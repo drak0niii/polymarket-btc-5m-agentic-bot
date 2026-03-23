@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "polymarket-btc-5m-agentic-bot-api"
+    static_configs:
+      - targets: ["host.docker.internal:3000"]
+
+  - job_name: "polymarket-btc-5m-agentic-bot-worker"
+    static_configs:
+      - targets: ["host.docker.internal:3001"]

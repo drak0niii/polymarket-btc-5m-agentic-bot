@@ -1,0 +1,27 @@
+{
+  "name": "polymarket-btc-5m-agentic-bot",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.14.0",
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=10.0.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev --parallel",
+    "lint": "turbo run lint",
+    "validate:no-deep-imports": "node scripts/check-no-deep-package-imports.mjs",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "clean": "turbo run clean && rm -rf node_modules"
+  },
+  "devDependencies": {
+    "turbo": "^2.5.6",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "^5.8.0",
+    "ethers": "5.8.0"
+  }
+}

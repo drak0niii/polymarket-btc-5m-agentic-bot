@@ -1,0 +1,452 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Outcome {
+  YES
+  NO
+}
+
+enum TradeIntent {
+  ENTER
+  REDUCE
+  EXIT
+  FLIP
+}
+
+enum VenueSide {
+  BUY
+  SELL
+}
+
+enum InventoryEffect {
+  INCREASE
+  DECREASE
+  NEUTRAL
+}
+
+model Market {
+  id               String          @id
+  slug             String          @unique
+  title            String
+  status           String
+  tokenIdYes       String?
+  tokenIdNo        String?
+  resolutionSource String?
+  expiresAt        DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  snapshots        MarketSnapshot[]
+  orderbooks       Orderbook[]
+  signals          Signal[]
+  orders           Order[]
+  fills            Fill[]
+  positions        Position[]
+  auditEvents      AuditEvent[]
+
+  @@map("markets")
+}
+
+model MarketSnapshot {
+  id          String   @id @default(uuid())
+  marketId    String
+  marketPrice Float?
+  bestBid     Float?
+  bestAsk     Float?
+  spread      Float?
+  volume      Float?
+  expiresAt   DateTime?
+  observedAt  DateTime
+  createdAt   DateTime @default(now())
+
+  market      Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@index([marketId, observedAt(sort: Desc)])
+  @@map("market_snapshots")
+}
+
+model Orderbook {
+  id            String   @id @default(uuid())
+  marketId      String
+  tokenId       String?
+  bidLevels     Json
+  askLevels     Json
+  bestBid       Float?
+  bestAsk       Float?
+  spread        Float?
+  depthScore    Float?
+
+  /**
+   * Venue validity metadata cached from Polymarket token order book.
+   * These are required for pre-submit validation and should be treated as
+   * authoritative only when fresh.
+   */
+  tickSize      Float?
+  minOrderSize  Float?
+  negRisk       Boolean?
+
+  observedAt    DateTime
+  createdAt     DateTime @default(now())
+
+  market        Market   @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@index([marketId, observedAt(sort: Desc)])
+  @@index([marketId, tokenId, observedAt(sort: Desc)])
+  @@index([tokenId, observedAt(sort: Desc)])
+  @@map("orderbooks")
+}
+
+model StrategyVersion {
+  id                         String          @id @default(uuid())
+  name                       String
+  isActive                   Boolean         @default(false)
+  priorModelConfig           Json
+  posteriorConfig            Json
+  filtersConfig              Json
+  riskConfig                 Json
+  executionConfig            Json
+  createdAt                  DateTime        @default(now())
+  updatedAt                  DateTime        @updatedAt
+
+  signals                    Signal[]
+  orders                     Order[]
+  diagnostics                ExecutionDiagnostic[]
+  evDriftDiagnostics         EvDriftDiagnostic[]
+  regimeDiagnostics          RegimeDiagnostic[]
+
+  @@map("strategy_versions")
+}
+
+model Signal {
+  id                    String           @id @default(uuid())
+  marketId              String
+  strategyVersionId     String?
+  side                  VenueSide?
+  tokenId               String?
+  outcome               Outcome?
+  intent                TradeIntent?
+  inventoryEffect       InventoryEffect?
+  priorProbability      Float
+  posteriorProbability  Float
+  marketImpliedProb     Float
+  edge                  Float
+  expectedEv            Float
+  regime                String?
+  status                String
+  observedAt            DateTime
+  createdAt             DateTime         @default(now())
+
+  market                Market           @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  strategyVersion       StrategyVersion? @relation(fields: [strategyVersionId], references: [id], onDelete: SetNull)
+  decisions             SignalDecision[]
+  orders                Order[]
+  auditEvents           AuditEvent[]
+
+  @@index([marketId, observedAt(sort: Desc)])
+  @@index([marketId, tokenId, observedAt(sort: Desc)])
+  @@index([marketId, outcome, observedAt(sort: Desc)])
+  @@index([status, createdAt(sort: Desc)])
+  @@map("signals")
+}
+
+model SignalDecision {
+  id                String    @id @default(uuid())
+  signalId          String
+  verdict           String
+  reasonCode        String
+  reasonMessage     String?
+  expectedEv        Float?
+  positionSize      Float?
+  decisionAt        DateTime
+  createdAt         DateTime  @default(now())
+
+  signal            Signal    @relation(fields: [signalId], references: [id], onDelete: Cascade)
+
+  @@index([signalId, decisionAt(sort: Desc)])
+  @@map("signal_decisions")
+}
+
+model Order {
+  id                    String           @id
+  marketId              String
+  tokenId               String
+  signalId              String?
+  strategyVersionId     String?
+  idempotencyKey        String?          @unique
+  venueOrderId          String?          @unique
+  status                String
+  side                  VenueSide
+  outcome               Outcome?
+  intent                TradeIntent?
+  inventoryEffect       InventoryEffect?
+  price                 Float
+  size                  Float
+  expectedEv            Float?
+  lastError             String?
+  filledSize            Float            @default(0)
+  remainingSize         Float            @default(0)
+  avgFillPrice          Float?
+  lastVenueStatus       String?
+  lastVenueSyncAt       DateTime?
+  postedAt              DateTime?
+  acknowledgedAt        DateTime?
+  canceledAt            DateTime?
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+
+  market                Market           @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  signal                Signal?          @relation(fields: [signalId], references: [id], onDelete: SetNull)
+  strategyVersion       StrategyVersion? @relation(fields: [strategyVersionId], references: [id], onDelete: SetNull)
+  fills                 Fill[]
+  auditEvents           AuditEvent[]
+  executionDiagnostics  ExecutionDiagnostic[]
+
+  @@index([marketId, createdAt(sort: Desc)])
+  @@index([marketId, tokenId, createdAt(sort: Desc)])
+  @@index([marketId, tokenId, status, createdAt(sort: Desc)])
+  @@index([status, createdAt(sort: Desc)])
+  @@map("orders")
+}
+
+model Fill {
+  id                String    @id
+  marketId          String
+  tokenId           String?
+  orderId           String?
+  price             Float
+  size              Float
+  fee               Float?
+  realizedPnl       Float?
+  filledAt          DateTime
+  createdAt         DateTime  @default(now())
+
+  market            Market    @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  order             Order?    @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([marketId, filledAt(sort: Desc)])
+  @@index([marketId, tokenId, filledAt(sort: Desc)])
+  @@index([orderId, filledAt(sort: Desc)])
+  @@map("fills")
+}
+
+model Position {
+  id                String           @id @default(uuid())
+  marketId          String
+  tokenId           String
+  side              VenueSide
+  outcome           Outcome?
+  intent            TradeIntent?
+  inventoryEffect   InventoryEffect?
+  entryPrice        Float
+  quantity          Float
+  status            String
+  openedAt          DateTime
+  closedAt          DateTime?
+  realizedPnl       Float?
+  unrealizedPnl     Float?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  market            Market           @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@index([marketId, openedAt(sort: Desc)])
+  @@index([marketId, tokenId, openedAt(sort: Desc)])
+  @@index([marketId, tokenId, status, updatedAt(sort: Desc)])
+  @@index([marketId, outcome, status, updatedAt(sort: Desc)])
+  @@index([status, updatedAt(sort: Desc)])
+  @@map("positions")
+}
+
+model PortfolioSnapshot {
+  id                String    @id @default(uuid())
+  bankroll          Float
+  availableCapital  Float
+  openExposure      Float
+  realizedPnlDay    Float
+  unrealizedPnl     Float
+  consecutiveLosses Int
+  capturedAt        DateTime
+  createdAt         DateTime  @default(now())
+
+  @@index([capturedAt(sort: Desc)])
+  @@map("portfolio_snapshots")
+}
+
+model BotRuntimeStatus {
+  id              String    @id @default("live")
+  state           String
+  reason          String?
+  lastHeartbeatAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@map("bot_runtime_status")
+}
+
+model BotRuntimeCommand {
+  id               String    @id @default(uuid())
+  command          String
+  reason           String
+  requestedBy      String?
+  cancelOpenOrders Boolean   @default(false)
+  status           String    @default("pending")
+  failureMessage   String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  processedAt      DateTime?
+
+  @@index([status, createdAt(sort: Asc)])
+  @@map("bot_runtime_commands")
+}
+
+model LiveConfig {
+  id                         String    @id @default("live")
+  maxOpenPositions           Int
+  maxDailyLossPct            Float
+  maxPerTradeRiskPct         Float
+  maxKellyFraction           Float
+  maxConsecutiveLosses       Int
+  noTradeWindowSeconds       Int
+  evaluationIntervalMs       Int
+  orderReconcileIntervalMs   Int
+  portfolioRefreshIntervalMs Int
+  createdAt                  DateTime  @default(now())
+  updatedAt                  DateTime  @updatedAt
+
+  @@map("live_config")
+}
+
+model ReconciliationCheckpoint {
+  id          String    @id @default(uuid())
+  cycleKey    String
+  source      String
+  status      String
+  details     Json?
+  processedAt DateTime
+  createdAt   DateTime  @default(now())
+
+  @@index([processedAt(sort: Desc)])
+  @@index([cycleKey, processedAt(sort: Desc)])
+  @@map("reconciliation_checkpoints")
+}
+
+model AuditEvent {
+  id                String    @id @default(uuid())
+  marketId          String?
+  signalId          String?
+  orderId           String?
+  eventType         String
+  message           String
+  metadata          Json?
+  createdAt         DateTime  @default(now())
+
+  market            Market?   @relation(fields: [marketId], references: [id], onDelete: SetNull)
+  signal            Signal?   @relation(fields: [signalId], references: [id], onDelete: SetNull)
+  order             Order?    @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt(sort: Desc)])
+  @@index([eventType, createdAt(sort: Desc)])
+  @@map("audit_events")
+}
+
+model ExecutionDiagnostic {
+  id                    String           @id @default(uuid())
+  orderId               String?
+  strategyVersionId     String?
+  expectedEv            Float?
+  realizedEv            Float?
+  evDrift               Float?
+  expectedFee           Float?
+  realizedFee           Float?
+  expectedSlippage      Float?
+  realizedSlippage      Float?
+  edgeAtSignal          Float?
+  edgeAtFill            Float?
+  fillRate              Float?
+  staleOrder            Boolean          @default(false)
+  regime                String?
+  capturedAt            DateTime
+  createdAt             DateTime         @default(now())
+
+  order                 Order?           @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  strategyVersion       StrategyVersion? @relation(fields: [strategyVersionId], references: [id], onDelete: SetNull)
+
+  @@index([capturedAt(sort: Desc)])
+  @@index([strategyVersionId, capturedAt(sort: Desc)])
+  @@map("execution_diagnostics")
+}
+
+model EvDriftDiagnostic {
+  id                    String           @id @default(uuid())
+  strategyVersionId     String?
+  windowLabel           String
+  expectedEvSum         Float
+  realizedEvSum         Float
+  evDrift               Float
+  realizedVsExpected    Float
+  capturedAt            DateTime
+  createdAt             DateTime         @default(now())
+
+  strategyVersion       StrategyVersion? @relation(fields: [strategyVersionId], references: [id], onDelete: SetNull)
+
+  @@index([capturedAt(sort: Desc)])
+  @@index([strategyVersionId, capturedAt(sort: Desc)])
+  @@map("ev_drift_diagnostics")
+}
+
+model RegimeDiagnostic {
+  id                    String           @id @default(uuid())
+  strategyVersionId     String?
+  regime                String
+  tradeCount            Int
+  winRate               Float?
+  expectedEvAvg         Float?
+  realizedEvAvg         Float?
+  fillRate              Float?
+  capturedAt            DateTime
+  createdAt             DateTime         @default(now())
+
+  strategyVersion       StrategyVersion? @relation(fields: [strategyVersionId], references: [id], onDelete: SetNull)
+
+  @@index([capturedAt(sort: Desc)])
+  @@index([regime, capturedAt(sort: Desc)])
+  @@map("regime_diagnostics")
+}
+
+model StressTestRun {
+  id                String                    @id @default(uuid())
+  family            String
+  status            String
+  startedAt         DateTime
+  completedAt       DateTime?
+  summary           Json?
+  verdict           String?
+  createdAt         DateTime                  @default(now())
+
+  scenarioResults   StressTestScenarioResult[]
+
+  @@index([family, startedAt(sort: Desc)])
+  @@map("stress_test_runs")
+}
+
+model StressTestScenarioResult {
+  id                String        @id @default(uuid())
+  stressTestRunId   String
+  scenarioKey       String
+  status            String
+  verdict           String?
+  parameters        Json
+  summary           Json?
+  createdAt         DateTime      @default(now())
+
+  stressTestRun     StressTestRun @relation(fields: [stressTestRunId], references: [id], onDelete: Cascade)
+
+  @@index([stressTestRunId, createdAt(sort: Desc)])
+  @@map("stress_test_scenario_results")
+}

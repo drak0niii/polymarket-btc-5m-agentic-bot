@@ -1,0 +1,1426 @@
+import { randomUUID } from 'crypto';
+import { PrismaClient } from '@prisma/client';
+import { AppLogger } from '@worker/common/logger';
+import { BotRuntimeState } from '@worker/runtime/bot-state';
+import { appEnv } from '@worker/config/env';
+import {
+  OrderIntentService,
+} from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { SignerHealth } from '@polymarket-btc-5m-agentic-bot/signing-engine';
+import { LiveTradeGuard } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { PreTradeFundingValidator } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { MarketableLimit } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { DuplicateExposureGuard } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { MakerQualityPolicy } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { NegativeRiskPolicy } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { OrderPlanner } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { SlippageEstimator } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { TradeIntentResolver } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { VenueFeeModel } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { VenueOrderValidator } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { ExecutionDiagnostics } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import {
+  OfficialPolymarketTradingClient,
+  VenueRewardMarket,
+} from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
+import {
+  PolymarketVenueError,
+  PolymarketNormalizedVenueError,
+} from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
+import { RuntimeControlRepository } from '@worker/runtime/runtime-control.repository';
+import { AccountStateService } from '@worker/portfolio/account-state.service';
+import {
+  OrderIntentRepository,
+  PersistedOrderIntentRecord,
+} from '@worker/runtime/order-intent.repository';
+import {
+  ExternalPortfolioService,
+  ExternalPortfolioSnapshot,
+} from '@worker/portfolio/external-portfolio.service';
+import { permissionsForRuntimeState } from '@worker/runtime/runtime-state-machine';
+import { MarketEligibilityService } from '@polymarket-btc-5m-agentic-bot/signal-engine';
+import { VenueOperationalPolicyService } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+
+type Outcome = 'YES' | 'NO';
+type VenueSide = 'BUY' | 'SELL';
+type ExecutionAction = 'ENTER' | 'REDUCE' | 'EXIT';
+type ExecutionStyle = 'rest' | 'cross';
+type InventoryEffect = 'increase' | 'decrease';
+
+interface ResolvedExecutionIntent {
+  tokenId: string;
+  outcome: Outcome;
+  venueSide: VenueSide;
+  action: ExecutionAction;
+  inventoryEffect: InventoryEffect;
+}
+
+export class ExecuteOrdersJob {
+  private readonly logger = new AppLogger('ExecuteOrdersJob');
+  private readonly signerHealth = new SignerHealth();
+  private readonly liveTradeGuard = new LiveTradeGuard();
+  private readonly fundingValidator = new PreTradeFundingValidator();
+  private readonly marketableLimit = new MarketableLimit();
+  private readonly duplicateExposureGuard = new DuplicateExposureGuard();
+  private readonly makerQualityPolicy = new MakerQualityPolicy();
+  private readonly negativeRiskPolicy = new NegativeRiskPolicy();
+  private readonly orderPlanner = new OrderPlanner();
+  private readonly slippageEstimator = new SlippageEstimator();
+  private readonly tradeIntentResolver = new TradeIntentResolver();
+  private readonly venueFeeModel = new VenueFeeModel();
+  private readonly venueOrderValidator = new VenueOrderValidator();
+  private readonly executionDiagnostics = new ExecutionDiagnostics();
+  private readonly marketEligibility = new MarketEligibilityService();
+  private readonly orderIntentService = new OrderIntentService();
+  private readonly operationalPolicy = new VenueOperationalPolicyService();
+  private readonly tradingClient = new OfficialPolymarketTradingClient({
+    host: appEnv.POLY_CLOB_HOST,
+    chainId: appEnv.POLY_CHAIN_ID,
+    privateKey: appEnv.POLY_PRIVATE_KEY ?? '',
+    apiKey: appEnv.POLY_API_KEY ?? '',
+    apiSecret: appEnv.POLY_API_SECRET ?? '',
+    apiPassphrase: appEnv.POLY_API_PASSPHRASE ?? '',
+    signatureType: appEnv.POLY_SIGNATURE_TYPE,
+    funder: appEnv.POLY_FUNDER ?? null,
+    geoBlockToken: appEnv.POLY_GEO_BLOCK_TOKEN ?? null,
+    useServerTime: appEnv.POLY_USE_SERVER_TIME,
+    maxClockSkewMs: appEnv.POLY_MAX_CLOCK_SKEW_MS,
+  });
+  private readonly runtimeControl: RuntimeControlRepository;
+  private readonly externalPortfolioService: ExternalPortfolioService;
+  private readonly accountStateService: Pick<AccountStateService, 'capture'>;
+  private readonly orderIntentRepository: Pick<
+    OrderIntentRepository,
+    'record' | 'loadLatest'
+  >;
+
+  constructor(
+    private readonly prisma: PrismaClient,
+    runtimeControl?: RuntimeControlRepository,
+  ) {
+    this.runtimeControl =
+      runtimeControl ??
+      new RuntimeControlRepository(this.prisma, {
+        maxOpenPositions: appEnv.MAX_OPEN_POSITIONS,
+        maxDailyLossPct: appEnv.MAX_DAILY_LOSS_PCT,
+        maxPerTradeRiskPct: appEnv.MAX_PER_TRADE_RISK_PCT,
+        maxKellyFraction: appEnv.MAX_KELLY_FRACTION,
+        maxConsecutiveLosses: appEnv.MAX_CONSECUTIVE_LOSSES,
+        noTradeWindowSeconds: appEnv.NO_TRADE_WINDOW_SECONDS,
+        evaluationIntervalMs: appEnv.BOT_EVALUATION_INTERVAL_MS,
+        orderReconcileIntervalMs: appEnv.BOT_ORDER_RECONCILE_INTERVAL_MS,
+        portfolioRefreshIntervalMs: appEnv.BOT_PORTFOLIO_REFRESH_INTERVAL_MS,
+      });
+    this.externalPortfolioService = new ExternalPortfolioService(
+      this.prisma,
+      this.tradingClient,
+    );
+    this.accountStateService = new AccountStateService(
+      this.prisma,
+      this.externalPortfolioService,
+    );
+    this.orderIntentRepository = new OrderIntentRepository(this.prisma);
+  }
+
+  async run(options?: {
+    canSubmit?: () => boolean;
+    runtimeState?: BotRuntimeState;
+  }): Promise<{ submitted: number; rejected: number }> {
+    const canSubmit = options?.canSubmit ?? (() => true);
+    if (
+      options?.runtimeState &&
+      !permissionsForRuntimeState(options.runtimeState).allowOrderSubmit
+    ) {
+      return { submitted: 0, rejected: 0 };
+    }
+
+    const liveConfig = await (this.prisma as any).liveConfig.findUnique({
+      where: { id: 'live' },
+    });
+
+    if (!canSubmit()) {
+      return { submitted: 0, rejected: 0 };
+    }
+
+    const executionReadiness = await this.assessExecutionReadiness();
+    if (!executionReadiness.ready) {
+      await this.prisma.auditEvent.create({
+        data: {
+          eventType: 'execution.runtime_freshness_veto',
+          message:
+            'Execution blocked because runtime heartbeat, reconciliation, or portfolio truth is stale.',
+          metadata: {
+            reasonCode: executionReadiness.reasonCode,
+          } as object,
+        },
+      });
+      this.logger.warn('Execution cycle blocked by stale runtime truth.', {
+        reasonCode: executionReadiness.reasonCode,
+      });
+      return { submitted: 0, rejected: 0 };
+    }
+
+    const activeSafetyState = await this.runtimeControl.getLatestSafetyState();
+    if (activeSafetyState.haltRequested) {
+      await this.prisma.auditEvent.create({
+        data: {
+          eventType: 'execution.safety_halt_veto',
+          message: 'Execution blocked because the graded safety state machine is halted.',
+          metadata: {
+            safetyState: activeSafetyState.state,
+            reasonCodes: activeSafetyState.reasonCodes,
+          } as object,
+        },
+      });
+      return { submitted: 0, rejected: 0 };
+    }
+
+    const approvedSignals = await this.prisma.signal.findMany({
+      where: {
+        status: 'approved',
+      },
+      orderBy: {
+        observedAt: 'asc',
+      },
+      take: 20,
+    });
+
+    let submitted = 0;
+    let rejected = 0;
+
+    for (const signal of approvedSignals) {
+      if (!canSubmit()) {
+        this.logger.warn('Execution stopped before signal submit due to runtime veto.');
+        break;
+      }
+
+      const existingOrder = await this.prisma.order.findFirst({
+        where: {
+          signalId: signal.id,
+          status: {
+            in: ['submitted', 'acknowledged', 'partially_filled'],
+          },
+        },
+      });
+      if (existingOrder) {
+        continue;
+      }
+
+      const decision = await this.prisma.signalDecision.findFirst({
+        where: { signalId: signal.id, verdict: 'approved' },
+        orderBy: { decisionAt: 'desc' },
+      });
+
+      if (!decision || !decision.positionSize || decision.positionSize <= 0) {
+        await this.rejectSignal(signal.id, 'position_size_missing');
+        rejected += 1;
+        continue;
+      }
+
+      if (!signal.strategyVersionId) {
+        await this.rejectSignal(signal.id, 'strategy_version_missing');
+        rejected += 1;
+        continue;
+      }
+
+      const market = await this.prisma.market.findUnique({
+        where: { id: signal.marketId },
+      });
+
+      if (!market) {
+        await this.rejectSignal(signal.id, 'market_missing');
+        rejected += 1;
+        continue;
+      }
+
+      const executionIntent = this.resolveExecutionIntent(signal, market);
+      if (!executionIntent) {
+        await this.rejectSignal(signal.id, 'ambiguous_execution_intent');
+        rejected += 1;
+        continue;
+      }
+
+      const { tokenId, outcome, venueSide, action, inventoryEffect } = executionIntent;
+      const isNewExposure = inventoryEffect === 'increase';
+
+      if (isNewExposure && !activeSafetyState.allowNewEntries) {
+        await this.rejectSignal(signal.id, 'safety_state_no_new_entries');
+        rejected += 1;
+        continue;
+      }
+
+      const signalAgeMs = Date.now() - new Date(signal.observedAt).getTime();
+      if (signalAgeMs > appEnv.BOT_MAX_SIGNAL_AGE_MS) {
+        await this.rejectSignal(signal.id, 'signal_stale');
+        rejected += 1;
+        continue;
+      }
+
+      const snapshot = await this.prisma.marketSnapshot.findFirst({
+        where: { marketId: market.id },
+        orderBy: { observedAt: 'desc' },
+      });
+      if (!snapshot) {
+        await this.rejectSignal(signal.id, 'market_snapshot_missing');
+        rejected += 1;
+        continue;
+      }
+
+      const snapshotAgeMs = Date.now() - new Date(snapshot.observedAt).getTime();
+      if (snapshotAgeMs > appEnv.BOT_MAX_MARKET_SNAPSHOT_AGE_MS) {
+        await this.rejectSignal(signal.id, 'market_snapshot_stale');
+        rejected += 1;
+        continue;
+      }
+
+      const expiryAt = snapshot.expiresAt ?? market.expiresAt;
+      if (!expiryAt) {
+        await this.rejectSignal(signal.id, 'expiry_unknown');
+        rejected += 1;
+        continue;
+      }
+
+      const noTradeWindowSeconds =
+        liveConfig?.noTradeWindowSeconds ?? appEnv.NO_TRADE_WINDOW_SECONDS;
+      if (noTradeWindowSeconds >= 0) {
+        const secondsToExpiry = Math.floor(
+          (new Date(expiryAt).getTime() - Date.now()) / 1000,
+        );
+        if (secondsToExpiry <= noTradeWindowSeconds) {
+          await this.rejectSignal(signal.id, 'no_trade_near_expiry');
+          rejected += 1;
+          continue;
+        }
+      }
+
+      const orderbook = await this.prisma.orderbook.findFirst({
+        where: {
+          marketId: market.id,
+          tokenId,
+        },
+        orderBy: { observedAt: 'desc' },
+      });
+      if (!orderbook) {
+        await this.rejectSignal(signal.id, 'orderbook_missing');
+        rejected += 1;
+        continue;
+      }
+
+      const orderbookAgeMs = Date.now() - new Date(orderbook.observedAt).getTime();
+      if (orderbookAgeMs > appEnv.BOT_MAX_ORDERBOOK_AGE_MS) {
+        await this.rejectSignal(signal.id, 'orderbook_stale');
+        rejected += 1;
+        continue;
+      }
+
+      const tickSize = this.normalizePositiveNumber(
+        (orderbook as Record<string, unknown>).tickSize as number | null | undefined,
+      );
+      if (tickSize === null) {
+        await this.rejectSignal(signal.id, 'orderbook_tick_size_missing');
+        rejected += 1;
+        continue;
+      }
+
+      const minOrderSize = this.normalizePositiveNumber(
+        (orderbook as Record<string, unknown>).minOrderSize as number | null | undefined,
+      );
+      if (minOrderSize === null) {
+        await this.rejectSignal(signal.id, 'orderbook_min_order_size_missing');
+        rejected += 1;
+        continue;
+      }
+
+      const negRiskRaw = (orderbook as Record<string, unknown>).negRisk;
+      const negRisk = typeof negRiskRaw === 'boolean' ? negRiskRaw : null;
+      if (negRisk === null) {
+        await this.rejectSignal(signal.id, 'orderbook_neg_risk_missing');
+        rejected += 1;
+        continue;
+      }
+
+      const negRiskVerdict = this.negativeRiskPolicy.evaluate({
+        negRisk,
+      });
+      if (!negRiskVerdict.allowed) {
+        await this.rejectSignal(signal.id, negRiskVerdict.reasonCode);
+        rejected += 1;
+        continue;
+      }
+
+      const eligibility = this.marketEligibility.evaluate({
+        market: {
+          id: market.id,
+          slug: this.readStringField(market, 'slug'),
+          title: this.readStringField(market, 'title'),
+          question: this.readStringField(market, 'title'),
+          active: this.readStringField(market, 'status') !== 'closed',
+          closed: this.readStringField(market, 'status') === 'closed',
+          tradable: true,
+          tokenIdYes: this.readStringField(market, 'tokenIdYes'),
+          tokenIdNo: this.readStringField(market, 'tokenIdNo'),
+          expiresAt: expiryAt ? new Date(expiryAt).toISOString() : null,
+          negativeRisk: negRisk,
+          enableOrderBook: true,
+        },
+        spread: orderbook.spread ?? null,
+        bidDepth: this.topLevelDepth(orderbook, 'SELL'),
+        askDepth: this.topLevelDepth(orderbook, 'BUY'),
+        topLevelDepth: this.topLevelDepth(orderbook, venueSide),
+        tickSize,
+        orderbookObservedAt: orderbook.observedAt,
+        marketObservedAt: snapshot.observedAt,
+        recentTradeCount: this.estimateRecentTradeCount(snapshot.volume ?? null),
+        maxOrderbookAgeMs: appEnv.BOT_MAX_ORDERBOOK_AGE_MS,
+        maxMarketAgeMs: appEnv.BOT_MAX_MARKET_SNAPSHOT_AGE_MS,
+        noTradeWindowSeconds,
+      });
+      if (!eligibility.eligible) {
+        await this.rejectSignal(signal.id, eligibility.reasonMessage ?? eligibility.reasonCode);
+        rejected += 1;
+        continue;
+      }
+
+      const signerHealth = this.signerHealth.check({
+        privateKey: appEnv.POLY_PRIVATE_KEY,
+        apiKey: appEnv.POLY_API_KEY,
+        apiSecret: appEnv.POLY_API_SECRET,
+        apiPassphrase: appEnv.POLY_API_PASSPHRASE,
+      });
+      const guard = this.liveTradeGuard.evaluate({
+        botState: canSubmit() ? 'running' : 'cancel_only',
+        signerHealthy: signerHealth.checks.privateKey,
+        credentialsHealthy:
+          signerHealth.checks.apiKey &&
+          signerHealth.checks.apiSecret &&
+          signerHealth.checks.apiPassphrase,
+        marketDataFresh:
+          signalAgeMs <= appEnv.BOT_MAX_SIGNAL_AGE_MS &&
+          orderbookAgeMs <= appEnv.BOT_MAX_ORDERBOOK_AGE_MS &&
+          snapshotAgeMs <= appEnv.BOT_MAX_MARKET_SNAPSHOT_AGE_MS,
+      });
+      if (!guard.passed) {
+        await this.rejectSignal(signal.id, guard.reasonCode);
+        rejected += 1;
+        continue;
+      }
+
+      const bestBid = orderbook.bestBid ?? 0;
+      const bestAsk = orderbook.bestAsk ?? 0;
+      const urgency = this.executionUrgency(expiryAt, noTradeWindowSeconds);
+
+      const marketable = this.marketableLimit.calculate({
+        side: venueSide,
+        bestBid: bestBid > 0 ? bestBid : null,
+        bestAsk: bestAsk > 0 ? bestAsk : null,
+        aggressionBps: urgency === 'high' ? 15 : urgency === 'medium' ? 8 : 3,
+      });
+
+      const rawPrice = this.clampPrice(marketable.price);
+      if (!Number.isFinite(rawPrice) || rawPrice <= 0) {
+        await this.rejectSignal(signal.id, 'invalid_price');
+        rejected += 1;
+        continue;
+      }
+
+      const price = this.quantizeToTick(rawPrice, tickSize);
+      if (!Number.isFinite(price) || price <= 0) {
+        await this.rejectSignal(signal.id, 'invalid_price');
+        rejected += 1;
+        continue;
+      }
+
+      if (!this.isOnTick(price, tickSize)) {
+        await this.rejectSignal(signal.id, 'price_not_on_tick');
+        rejected += 1;
+        continue;
+      }
+
+      const topLevelDepth = this.topLevelDepth(orderbook, venueSide);
+      const capitalAwareDecisionSize =
+        decision.positionSize *
+        (isNewExposure ? activeSafetyState.sizeMultiplier : 1);
+      const initialSize = Math.max(0, capitalAwareDecisionSize / price);
+      const size = topLevelDepth > 0 ? Math.min(initialSize, topLevelDepth * 0.8) : initialSize;
+
+      if (!Number.isFinite(size) || size <= 0) {
+        await this.rejectSignal(signal.id, 'invalid_size');
+        rejected += 1;
+        continue;
+      }
+
+      if (size < minOrderSize) {
+        await this.rejectSignal(signal.id, 'size_below_min_order_size');
+        rejected += 1;
+        continue;
+      }
+
+      const slippage = this.slippageEstimator.estimate({
+        side: venueSide,
+        bestBid: bestBid > 0 ? bestBid : null,
+        bestAsk: bestAsk > 0 ? bestAsk : null,
+        targetSize: size,
+        topLevelDepth,
+      });
+      if (slippage.severity === 'high' && signal.expectedEv <= slippage.expectedSlippage) {
+        await this.rejectSignal(signal.id, 'expected_slippage_exceeds_edge');
+        rejected += 1;
+        continue;
+      }
+
+      let orderPlan;
+      try {
+        orderPlan = this.orderPlanner.plan({
+          resolvedIntent: {
+            tokenId,
+            outcome,
+            intent: action,
+            venueSide,
+            inventoryEffect: inventoryEffect === 'increase' ? 'INCREASE' : 'DECREASE',
+          },
+          price,
+          size,
+          urgency,
+          expiryAt: new Date(expiryAt).toISOString(),
+          noTradeWindowSeconds,
+          partialFillTolerance:
+            action === 'ENTER' && urgency === 'high' ? 'all_or_nothing' : 'allow_partial',
+          preferResting: action === 'ENTER' && urgency !== 'high',
+          venueConstraints: {
+            tickSize,
+            minOrderSize,
+            negRisk,
+          },
+          liquidity: {
+            topLevelDepth,
+            executableDepth: topLevelDepth,
+          },
+        });
+      } catch (error) {
+        await this.rejectSignal(
+          signal.id,
+          error instanceof Error ? 'order_planning_failed' : 'order_planning_failed',
+        );
+        rejected += 1;
+        continue;
+      }
+
+      if (
+        isNewExposure &&
+        !activeSafetyState.allowAggressiveEntries &&
+        orderPlan.executionStyle === 'cross'
+      ) {
+        await this.rejectSignal(signal.id, 'safety_state_passive_only');
+        rejected += 1;
+        continue;
+      }
+
+      const venueValidation = this.venueOrderValidator.validate({
+        tokenId: orderPlan.tokenId,
+        side: orderPlan.side,
+        price: orderPlan.price,
+        size: orderPlan.size,
+        orderType: orderPlan.orderType,
+        metadata: {
+          tickSize,
+          minOrderSize,
+          negRisk,
+        },
+        executionStyle: orderPlan.executionStyle,
+        expiration: orderPlan.expiration,
+        postOnly: false,
+        normalizePriceToTick: false,
+      });
+      if (!venueValidation.valid) {
+        await this.rejectSignal(
+          signal.id,
+          venueValidation.reasonCode ?? 'venue_order_validation_failed',
+        );
+        rejected += 1;
+        continue;
+      }
+
+      if ((orderPlan.orderType === 'FOK' || orderPlan.orderType === 'FAK') && topLevelDepth <= 0) {
+        await this.rejectSignal(signal.id, 'immediate_execution_liquidity_missing');
+        rejected += 1;
+        continue;
+      }
+
+      const feeSnapshot = await this.resolveVenueFeeSnapshot(tokenId);
+      const feeModel = this.venueFeeModel.evaluate({
+        tokenId,
+        route: orderPlan.route,
+        price: orderPlan.price,
+        size: orderPlan.size,
+        venueFeeRateBps: feeSnapshot?.feeRateBps ?? null,
+        venueFeeFetchedAt: feeSnapshot?.fetchedAt ?? null,
+        source: feeSnapshot ? 'venue_live' : 'fallback',
+      });
+      if (signal.expectedEv <= slippage.expectedSlippage + feeModel.expectedFeePerUnit) {
+        await this.rejectSignal(signal.id, 'fee_adjusted_edge_non_positive');
+        rejected += 1;
+        continue;
+      }
+
+      const rewardsMarkets =
+        orderPlan.route === 'maker' ? await this.resolveVenueRewardsMarkets() : [];
+      const makerQuality = this.makerQualityPolicy.evaluate({
+        route: orderPlan.route,
+        tokenId,
+        side: orderPlan.side,
+        price: orderPlan.price,
+        size: orderPlan.size,
+        bestBid: bestBid > 0 ? bestBid : null,
+        bestAsk: bestAsk > 0 ? bestAsk : null,
+        tickSize,
+        rewardsMarkets,
+      });
+
+      const localOrderId = randomUUID();
+      const intentEpoch = await this.resolveIntentEpoch(signal.id);
+      const orderIdentity = this.orderIntentService.identify({
+        source: `${signal.id}:epoch:${intentEpoch}:${signal.strategyVersionId ?? 'unknown'}`,
+        marketId: market.id,
+        tokenId,
+        side: orderPlan.side,
+        intent:
+          action === 'EXIT'
+            ? 'EXIT'
+            : action === 'REDUCE'
+              ? 'REDUCE'
+              : 'ENTER',
+        price: orderPlan.price,
+        size: orderPlan.size,
+        orderType: orderPlan.orderType,
+        expiration: orderPlan.expiration,
+      });
+      const idempotencyKey = orderIdentity.intentId;
+      const priorIntent = await this.orderIntentRepository.loadLatest(orderIdentity.intentId);
+      if (this.shouldBlockIntentReplay(priorIntent)) {
+        await this.prisma.auditEvent.create({
+          data: {
+            marketId: market.id,
+            signalId: signal.id,
+            eventType: 'order.intent.truth_pending',
+            message:
+              'Order intent replay was blocked because prior submit truth is already recorded.',
+            metadata: {
+              intentId: orderIdentity.intentId,
+              clientOrderId: orderIdentity.clientOrderId,
+              priorIntent,
+            } as object,
+          },
+        });
+        continue;
+      }
+      const inventoryEffectValue: 'INCREASE' | 'DECREASE' =
+        inventoryEffect === 'increase' ? 'INCREASE' : 'DECREASE';
+      const payload = {
+        tokenId,
+        side: orderPlan.side,
+        outcome,
+        intent: action,
+        inventoryEffect: inventoryEffectValue,
+        tickSize,
+        minOrderSize,
+        negRisk,
+        price: orderPlan.price,
+        size: orderPlan.size,
+        orderType: orderPlan.orderType,
+        expiration: orderPlan.expiration,
+        clientOrderId: orderIdentity.clientOrderId,
+      };
+
+      let postedStatus = 'submitted';
+      let venueOrderId: string | null = null;
+      let lastError: string | null = null;
+      let lastVenueStatus: string | null = null;
+      let externalPortfolioSnapshot: ExternalPortfolioSnapshot | null = null;
+      let duplicateExposureVerdict: ReturnType<DuplicateExposureGuard['evaluate']> | null = null;
+      let terminalRejectReason: string | null = null;
+
+      if (appEnv.BOT_LIVE_EXECUTION_ENABLED) {
+        if (!canSubmit()) {
+          await this.rejectSignal(signal.id, 'runtime_not_running');
+          rejected += 1;
+          continue;
+        }
+
+        try {
+          externalPortfolioSnapshot =
+            await this.externalPortfolioService.capture({
+              cycleKey: `pretrade:${signal.id}:${Date.now()}`,
+              source: 'external_portfolio_reconcile',
+            });
+          const accountState = await this.accountStateService.capture({
+            persist: false,
+            externalSnapshot: externalPortfolioSnapshot,
+            marketStreamHealthy: true,
+            userStreamHealthy: true,
+          });
+          if (orderPlan.price * orderPlan.size > accountState.deployableRiskNow + 1e-9) {
+            await this.rejectSignal(signal.id, 'deployable_risk_exhausted');
+            rejected += 1;
+            continue;
+          }
+          const fundingVerdict = this.fundingValidator.validate({
+            tokenId,
+            side: orderPlan.side,
+            price: orderPlan.price,
+            size: orderPlan.size,
+            snapshot: externalPortfolioSnapshot,
+          });
+          if (!fundingVerdict.passed) {
+            await this.rejectSignal(
+              signal.id,
+              fundingVerdict.reasonCode ?? 'external_portfolio_truth_missing',
+            );
+            rejected += 1;
+            continue;
+          }
+
+          const currentPositionSize =
+            externalPortfolioSnapshot.inventories.find((inventory) => inventory.tokenId === tokenId)
+              ?.positionQuantity ?? 0;
+          const localWorkingOrders =
+            (this.prisma.order as any)?.findMany
+              ? await (this.prisma.order as any).findMany({
+                  where: {
+                    marketId: market.id,
+                    tokenId,
+                    status: {
+                      in: ['submitted', 'acknowledged', 'partially_filled'],
+                    },
+                  },
+                  orderBy: {
+                    createdAt: 'asc',
+                  },
+                  take: 20,
+                })
+              : [];
+          duplicateExposureVerdict = this.duplicateExposureGuard.evaluate({
+            marketId: market.id,
+            tokenId,
+            side: orderPlan.side,
+            inventoryEffect: inventoryEffectValue,
+            desiredSize: orderPlan.size,
+            currentPositionSize,
+            localWorkingOrders: localWorkingOrders
+              .filter((order: any) => typeof order.tokenId === 'string' && order.tokenId.length > 0)
+              .map((order: any) => ({
+                id: order.id,
+                signalId: order.signalId,
+                tokenId: order.tokenId as string,
+                side: order.side as 'BUY' | 'SELL',
+                size: order.size,
+                remainingSize: order.remainingSize,
+                status: order.status,
+              })),
+            venueWorkingOrders: externalPortfolioSnapshot.openOrders.map((order) => ({
+              id: order.id,
+              tokenId: order.tokenId,
+              side: order.side === 'SELL' ? 'SELL' : 'BUY',
+              size: order.size,
+              matchedSize: order.matchedSize,
+              status: order.status,
+            })),
+          });
+          if (!duplicateExposureVerdict.allowed) {
+            await this.rejectSignal(signal.id, duplicateExposureVerdict.reasonCode);
+            rejected += 1;
+            continue;
+          }
+        } catch (error) {
+          await this.rejectSignal(signal.id, 'external_portfolio_truth_unhealthy');
+          rejected += 1;
+          this.logger.error('External portfolio truth fetch failed before submit.', undefined, {
+            signalId: signal.id,
+            error: error instanceof Error ? error.message : String(error),
+            tokenId,
+            venueSide: orderPlan.side,
+          });
+          continue;
+        }
+
+        await this.orderIntentRepository.record({
+          intentId: orderIdentity.intentId,
+          status: 'prepared',
+          fingerprint: orderIdentity.fingerprint,
+          clientOrderId: orderIdentity.clientOrderId,
+          signalId: signal.id,
+          marketId: market.id,
+          tokenId,
+          attempts: (priorIntent?.attempts ?? 0) + 1,
+        });
+        try {
+          const response = await this.tradingClient.postOrder(payload);
+
+          venueOrderId = response.orderId;
+          lastVenueStatus = response.status;
+          postedStatus = response.success
+            ? this.normalizeVenueStatus(lastVenueStatus)
+            : 'rejected';
+
+          if (!response.success) {
+            lastError = `order_rejected:${response.status}`;
+            terminalRejectReason = this.reasonCodeFromVenueStatus(response.status);
+          }
+
+          this.logger.debug('Order post response received from Polymarket adapter.', {
+            signalId: signal.id,
+            venueOrderId,
+            venueStatus: lastVenueStatus,
+            tokenId,
+            outcome,
+            action,
+            venueSide: orderPlan.side,
+            orderType: orderPlan.orderType,
+            route: orderPlan.route,
+            timeDiscipline: orderPlan.timeDiscipline,
+            partialFillTolerance: orderPlan.partialFillTolerance,
+            tickSize,
+            minOrderSize,
+            negRisk,
+            policyReasonCode: orderPlan.policyReasonCode,
+            feeModel,
+            makerQuality,
+            negRiskVerdict,
+            duplicateExposureVerdict,
+            externalPortfolioAvailableCapital:
+              externalPortfolioSnapshot?.availableCapital ?? null,
+            externalPortfolioReservedCash:
+              externalPortfolioSnapshot?.reservedCash ?? null,
+            externalPortfolioAvailableInventory:
+              externalPortfolioSnapshot?.inventories.find(
+                (inventory) => inventory.tokenId === tokenId,
+              )?.availableQuantity ?? null,
+          });
+        } catch (error) {
+          const normalized = this.normalizeVenueError(error);
+          await this.applyOperationalDecision(normalized);
+          lastError = error instanceof Error ? error.message : String(error);
+          if (this.isUncertainSubmitError(normalized)) {
+            await this.orderIntentRepository.record({
+              intentId: orderIdentity.intentId,
+              status: 'unknown_visibility',
+              fingerprint: orderIdentity.fingerprint,
+              clientOrderId: orderIdentity.clientOrderId,
+              signalId: signal.id,
+              marketId: market.id,
+              tokenId,
+              orderId: localOrderId,
+              attempts: (priorIntent?.attempts ?? 0) + 1,
+              details: {
+                error: lastError,
+                reasonCode: normalized?.reasonCode ?? 'submit_unknown_visibility',
+              },
+            });
+            await this.prisma.auditEvent.create({
+              data: {
+                marketId: market.id,
+                signalId: signal.id,
+                eventType: 'order.submit_truth_pending',
+                message:
+                  'Submit visibility is uncertain; replay protection blocked blind resubmission.',
+                metadata: {
+                  intentId: orderIdentity.intentId,
+                  clientOrderId: orderIdentity.clientOrderId,
+                  error: lastError,
+                  reasonCode: normalized?.reasonCode ?? 'submit_unknown_visibility',
+                } as object,
+              },
+            });
+            rejected += 1;
+            continue;
+          }
+          postedStatus = 'rejected';
+          terminalRejectReason =
+            normalized?.reasonCode ?? 'venue_submit_failed';
+          this.logger.error('Order post failed via Polymarket adapter.', undefined, {
+            signalId: signal.id,
+            error: lastError,
+            tokenId,
+            outcome,
+            action,
+            venueSide: orderPlan.side,
+            orderType: orderPlan.orderType,
+            tickSize,
+            minOrderSize,
+            negRisk,
+            externalPortfolioAvailableCapital:
+              externalPortfolioSnapshot?.availableCapital ?? null,
+            externalPortfolioAvailableInventory:
+              externalPortfolioSnapshot?.inventories.find(
+                (inventory) => inventory.tokenId === tokenId,
+              )?.availableQuantity ?? null,
+            });
+        }
+      } else {
+        await this.orderIntentRepository.record({
+          intentId: orderIdentity.intentId,
+          status: 'prepared',
+          fingerprint: orderIdentity.fingerprint,
+          clientOrderId: orderIdentity.clientOrderId,
+          signalId: signal.id,
+          marketId: market.id,
+          tokenId,
+          attempts: (priorIntent?.attempts ?? 0) + 1,
+        });
+        postedStatus = 'submitted';
+        venueOrderId = localOrderId;
+        lastVenueStatus = 'simulated';
+      }
+
+      try {
+        const initialFilledSize = postedStatus === 'filled' ? size : 0;
+        const initialRemainingSize = postedStatus === 'filled' ? 0 : size;
+
+        await this.prisma.order.create({
+          data: {
+            id: localOrderId,
+            marketId: market.id,
+            tokenId,
+            signalId: signal.id,
+            strategyVersionId: signal.strategyVersionId,
+            idempotencyKey,
+            venueOrderId,
+            status: postedStatus,
+            side: orderPlan.side,
+            outcome,
+            intent: action,
+            inventoryEffect: inventoryEffectValue,
+            price: orderPlan.price,
+            size: orderPlan.size,
+            expectedEv: signal.expectedEv,
+            lastError,
+            filledSize: initialFilledSize,
+            remainingSize: initialRemainingSize,
+            avgFillPrice: null,
+            lastVenueStatus,
+            lastVenueSyncAt: new Date(),
+            postedAt: new Date(),
+            acknowledgedAt:
+              postedStatus === 'submitted' || postedStatus === 'acknowledged'
+                ? new Date()
+                : null,
+            canceledAt: null,
+          } as never,
+        });
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message.toLowerCase().includes('unique constraint')
+        ) {
+          continue;
+        }
+        throw error;
+      }
+
+      await this.orderIntentRepository.record({
+        intentId: orderIdentity.intentId,
+        status: postedStatus === 'rejected' || postedStatus === 'filled' ? 'terminal' : 'submitted',
+        fingerprint: orderIdentity.fingerprint,
+        orderId: localOrderId,
+        venueOrderId,
+        clientOrderId: orderIdentity.clientOrderId,
+        signalId: signal.id,
+        marketId: market.id,
+        tokenId,
+        attempts: (priorIntent?.attempts ?? 0) + 1,
+        details: {
+          postedStatus,
+          lastError,
+        },
+      });
+
+      const prismaAny = this.prisma as any;
+      if (prismaAny.executionDiagnostic?.create) {
+        const snapshot = this.executionDiagnostics.create({
+          orderId: localOrderId,
+          strategyVersionId: signal.strategyVersionId,
+          expectedEv: signal.expectedEv,
+          realizedEv: postedStatus === 'filled'
+            ? signal.expectedEv - feeModel.expectedFee - slippage.expectedSlippage
+            : null,
+          expectedFee: feeModel.expectedFee,
+          realizedFee: postedStatus === 'filled' ? feeModel.expectedFee : null,
+          expectedSlippage: slippage.expectedSlippage,
+          realizedSlippage: postedStatus === 'filled' ? slippage.expectedSlippage : null,
+          edgeAtSignal: signal.edge ?? null,
+          edgeAtFill: postedStatus === 'filled' ? signal.edge ?? null : null,
+          fillRate: postedStatus === 'filled' ? 1 : 0,
+          staleOrder: signalAgeMs > appEnv.BOT_MAX_SIGNAL_AGE_MS,
+          regime: signal.regime ?? null,
+        });
+
+        await prismaAny.executionDiagnostic.create({
+          data: {
+            orderId: snapshot.orderId,
+            strategyVersionId: snapshot.strategyVersionId,
+            expectedEv: snapshot.expectedEv,
+            realizedEv: snapshot.realizedEv,
+            evDrift: snapshot.evDrift,
+            expectedFee: snapshot.expectedFee,
+            realizedFee: snapshot.realizedFee,
+            expectedSlippage: snapshot.expectedSlippage,
+            realizedSlippage: snapshot.realizedSlippage,
+            edgeAtSignal: snapshot.edgeAtSignal,
+            edgeAtFill: snapshot.edgeAtFill,
+            fillRate: snapshot.fillRate,
+            staleOrder: snapshot.staleOrder,
+            regime: snapshot.regime,
+            capturedAt: new Date(snapshot.capturedAt),
+          },
+        });
+      }
+
+      const submitSucceeded =
+        postedStatus === 'submitted' ||
+        postedStatus === 'acknowledged' ||
+        postedStatus === 'partially_filled' ||
+        postedStatus === 'filled';
+
+      await this.prisma.auditEvent.create({
+        data: {
+          marketId: market.id,
+          signalId: signal.id,
+          orderId: localOrderId,
+          eventType: submitSucceeded
+            ? 'order.submitted'
+            : 'order.rejected_on_submit',
+          message: submitSucceeded
+            ? 'Order submitted.'
+            : 'Order rejected during submit.',
+          metadata: {
+            idempotencyKey,
+            venueOrderId,
+            tokenId,
+            outcome,
+            action,
+            inventoryEffect,
+            venueSide: orderPlan.side,
+            signalSide: this.readStringField(signal, 'side'),
+            size: orderPlan.size,
+            orderType: orderPlan.orderType,
+            urgency,
+            executionStyle: orderPlan.executionStyle,
+            route: orderPlan.route,
+            timeDiscipline: orderPlan.timeDiscipline,
+            partialFillTolerance: orderPlan.partialFillTolerance,
+            policyReasonCode: orderPlan.policyReasonCode,
+            policyReasonMessage: orderPlan.policyReasonMessage,
+            allowedOrderTypes: orderPlan.allowedOrderTypes,
+            tickSize,
+            minOrderSize,
+            negRisk,
+            feeModel,
+            makerQuality,
+            negRiskVerdict,
+            duplicateExposureVerdict,
+            externalPortfolioAvailableCapital:
+              externalPortfolioSnapshot?.availableCapital ?? null,
+            externalPortfolioReservedCash:
+              externalPortfolioSnapshot?.reservedCash ?? null,
+            externalPortfolioAvailableInventory:
+              externalPortfolioSnapshot?.inventories.find(
+                (inventory) => inventory.tokenId === tokenId,
+              )?.availableQuantity ?? null,
+            expectedSlippage: slippage.expectedSlippage,
+            safetyState: activeSafetyState.state,
+            safetyReasonCodes: activeSafetyState.reasonCodes,
+            liveExecutionEnabled: appEnv.BOT_LIVE_EXECUTION_ENABLED,
+            error: lastError,
+          } as object,
+        },
+      });
+
+      if (submitSucceeded) {
+        submitted += 1;
+      } else {
+        if (terminalRejectReason) {
+          await this.rejectSignal(signal.id, terminalRejectReason);
+        }
+        rejected += 1;
+      }
+    }
+
+    this.logger.debug('Order execution cycle complete.', {
+      submitted,
+      rejected,
+      liveExecutionEnabled: appEnv.BOT_LIVE_EXECUTION_ENABLED,
+    });
+
+    return { submitted, rejected };
+  }
+
+  private async rejectSignal(signalId: string, reasonCode: string): Promise<void> {
+    await this.prisma.signal.update({
+      where: { id: signalId },
+      data: { status: 'rejected' },
+    });
+
+    await this.prisma.signalDecision.create({
+      data: {
+        id: randomUUID(),
+        signalId,
+        verdict: 'rejected',
+        reasonCode,
+        reasonMessage: reasonCode,
+        expectedEv: null,
+        positionSize: null,
+        decisionAt: new Date(),
+      },
+    });
+  }
+
+  private resolveExecutionIntent(
+    signal: unknown,
+    market: unknown,
+  ): ResolvedExecutionIntent | null {
+    const resolution = this.tradeIntentResolver.resolve({
+      market: {
+        id: this.readStringField(market, 'id') ?? '',
+        tokenIdYes: this.readStringField(market, 'tokenIdYes'),
+        tokenIdNo: this.readStringField(market, 'tokenIdNo'),
+      },
+      signal: {
+        marketId: this.readStringField(signal, 'marketId'),
+        side: this.readStringField(signal, 'side'),
+        venueSide: this.readStringField(signal, 'venueSide'),
+        tokenId: this.readStringField(signal, 'tokenId'),
+        outcome: this.readStringField(signal, 'outcome'),
+        targetOutcome: this.readStringField(signal, 'targetOutcome'),
+        action: this.readStringField(signal, 'action'),
+        intent: this.readStringField(signal, 'intent'),
+      },
+    });
+
+    if (!resolution.ok) {
+      return null;
+    }
+
+    return {
+      tokenId: resolution.resolved.tokenId,
+      outcome: resolution.resolved.outcome,
+      action: resolution.resolved.intent as ExecutionAction,
+      venueSide: resolution.resolved.venueSide,
+      inventoryEffect:
+        resolution.resolved.inventoryEffect === 'INCREASE'
+          ? 'increase'
+          : 'decrease',
+    };
+  }
+
+  private readStringField(source: unknown, key: string): string | null {
+    if (!source || typeof source !== 'object') {
+      return null;
+    }
+
+    const value = (source as Record<string, unknown>)[key];
+    return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+  }
+
+  private estimateRecentTradeCount(volume: number | null): number {
+    if (!Number.isFinite(volume ?? Number.NaN) || (volume ?? 0) <= 0) {
+      return 0;
+    }
+
+    if ((volume ?? 0) >= 500) {
+      return 10;
+    }
+    if ((volume ?? 0) >= 100) {
+      return 5;
+    }
+
+    return 1;
+  }
+
+  private clampPrice(price: number): number {
+    if (!Number.isFinite(price)) {
+      return 0;
+    }
+
+    return Math.min(0.999, Math.max(0.001, price));
+  }
+
+  private normalizeVenueStatus(status: string | null): string {
+    const normalized = (status ?? '').toLowerCase();
+    if (normalized.includes('part')) {
+      return 'partially_filled';
+    }
+    if (normalized.includes('fill')) {
+      return 'filled';
+    }
+    if (normalized.includes('cancel')) {
+      return 'canceled';
+    }
+    if (normalized.includes('ack')) {
+      return 'acknowledged';
+    }
+    if (normalized.includes('reject')) {
+      return 'rejected';
+    }
+    return 'submitted';
+  }
+
+  private executionUrgency(
+    expiryAt: Date | string,
+    noTradeWindowSeconds: number,
+  ): 'low' | 'medium' | 'high' {
+    const expiryTs = new Date(expiryAt).getTime();
+    if (!Number.isFinite(expiryTs)) {
+      return 'medium';
+    }
+
+    const secondsToExpiry = Math.floor((expiryTs - Date.now()) / 1000);
+    if (secondsToExpiry <= noTradeWindowSeconds + 20) {
+      return 'high';
+    }
+    if (secondsToExpiry <= noTradeWindowSeconds + 90) {
+      return 'medium';
+    }
+    return 'low';
+  }
+
+  private topLevelDepth(
+    orderbook: {
+      bidLevels: unknown;
+      askLevels: unknown;
+    },
+    side: VenueSide,
+  ): number {
+    const levels = side === 'BUY' ? orderbook.askLevels : orderbook.bidLevels;
+    if (!Array.isArray(levels) || levels.length === 0) {
+      return 0;
+    }
+
+    const top = levels[0];
+    if (Array.isArray(top) && top.length >= 2) {
+      const size = Number(top[1]);
+      return Number.isFinite(size) && size > 0 ? size : 0;
+    }
+    if (typeof top === 'object' && top !== null) {
+      const record = top as Record<string, unknown>;
+      const size = Number(record.size ?? record.s ?? Number.NaN);
+      return Number.isFinite(size) && size > 0 ? size : 0;
+    }
+    return 0;
+  }
+
+  private normalizePositiveNumber(value: number | null | undefined): number | null {
+    return Number.isFinite(value) && (value as number) > 0 ? (value as number) : null;
+  }
+
+  private quantizeToTick(price: number, tickSize: number): number {
+    const rounded = Math.round(price / tickSize) * tickSize;
+    return Number(rounded.toFixed(this.decimalPlaces(tickSize)));
+  }
+
+  private isOnTick(price: number, tickSize: number): boolean {
+    const scaled = price / tickSize;
+    return Math.abs(scaled - Math.round(scaled)) <= 1e-9;
+  }
+
+  private decimalPlaces(value: number): number {
+    const asString = value.toString();
+    const idx = asString.indexOf('.');
+    return idx === -1 ? 0 : asString.length - idx - 1;
+  }
+
+  private async assessExecutionReadiness(): Promise<{
+    ready: boolean;
+    reasonCode: string | null;
+  }> {
+    const prismaAny = this.prisma as any;
+    const [freshness, runtimeStatus] = await Promise.all([
+      this.runtimeControl.assessOperationalFreshness(),
+      prismaAny.botRuntimeStatus?.findUnique
+        ? prismaAny.botRuntimeStatus.findUnique({ where: { id: 'live' } })
+        : Promise.resolve(null),
+    ]);
+
+    if (!freshness.healthy) {
+      return {
+        ready: false,
+        reasonCode: freshness.reasonCode,
+      };
+    }
+
+    if (!runtimeStatus?.lastHeartbeatAt) {
+      return {
+        ready: false,
+        reasonCode: 'runtime_heartbeat_missing',
+      };
+    }
+
+    const heartbeatMaxAgeMs = Math.max(appEnv.BOT_PORTFOLIO_REFRESH_INTERVAL_MS * 2, 15_000);
+    const heartbeatAgeMs = Date.now() - new Date(runtimeStatus.lastHeartbeatAt).getTime();
+    if (heartbeatAgeMs > heartbeatMaxAgeMs) {
+      return {
+        ready: false,
+        reasonCode: 'runtime_heartbeat_stale',
+      };
+    }
+
+    return {
+      ready: true,
+      reasonCode: null,
+    };
+  }
+
+  private async resolveVenueFeeSnapshot(tokenId: string): Promise<{
+    feeRateBps: number;
+    fetchedAt: string;
+  } | null> {
+    if (this.shouldSkipVenueSemanticsLookups()) {
+      return null;
+    }
+
+    try {
+      const feeRate = await this.tradingClient.getFeeRate(tokenId);
+      return {
+        feeRateBps: feeRate.feeRateBps,
+        fetchedAt: feeRate.fetchedAt,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async resolveVenueRewardsMarkets(): Promise<VenueRewardMarket[]> {
+    if (this.shouldSkipVenueSemanticsLookups()) {
+      return [];
+    }
+
+    try {
+      return await this.tradingClient.getCurrentRewards();
+    } catch {
+      return [];
+    }
+  }
+
+  private shouldSkipVenueSemanticsLookups(): boolean {
+    return (
+      appEnv.IS_TEST ||
+      /(^https?:\/\/)?(localhost|127\.0\.0\.1)(:\d+)?$/i.test(appEnv.POLY_CLOB_HOST.trim())
+    );
+  }
+
+  private async resolveIntentEpoch(signalId: string): Promise<number> {
+    const prismaAny = this.prisma as any;
+    if (!signalId || !prismaAny.order?.count) {
+      return 0;
+    }
+
+    return prismaAny.order.count({
+      where: {
+        signalId,
+        status: 'canceled',
+      },
+    });
+  }
+
+  private shouldBlockIntentReplay(
+    priorIntent: PersistedOrderIntentRecord | null,
+  ): boolean {
+    return priorIntent !== null;
+  }
+
+  private normalizeVenueError(error: unknown): PolymarketNormalizedVenueError | null {
+    if (error instanceof PolymarketVenueError) {
+      return error.normalized;
+    }
+    if (
+      error &&
+      typeof error === 'object' &&
+      'normalized' in error &&
+      (error as Record<string, unknown>).normalized &&
+      typeof (error as Record<string, unknown>).normalized === 'object'
+    ) {
+      return (error as { normalized: PolymarketNormalizedVenueError }).normalized;
+    }
+    return null;
+  }
+
+  private isUncertainSubmitError(
+    normalized: PolymarketNormalizedVenueError | null,
+  ): boolean {
+    return (
+      normalized?.reasonCode === 'rate_limited' ||
+      normalized?.reasonCode === 'network_unavailable' ||
+      normalized?.reasonCode === 'server_unavailable' ||
+      normalized?.reasonCode === 'venue_unknown_error'
+    );
+  }
+
+  private async applyOperationalDecision(
+    normalized: PolymarketNormalizedVenueError | null,
+  ): Promise<void> {
+    if (!normalized) {
+      return;
+    }
+
+    const recentRejectCount = await this.countRecentOperationalRejects(
+      normalized.reasonCode,
+    );
+    const decision = this.operationalPolicy.evaluate({
+      reasonCode: normalized.reasonCode,
+      recentRejectCount,
+    });
+
+    if (!decision.transitionTo) {
+      return;
+    }
+
+    await this.runtimeControl.updateRuntimeStatus(
+      decision.transitionTo,
+      decision.reasonCode,
+    );
+    await this.prisma.auditEvent.create({
+      data: {
+        eventType: 'runtime.operational_transition',
+        message: 'Venue operational policy forced a runtime transition.',
+        metadata: {
+          normalized,
+          decision,
+          recentRejectCount,
+        } as object,
+      },
+    });
+  }
+
+  private async countRecentOperationalRejects(reasonCode: string): Promise<number> {
+    const prismaAny = this.prisma as any;
+    if (!prismaAny.auditEvent?.count) {
+      return 0;
+    }
+
+    return prismaAny.auditEvent.count({
+      where: {
+        eventType: 'order.rejected_on_submit',
+        createdAt: {
+          gte: new Date(Date.now() - 5 * 60 * 1000),
+        },
+      },
+    }).then((count: number) =>
+      reasonCode === 'venue_validation_failed' ? count : 1,
+    );
+  }
+
+  private reasonCodeFromVenueStatus(status: string | null): string {
+    const searchable = (status ?? '').toLowerCase();
+    if (searchable.includes('closed')) {
+      return 'venue_closed_only';
+    }
+    if (searchable.includes('geo')) {
+      return 'venue_geoblocked';
+    }
+    if (searchable.includes('auth')) {
+      return 'auth_failed';
+    }
+    if (searchable.includes('clock') || searchable.includes('time')) {
+      return 'clock_skew_detected';
+    }
+    return 'venue_submit_rejected';
+  }
+}

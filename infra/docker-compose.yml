@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: polymarket-btc-bot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: polymarket_btc_bot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - polymarket_btc_bot_postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    container_name: polymarket-btc-bot-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - polymarket_btc_bot_redis_data:/data
+
+volumes:
+  polymarket_btc_bot_postgres_data:
+  polymarket_btc_bot_redis_data:

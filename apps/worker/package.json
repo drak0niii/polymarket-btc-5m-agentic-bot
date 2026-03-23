@@ -1,0 +1,53 @@
+{
+  "name": "@polymarket-btc-5m-agentic-bot/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "ts-node --project tsconfig.json src/main.ts",
+    "start": "node dist/main.js",
+    "test": "DATABASE_URL=postgresql://test REDIS_URL=redis://test POLY_CLOB_HOST=http://localhost POLY_GAMMA_HOST=http://localhost POLY_PRIVATE_KEY=1111111111111111111111111111111111111111111111111111111111111111 POLY_API_KEY=test POLY_API_SECRET=test POLY_API_PASSPHRASE=test BOT_LIVE_EXECUTION_ENABLED=true ts-node -r tsconfig-paths/register --project tsconfig.json src/tests/integration-runner.ts",
+    "smoke:polymarket-auth": "ts-node -r tsconfig-paths/register --project tsconfig.json src/smoke/polymarket-auth-smoke.ts",
+    "readiness:production": "ts-node -r tsconfig-paths/register --project tsconfig.json src/smoke/production-readiness.ts",
+    "readiness:dashboard": "ts-node -r tsconfig-paths/register --project tsconfig.json src/runtime/readiness-dashboard.command.ts",
+    "replay:signal": "ts-node -r tsconfig-paths/register --project tsconfig.json src/runtime/replay.command.ts",
+    "chaos:p23": "ts-node -r tsconfig-paths/register --project tsconfig.json src/runtime/chaos-command.ts",
+    "chaos:p23:soak": "ts-node -r tsconfig-paths/register --project tsconfig.json src/runtime/chaos-command.ts --iterations=3",
+    "validate:lifecycle": "DATABASE_URL=postgresql://test REDIS_URL=redis://test POLY_CLOB_HOST=http://localhost POLY_GAMMA_HOST=http://localhost POLY_PRIVATE_KEY=1111111111111111111111111111111111111111111111111111111111111111 POLY_API_KEY=test POLY_API_SECRET=test POLY_API_PASSPHRASE=test BOT_LIVE_EXECUTION_ENABLED=true ts-node -r tsconfig-paths/register --project tsconfig.json src/validation/live-order-lifecycle-validation.ts",
+    "validate:lifecycle:soak": "DATABASE_URL=postgresql://test REDIS_URL=redis://test POLY_CLOB_HOST=http://localhost POLY_GAMMA_HOST=http://localhost POLY_PRIVATE_KEY=1111111111111111111111111111111111111111111111111111111111111111 POLY_API_KEY=test POLY_API_SECRET=test POLY_API_PASSPHRASE=test BOT_LIVE_EXECUTION_ENABLED=true ts-node -r tsconfig-paths/register --project tsconfig.json src/validation/live-order-lifecycle-validation.ts --soak-iterations=3 --scenario-delay-ms=15",
+    "validate:dataset-quality": "ts-node -r tsconfig-paths/register --project tsconfig.json src/validation/dataset-quality.command.ts",
+    "validate:p23": "ts-node -r tsconfig-paths/register --project tsconfig.json src/validation/p23-validation.ts",
+    "validate:capital-exposure": "DATABASE_URL=postgresql://test REDIS_URL=redis://test POLY_CLOB_HOST=http://localhost POLY_GAMMA_HOST=http://localhost POLY_PRIVATE_KEY=1111111111111111111111111111111111111111111111111111111111111111 POLY_API_KEY=test POLY_API_SECRET=test POLY_API_PASSPHRASE=test BOT_DEPLOYMENT_TIER=scaled_live BOT_LIVE_EXECUTION_ENABLED=true ts-node -r tsconfig-paths/register --project tsconfig.json src/runtime/capital-exposure.command.ts --mode=limited_cap_live",
+    "validate:p1": "corepack pnpm typecheck && corepack pnpm test",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@polymarket-btc-5m-agentic-bot/agent-layer": "workspace:*",
+    "@polymarket/clob-client": "^5.8.0",
+    "@polymarket-btc-5m-agentic-bot/domain": "workspace:*",
+    "@polymarket-btc-5m-agentic-bot/execution-engine": "workspace:*",
+    "@polymarket-btc-5m-agentic-bot/market-data": "workspace:*",
+    "@polymarket-btc-5m-agentic-bot/polymarket-adapter": "workspace:*",
+    "@prisma/client": "^6.16.1",
+    "@polymarket-btc-5m-agentic-bot/risk-engine": "workspace:*",
+    "@polymarket-btc-5m-agentic-bot/signal-engine": "workspace:*",
+    "@polymarket-btc-5m-agentic-bot/signing-engine": "workspace:*",
+    "dotenv": "^17.2.1",
+    "ethers": "5.8.0",
+    "reflect-metadata": "^0.2.2",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/ws": "^8.18.1",
+    "prisma": "^6.16.1",
+    "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.9.2",
+    "ws": "^8.18.3"
+  }
+}
