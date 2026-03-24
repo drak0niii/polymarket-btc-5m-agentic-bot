@@ -19,6 +19,7 @@ import { permissionsForRuntimeState } from './runtime-state-machine';
 import { MarketWebSocketStateService } from '@polymarket-btc-5m-agentic-bot/market-data';
 import { UserWebSocketStateService } from './user-websocket-state.service';
 import { InventoryLiquidationPolicy } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { LearningStateStore } from './learning-state-store';
 
 export class LiveLoop {
   private readonly logger = new AppLogger('LiveLoop');
@@ -51,16 +52,27 @@ export class LiveLoop {
     private readonly runtimeControl: RuntimeControlRepository,
     private readonly marketStreamService: MarketWebSocketStateService,
     private readonly userStreamService: UserWebSocketStateService,
+    private readonly learningStateStore?: LearningStateStore,
   ) {
     this.discoverMarketsJob = new DiscoverActiveBtcMarketsJob(this.prisma);
     this.syncBtcReferenceJob = new SyncBtcReferenceJob();
     this.syncOrderbooksJob = new SyncOrderbooksJob(this.prisma);
-    this.buildSignalsJob = new BuildSignalsJob(this.prisma);
+    this.buildSignalsJob = new BuildSignalsJob(
+      this.prisma,
+      undefined,
+      this.learningStateStore,
+    );
     this.evaluateTradesJob = new EvaluateTradeOpportunitiesJob(
       this.prisma,
       this.runtimeControl,
+      undefined,
+      this.learningStateStore,
     );
-    this.executeOrdersJob = new ExecuteOrdersJob(this.prisma, this.runtimeControl);
+    this.executeOrdersJob = new ExecuteOrdersJob(
+      this.prisma,
+      this.runtimeControl,
+      this.learningStateStore,
+    );
     this.manageOpenOrdersJob = new ManageOpenOrdersJob(this.prisma, this.runtimeControl);
     this.reconcileFillsJob = new ReconcileFillsJob(this.prisma, this.runtimeControl);
     this.refreshPortfolioJob = new RefreshPortfolioJob(this.prisma);

@@ -1,3 +1,5 @@
+import os from 'os';
+import path from 'path';
 import { randomUUID } from 'crypto';
 import { PrismaClient } from '@prisma/client';
 import { AppLogger } from '@worker/common/logger';
@@ -50,7 +52,25 @@ import { DeploymentTierPolicyService } from '@polymarket-btc-5m-agentic-bot/risk
 import { CapitalRampPolicyService } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { DecisionLogService } from '@worker/runtime/decision-log.service';
 import { LearningStateStore } from '@worker/runtime/learning-state-store';
-import type { CalibrationState } from '@polymarket-btc-5m-agentic-bot/domain';
+import {
+  buildStrategyVariantId,
+  type CalibrationState,
+} from '@polymarket-btc-5m-agentic-bot/domain';
+import { StrategyDeploymentRegistry } from '@worker/runtime/strategy-deployment-registry';
+import { StrategyRolloutController } from '@worker/runtime/strategy-rollout-controller';
+import {
+  VenueHealthLearningStore,
+  VenueModePolicy,
+  VenueUncertaintyDetector,
+} from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
+import {
+  VersionLineageRegistry,
+  buildAllocationPolicyVersionLineage,
+  buildCalibrationVersionLineage,
+  buildFeatureSetVersionLineage,
+  buildRiskPolicyVersionLineage,
+  buildStrategyVersionLineage,
+} from '@worker/runtime/version-lineage-registry';
 
 type Outcome = 'YES' | 'NO';
 type VenueSide = 'BUY' | 'SELL';
@@ -100,19 +120,37 @@ export class EvaluateTradeOpportunitiesJob {
   private readonly accountStateService: AccountStateService;
   private readonly marketEligibility = new MarketEligibilityService();
   private readonly decisionLogService: DecisionLogService;
-  private readonly learningStateStore = new LearningStateStore();
-  private readonly liveCalibrationStore = new LiveCalibrationStore({
-    loadState: () => this.learningStateStore.load(),
-    saveState: (state) => this.learningStateStore.save(state),
-  });
+  private readonly learningStateStore: LearningStateStore;
+  private readonly strategyDeploymentRegistry: StrategyDeploymentRegistry;
+  private readonly liveCalibrationStore: LiveCalibrationStore;
   private readonly confidenceShrinkagePolicy = new ConfidenceShrinkagePolicy();
+  private readonly strategyRolloutController = new StrategyRolloutController();
+  private readonly versionLineageRegistry: VersionLineageRegistry;
+  private readonly venueHealthLearningStore: VenueHealthLearningStore;
+  private readonly venueUncertaintyDetector = new VenueUncertaintyDetector();
+  private readonly venueModePolicy = new VenueModePolicy();
 
   constructor(
     private readonly prisma: PrismaClient,
     private readonly runtimeControl?: RuntimeControlRepository,
+    strategyDeploymentRegistry?: StrategyDeploymentRegistry,
+    learningStateStore?: LearningStateStore,
+    versionLineageRegistry?: VersionLineageRegistry,
+    venueHealthLearningStore?: VenueHealthLearningStore,
   ) {
     this.accountStateService = new AccountStateService(prisma);
     this.decisionLogService = new DecisionLogService(prisma);
+    this.learningStateStore = learningStateStore ?? new LearningStateStore();
+    this.strategyDeploymentRegistry =
+      strategyDeploymentRegistry ?? new StrategyDeploymentRegistry();
+    this.liveCalibrationStore = new LiveCalibrationStore({
+      loadState: () => this.learningStateStore.load(),
+      saveState: (state) => this.learningStateStore.save(state),
+    });
+    this.versionLineageRegistry =
+      versionLineageRegistry ?? new VersionLineageRegistry();
+    this.venueHealthLearningStore =
+      venueHealthLearningStore ?? createDefaultVenueHealthLearningStore(this.learningStateStore);
   }
 
   async run(
@@ -159,7 +197,16 @@ export class EvaluateTradeOpportunitiesJob {
         safetyControls: defaultSafety,
       };
     }
-    const calibrationByContext = await this.liveCalibrationStore.getAll();
+    const learningState = await this.learningStateStore.load();
+    const calibrationByContext = learningState.calibration;
+    const deploymentRegistry = await this.strategyDeploymentRegistry.load();
+    const venueMetrics = await this.venueHealthLearningStore.getCurrentMetrics();
+    const venueAssessment = this.venueUncertaintyDetector.evaluate(venueMetrics);
+    const venueMode = this.venueModePolicy.decide(venueAssessment);
+    await this.venueHealthLearningStore.setOperationalAssessment({
+      activeMode: venueMode.mode,
+      uncertaintyLabel: venueAssessment.label,
+    });
 
     const [
       latestPortfolio,
@@ -637,6 +684,7 @@ export class EvaluateTradeOpportunitiesJob {
       } else {
         const orderbookAgeMs = now.getTime() - new Date(orderbook.observedAt).getTime();
         if (orderbookAgeMs > appEnv.BOT_MAX_ORDERBOOK_AGE_MS) {
+          await this.venueHealthLearningStore.recordStaleDataInterval(orderbookAgeMs);
           reasons.push('orderbook_stale');
         }
       }
@@ -646,6 +694,7 @@ export class EvaluateTradeOpportunitiesJob {
       } else {
         const snapshotAgeMs = now.getTime() - new Date(snapshot.observedAt).getTime();
         if (snapshotAgeMs > appEnv.BOT_MAX_MARKET_SNAPSHOT_AGE_MS) {
+          await this.venueHealthLearningStore.recordStaleDataInterval(snapshotAgeMs);
           reasons.push('market_snapshot_stale');
         }
       }
@@ -673,6 +722,19 @@ export class EvaluateTradeOpportunitiesJob {
               signal.regime,
             )
           : null;
+      const rolloutControls = this.strategyRolloutController.getExecutionControls(
+        deploymentRegistry,
+        {
+          strategyVersionId: signal.strategyVersionId,
+        },
+      );
+      const portfolioAllocationDecision =
+        signal.strategyVersionId != null
+          ? this.resolvePortfolioAllocationDecision(
+              learningState,
+              buildStrategyVariantId(signal.strategyVersionId),
+            )
+          : null;
       const shrinkage = this.confidenceShrinkagePolicy.evaluate(calibration);
       const sizing = this.betSizing.calculate({
         bankroll,
@@ -695,6 +757,9 @@ export class EvaluateTradeOpportunitiesJob {
           (isNewExposure
             ? nextSafetyState.sizeMultiplier *
               shrinkage.sizeMultiplier *
+              (portfolioAllocationDecision?.targetMultiplier ?? 1) *
+              rolloutControls.sizeMultiplier *
+              venueMode.sizeMultiplier *
               deploymentTier.perTradeRiskMultiplier *
               Math.max(0, capitalRamp.capitalMultiplier)
             : 1),
@@ -708,6 +773,15 @@ export class EvaluateTradeOpportunitiesJob {
       }
       if (positionSize <= 0) {
         reasons.push('position_size_zero');
+      }
+      if (isNewExposure && (portfolioAllocationDecision?.targetMultiplier ?? 1) <= 0) {
+        reasons.push('portfolio_allocation_blocks_scaling');
+      }
+      if (isNewExposure && venueMode.blockNewEntries) {
+        reasons.push(`venue_mode_${venueMode.mode}`);
+      }
+      if (rolloutControls.blocked) {
+        reasons.unshift(...[...rolloutControls.reasonCodes].reverse());
       }
 
       if (resolvedIntent && orderbook && venueSide) {
@@ -893,9 +967,10 @@ export class EvaluateTradeOpportunitiesJob {
       }
 
       if (reasons.length > 0) {
+        const decisionId = randomUUID();
         await this.prisma.signalDecision.create({
           data: {
-            id: randomUUID(),
+            id: decisionId,
             signalId: signal.id,
             verdict: 'rejected',
             reasonCode: reasons[0],
@@ -926,16 +1001,107 @@ export class EvaluateTradeOpportunitiesJob {
             auditCoverage,
             calibration,
             shrinkage,
+            portfolioAllocationDecision,
+            rolloutControls,
+            venueAssessment,
+            venueMode,
           },
           createdAt: now.toISOString(),
+        });
+        await this.versionLineageRegistry.recordDecision({
+          decisionId,
+          decisionType: 'signal_execution',
+          recordedAt: now.toISOString(),
+          summary: `Execution admission rejected for signal ${signal.id}.`,
+          signalId: signal.id,
+          signalDecisionId: decisionId,
+          marketId: signal.marketId,
+          strategyVariantId:
+            signal.strategyVersionId != null
+              ? buildStrategyVariantId(signal.strategyVersionId)
+              : null,
+          lineage: {
+            strategyVersion: buildStrategyVersionLineage({
+              strategyVersionId: signal.strategyVersionId,
+              strategyVariantId:
+                signal.strategyVersionId != null
+                  ? buildStrategyVariantId(signal.strategyVersionId)
+                  : null,
+            }),
+            featureSetVersion: buildFeatureSetVersionLineage({
+              featureSetId: 'btc-five-minute-live-signal',
+              parentStrategyVersionId: signal.strategyVersionId,
+              parameters: {
+                signalShape: 'stored-signal-evaluation',
+                regime: signal.regime ?? null,
+                outcome: resolvedIntent?.outcome ?? null,
+              },
+            }),
+            calibrationVersion: buildCalibrationVersionLineage(calibration),
+            executionPolicyVersion: null,
+            riskPolicyVersion: buildRiskPolicyVersionLineage({
+              policyId: 'trade-evaluation',
+              parameters: {
+                runtimeConfig: config,
+                deploymentTier,
+                capitalRamp,
+                rolloutControls,
+                safetyState: nextSafetyState,
+                venueMode,
+              },
+            }),
+            allocationPolicyVersion: portfolioAllocationDecision
+              ? buildAllocationPolicyVersionLineage({
+                  policyId: 'capital-allocation-engine',
+                  strategyVariantId: buildStrategyVariantId(signal.strategyVersionId ?? ''),
+                  allocationDecisionKey: portfolioAllocationDecision.decisionKey,
+                  parameters: portfolioAllocationDecision.evidence,
+                })
+              : null,
+          },
+          replay: {
+            marketState: {
+              signal,
+              market,
+              orderbook,
+              marketSnapshot: snapshot,
+            },
+            runtimeState: {
+              runtimeStatus,
+              safetyState: nextSafetyState,
+            },
+            learningState: {
+              calibration,
+              portfolioAllocationDecision,
+              lastCycleSummary: learningState.lastCycleSummary,
+            },
+            lineageState: {
+              incumbentVariantId: deploymentRegistry.incumbentVariantId,
+              activeRollout: deploymentRegistry.activeRollout,
+            },
+            activeParameterBundle: {
+              deploymentTier,
+              capitalRamp,
+              executableEdge: calibratedExecutableEdge,
+              noTradeZone,
+              halfLife,
+              shrinkage,
+              rolloutControls,
+              venueAssessment,
+            },
+            venueMode: venueMode.mode,
+            venueUncertainty: venueAssessment.label,
+          },
+          tags: ['wave5', 'signal-execution', 'rejected'],
         });
         rejected += 1;
         continue;
       }
 
+      const decisionId = randomUUID();
       await this.prisma.signalDecision.create({
         data: {
-          id: randomUUID(),
+          id: decisionId,
           signalId: signal.id,
           verdict: 'approved',
           reasonCode: 'passed',
@@ -972,8 +1138,99 @@ export class EvaluateTradeOpportunitiesJob {
           positionSize,
           calibration,
           shrinkage,
+          portfolioAllocationDecision,
+          rolloutControls,
+          venueAssessment,
+          venueMode,
         },
         createdAt: now.toISOString(),
+      });
+      await this.versionLineageRegistry.recordDecision({
+        decisionId,
+        decisionType: 'signal_execution',
+        recordedAt: now.toISOString(),
+        summary: `Execution admission approved for signal ${signal.id}.`,
+        signalId: signal.id,
+        signalDecisionId: decisionId,
+        marketId: signal.marketId,
+        strategyVariantId:
+          signal.strategyVersionId != null
+            ? buildStrategyVariantId(signal.strategyVersionId)
+            : null,
+        lineage: {
+          strategyVersion: buildStrategyVersionLineage({
+            strategyVersionId: signal.strategyVersionId,
+            strategyVariantId:
+              signal.strategyVersionId != null
+                ? buildStrategyVariantId(signal.strategyVersionId)
+                : null,
+          }),
+          featureSetVersion: buildFeatureSetVersionLineage({
+            featureSetId: 'btc-five-minute-live-signal',
+            parentStrategyVersionId: signal.strategyVersionId,
+            parameters: {
+              signalShape: 'stored-signal-evaluation',
+              regime: signal.regime ?? null,
+              outcome: resolvedIntent?.outcome ?? null,
+            },
+          }),
+          calibrationVersion: buildCalibrationVersionLineage(calibration),
+          executionPolicyVersion: null,
+          riskPolicyVersion: buildRiskPolicyVersionLineage({
+            policyId: 'trade-evaluation',
+            parameters: {
+              runtimeConfig: config,
+              deploymentTier,
+              capitalRamp,
+              rolloutControls,
+              safetyState: nextSafetyState,
+              venueMode,
+            },
+          }),
+          allocationPolicyVersion: portfolioAllocationDecision
+            ? buildAllocationPolicyVersionLineage({
+                policyId: 'capital-allocation-engine',
+                strategyVariantId: buildStrategyVariantId(signal.strategyVersionId ?? ''),
+                allocationDecisionKey: portfolioAllocationDecision.decisionKey,
+                parameters: portfolioAllocationDecision.evidence,
+              })
+            : null,
+        },
+        replay: {
+          marketState: {
+            signal,
+            market,
+            orderbook,
+            marketSnapshot: snapshot,
+          },
+          runtimeState: {
+            runtimeStatus,
+            safetyState: nextSafetyState,
+          },
+          learningState: {
+            calibration,
+            portfolioAllocationDecision,
+            lastCycleSummary: learningState.lastCycleSummary,
+          },
+          lineageState: {
+            incumbentVariantId: deploymentRegistry.incumbentVariantId,
+            activeRollout: deploymentRegistry.activeRollout,
+          },
+          activeParameterBundle: {
+            deploymentTier,
+            capitalRamp,
+            executableEdge: calibratedExecutableEdge,
+            noTradeZone,
+            halfLife,
+            positionSize,
+            shrinkage,
+            rolloutControls,
+            venueAssessment,
+          },
+          venueMode: venueMode.mode,
+          venueUncertainty: venueAssessment.label,
+        },
+        tags: ['wave5', 'signal-execution', 'approved'],
       });
 
       if (isNewExposure) {
@@ -1241,6 +1498,13 @@ export class EvaluateTradeOpportunitiesJob {
     }
 
     return calibrationByContext[buildCalibrationContextKey(strategyVariantId, null)] ?? null;
+  }
+
+  private resolvePortfolioAllocationDecision(
+    learningState: Awaited<ReturnType<LearningStateStore['load']>>,
+    strategyVariantId: string,
+  ) {
+    return learningState.portfolioLearning.allocationDecisions[strategyVariantId] ?? null;
   }
 
   private readDivergenceStatus(
@@ -1564,4 +1828,22 @@ export class EvaluateTradeOpportunitiesJob {
       reconciliationHealthy,
     };
   }
+}
+
+function createDefaultVenueHealthLearningStore(
+  learningStateStore?: LearningStateStore,
+): VenueHealthLearningStore {
+  if (learningStateStore) {
+    return new VenueHealthLearningStore(
+      path.join(learningStateStore.getPaths().rootDir, '..', 'venue-health'),
+    );
+  }
+
+  if (process.env.DATABASE_URL === 'postgresql://test') {
+    return new VenueHealthLearningStore(
+      path.join(os.tmpdir(), `venue-health-${randomUUID()}`),
+    );
+  }
+
+  return new VenueHealthLearningStore();
 }

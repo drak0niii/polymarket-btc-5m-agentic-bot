@@ -64,17 +64,139 @@ export interface CalibrationState {
   lastUpdatedAt: string | null;
 }
 
+export type ExecutionPolicyMode =
+  | 'maker_preferred'
+  | 'balanced'
+  | 'taker_preferred';
+
+export interface ExecutionLearningContext {
+  contextKey: string;
+  strategyVariantId: string;
+  regime: string | null;
+  sampleCount: number;
+  makerSampleCount: number;
+  takerSampleCount: number;
+  makerFillRate: number;
+  takerFillRate: number;
+  averageFillDelayMs: number | null;
+  averageSlippage: number;
+  adverseSelectionScore: number;
+  cancelSuccessRate: number;
+  partialFillRate: number;
+  makerPunished: boolean;
+  health: HealthLabel;
+  notes: string[];
+  activePolicyVersionId: string | null;
+  lastUpdatedAt: string | null;
+}
+
+export interface ExecutionPolicyVersion {
+  versionId: string;
+  contextKey: string;
+  strategyVariantId: string;
+  regime: string | null;
+  mode: ExecutionPolicyMode;
+  recommendedRoute: 'maker' | 'taker';
+  recommendedExecutionStyle: 'rest' | 'cross';
+  sampleCount: number;
+  makerFillRateAssumption: number;
+  takerFillRateAssumption: number;
+  expectedFillDelayMs: number | null;
+  expectedSlippage: number;
+  adverseSelectionScore: number;
+  cancelSuccessRate: number;
+  partialFillRate: number;
+  health: HealthLabel;
+  rationale: string[];
+  sourceCycleId: string | null;
+  supersedesVersionId: string | null;
+  createdAt: string;
+}
+
 export interface ExecutionLearningState {
   version: number;
   updatedAt: string | null;
-  contexts: Record<
-    string,
-    {
-      sampleCount: number;
-      health: HealthLabel;
-      notes: string[];
-    }
-  >;
+  contexts: Record<string, ExecutionLearningContext>;
+  policyVersions: Record<string, ExecutionPolicyVersion>;
+  activePolicyVersionIds: Record<string, string>;
+  lastPolicyChangeAt: string | null;
+}
+
+export type PortfolioLearningSleeveType = 'variant' | 'regime' | 'opportunity_class';
+
+export interface PortfolioAllocationSlice {
+  sliceKey: string;
+  sleeveType: PortfolioLearningSleeveType;
+  sleeveValue: string;
+  sampleCount: number;
+  allocatedCapital: number;
+  expectedEvSum: number;
+  realizedEvSum: number;
+  realizedVsExpected: number | null;
+  allocationShare: number;
+  targetMultiplier: number;
+  lastUpdatedAt: string | null;
+}
+
+export interface PortfolioDrawdownState {
+  sleeveKey: string;
+  sleeveType: PortfolioLearningSleeveType;
+  sleeveValue: string;
+  realizedEvCumulative: number;
+  peakRealizedEv: number;
+  troughRealizedEv: number;
+  currentDrawdown: number;
+  maxDrawdown: number;
+  lastUpdatedAt: string | null;
+}
+
+export interface PortfolioConcentrationSignal {
+  signalKey: string;
+  sleeveType: PortfolioLearningSleeveType;
+  sleeveValue: string;
+  allocationShare: number;
+  concentrationScore: number;
+  penaltyMultiplier: number;
+  severity: 'none' | 'low' | 'medium' | 'high';
+  reasons: string[];
+  lastUpdatedAt: string | null;
+}
+
+export interface StrategyCorrelationSignal {
+  signalKey: string;
+  leftVariantId: string;
+  rightVariantId: string;
+  sharedSampleCount: number;
+  overlapScore: number;
+  realizedAlignment: number;
+  penaltyMultiplier: number;
+  hiddenOverlap: boolean;
+  reasons: string[];
+  lastUpdatedAt: string | null;
+}
+
+export interface PortfolioAllocationDecisionRecord {
+  decisionKey: string;
+  strategyVariantId: string;
+  targetMultiplier: number;
+  status: 'increase' | 'hold' | 'reduce' | 'block_scale';
+  reasons: string[];
+  evidence: Record<string, unknown>;
+  decidedAt: string | null;
+}
+
+export interface PortfolioLearningState {
+  version: number;
+  updatedAt: string | null;
+  allocationByVariant: Record<string, PortfolioAllocationSlice>;
+  allocationByRegime: Record<string, PortfolioAllocationSlice>;
+  allocationByOpportunityClass: Record<string, PortfolioAllocationSlice>;
+  drawdownBySleeve: Record<string, PortfolioDrawdownState>;
+  concentrationSignals: Record<string, PortfolioConcentrationSignal>;
+  correlationSignals: Record<string, StrategyCorrelationSignal>;
+  allocationDecisions: Record<string, PortfolioAllocationDecisionRecord>;
+  lastCorrelationUpdatedAt: string | null;
+  lastAllocationUpdatedAt: string | null;
 }
 
 export interface PromotionDecision {
@@ -141,7 +263,19 @@ export interface LearningEvent {
     | 'learning_cycle_failed'
     | 'calibration_updated'
     | 'edge_decay_detected'
-    | 'confidence_shrinkage_changed';
+    | 'confidence_shrinkage_changed'
+    | 'strategy_variant_registered'
+    | 'shadow_evaluation_completed'
+    | 'strategy_promotion_decided'
+    | 'strategy_quarantined'
+    | 'strategy_rollout_changed'
+    | 'strategy_rollback_triggered'
+    | 'execution_learning_updated'
+    | 'execution_policy_versioned'
+    | 'adverse_selection_detected'
+    | 'portfolio_learning_updated'
+    | 'capital_allocation_decided'
+    | 'correlation_signal_detected';
   severity: 'info' | 'warning' | 'critical';
   createdAt: string;
   cycleId: string | null;
@@ -160,6 +294,7 @@ export interface LearningState {
   strategyVariants: Record<string, StrategyVariantState>;
   calibration: Record<string, CalibrationState>;
   executionLearning: ExecutionLearningState;
+  portfolioLearning: PortfolioLearningState;
 }
 
 export function createDefaultExecutionLearningState(): ExecutionLearningState {
@@ -167,6 +302,52 @@ export function createDefaultExecutionLearningState(): ExecutionLearningState {
     version: 1,
     updatedAt: null,
     contexts: {},
+    policyVersions: {},
+    activePolicyVersionIds: {},
+    lastPolicyChangeAt: null,
+  };
+}
+
+export function createDefaultPortfolioLearningState(): PortfolioLearningState {
+  return {
+    version: 1,
+    updatedAt: null,
+    allocationByVariant: {},
+    allocationByRegime: {},
+    allocationByOpportunityClass: {},
+    drawdownBySleeve: {},
+    concentrationSignals: {},
+    correlationSignals: {},
+    allocationDecisions: {},
+    lastCorrelationUpdatedAt: null,
+    lastAllocationUpdatedAt: null,
+  };
+}
+
+export function createDefaultExecutionLearningContext(input: {
+  contextKey: string;
+  strategyVariantId: string;
+  regime?: string | null;
+}): ExecutionLearningContext {
+  return {
+    contextKey: input.contextKey,
+    strategyVariantId: input.strategyVariantId,
+    regime: input.regime ?? null,
+    sampleCount: 0,
+    makerSampleCount: 0,
+    takerSampleCount: 0,
+    makerFillRate: 0,
+    takerFillRate: 0,
+    averageFillDelayMs: null,
+    averageSlippage: 0,
+    adverseSelectionScore: 0,
+    cancelSuccessRate: 1,
+    partialFillRate: 0,
+    makerPunished: false,
+    health: 'healthy',
+    notes: [],
+    activePolicyVersionId: null,
+    lastUpdatedAt: null,
   };
 }
 
@@ -224,5 +405,6 @@ export function createDefaultLearningState(now = new Date()): LearningState {
     strategyVariants: {},
     calibration: {},
     executionLearning: createDefaultExecutionLearningState(),
+    portfolioLearning: createDefaultPortfolioLearningState(),
   };
 }

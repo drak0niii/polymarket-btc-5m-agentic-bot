@@ -15,6 +15,7 @@ export interface ExecutionSemanticsPolicyInput {
   noTradeWindowSeconds: number;
   partialFillTolerance?: PartialFillTolerance | null;
   preferResting?: boolean | null;
+  executionStyle?: ExecutionStyle | null;
   gtdMinLifetimeMs?: number;
   defaultGtdLifetimeMs?: number;
 }
@@ -39,8 +40,13 @@ export class ExecutionSemanticsPolicy {
         ? 'all_or_nothing'
         : 'allow_partial');
     const preferResting =
-      input.preferResting ??
-      (input.action === 'ENTER' && (input.urgency === 'low' || input.urgency === 'medium'));
+      input.executionStyle === 'rest'
+        ? true
+        : input.executionStyle === 'cross'
+          ? false
+          : input.preferResting ??
+            (input.action === 'ENTER' &&
+              (input.urgency === 'low' || input.urgency === 'medium'));
 
     if (preferResting) {
       if (input.urgency === 'low') {

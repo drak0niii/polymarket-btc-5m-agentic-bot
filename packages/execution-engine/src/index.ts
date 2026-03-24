@@ -1,6 +1,11 @@
+export * from './adaptive-maker-taker-policy';
+export * from './adverse-selection-monitor';
 export * from './cancel-replace-policy';
 export * from './duplicate-exposure-guard';
 export * from './execution-diagnostics';
+export * from './execution-learning-store';
+export * from './execution-policy-updater';
+export * from './execution-policy-version-store';
 export {
   ExecutionSemanticsPolicy,
   type ExecutionAction,

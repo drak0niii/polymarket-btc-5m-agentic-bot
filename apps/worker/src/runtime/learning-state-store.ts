@@ -3,11 +3,16 @@ import fs from 'fs/promises';
 import path from 'path';
 import type {
   CalibrationState,
+  ExecutionLearningState,
   LearningState,
+  PortfolioLearningState,
   StrategyVariantState,
 } from '@polymarket-btc-5m-agentic-bot/domain';
 import {
+  createDefaultExecutionLearningContext,
+  createDefaultExecutionLearningState,
   createDefaultLearningState,
+  createDefaultPortfolioLearningState,
   createDefaultStrategyVariantState,
 } from '@polymarket-btc-5m-agentic-bot/domain';
 import { AppLogger } from '@worker/common/logger';
@@ -219,10 +224,8 @@ function normalizeLearningState(raw: unknown): LearningState {
         : null,
     strategyVariants,
     calibration,
-    executionLearning:
-      record.executionLearning && typeof record.executionLearning === 'object'
-        ? (record.executionLearning as LearningState['executionLearning'])
-        : base.executionLearning,
+    executionLearning: normalizeExecutionLearning(record.executionLearning),
+    portfolioLearning: normalizePortfolioLearning(record.portfolioLearning),
   };
 }
 
@@ -249,9 +252,7 @@ function normalizeStrategyVariants(raw: unknown): Record<string, StrategyVariant
           ? record.calibrationContexts.filter((item): item is string => typeof item === 'string')
           : [],
         executionLearning:
-          record.executionLearning && typeof record.executionLearning === 'object'
-            ? (record.executionLearning as StrategyVariantState['executionLearning'])
-            : variant.executionLearning,
+          normalizeExecutionLearning(record.executionLearning),
         lastPromotionDecision:
           record.lastPromotionDecision && typeof record.lastPromotionDecision === 'object'
             ? (record.lastPromotionDecision as StrategyVariantState['lastPromotionDecision'])
@@ -272,6 +273,85 @@ function normalizeStrategyVariants(raw: unknown): Record<string, StrategyVariant
   }
 
   return next;
+}
+
+function normalizeExecutionLearning(raw: unknown): ExecutionLearningState {
+  const base = createDefaultExecutionLearningState();
+  if (!raw || typeof raw !== 'object') {
+    return base;
+  }
+
+  const record = raw as Record<string, unknown>;
+  const contexts: ExecutionLearningState['contexts'] = {};
+  const rawContexts =
+    record.contexts && typeof record.contexts === 'object'
+      ? (record.contexts as Record<string, unknown>)
+      : {};
+
+  for (const [contextKey, value] of Object.entries(rawContexts)) {
+    if (!value || typeof value !== 'object') {
+      continue;
+    }
+
+    const contextRecord = value as Record<string, unknown>;
+    const strategyVariantId =
+      readString(contextRecord.strategyVariantId) ?? 'unknown_strategy_variant';
+    const fallback = createDefaultExecutionLearningContext({
+      contextKey,
+      strategyVariantId,
+      regime: readString(contextRecord.regime),
+    });
+    contexts[contextKey] = {
+      ...fallback,
+      contextKey: readString(contextRecord.contextKey) ?? contextKey,
+      strategyVariantId,
+      regime: readString(contextRecord.regime),
+      sampleCount: readNumber(contextRecord.sampleCount),
+      makerSampleCount: readNumber(contextRecord.makerSampleCount),
+      takerSampleCount: readNumber(contextRecord.takerSampleCount),
+      makerFillRate: readNumber(contextRecord.makerFillRate),
+      takerFillRate: readNumber(contextRecord.takerFillRate),
+      averageFillDelayMs: readNullableNumber(contextRecord.averageFillDelayMs),
+      averageSlippage: readNumber(contextRecord.averageSlippage),
+      adverseSelectionScore: readNumber(contextRecord.adverseSelectionScore),
+      cancelSuccessRate: readNumber(contextRecord.cancelSuccessRate, 1),
+      partialFillRate: readNumber(contextRecord.partialFillRate),
+      makerPunished: readBoolean(contextRecord.makerPunished) ?? false,
+      health: readHealth(contextRecord.health) ?? fallback.health,
+      notes: Array.isArray(contextRecord.notes)
+        ? contextRecord.notes.filter((item): item is string => typeof item === 'string')
+        : [],
+      activePolicyVersionId: readString(contextRecord.activePolicyVersionId),
+      lastUpdatedAt: readString(contextRecord.lastUpdatedAt),
+    };
+  }
+
+  const policyVersions =
+    record.policyVersions && typeof record.policyVersions === 'object'
+      ? (record.policyVersions as ExecutionLearningState['policyVersions'])
+      : {};
+
+  const activePolicyVersionIds: Record<string, string> = {};
+  const rawActivePolicyVersionIds =
+    record.activePolicyVersionIds && typeof record.activePolicyVersionIds === 'object'
+      ? (record.activePolicyVersionIds as Record<string, unknown>)
+      : {};
+  for (const [contextKey, value] of Object.entries(rawActivePolicyVersionIds)) {
+    const versionId = readString(value);
+    if (versionId) {
+      activePolicyVersionIds[contextKey] = versionId;
+    }
+  }
+
+  return {
+    ...base,
+    version: readNumber(record.version, base.version),
+    updatedAt: readString(record.updatedAt),
+    contexts,
+    policyVersions,
+    activePolicyVersionIds,
+    lastPolicyChangeAt: readString(record.lastPolicyChangeAt),
+  };
 }
 
 function normalizeCalibration(raw: unknown): Record<string, CalibrationState> {
@@ -307,6 +387,181 @@ function normalizeCalibration(raw: unknown): Record<string, CalibrationState> {
   return next;
 }
 
+function normalizePortfolioLearning(raw: unknown): PortfolioLearningState {
+  const base = createDefaultPortfolioLearningState();
+  if (!raw || typeof raw !== 'object') {
+    return base;
+  }
+
+  const record = raw as Record<string, unknown>;
+  return {
+    ...base,
+    version: readNumber(record.version, base.version),
+    updatedAt: readString(record.updatedAt),
+    allocationByVariant: normalizePortfolioAllocationSlices(record.allocationByVariant),
+    allocationByRegime: normalizePortfolioAllocationSlices(record.allocationByRegime),
+    allocationByOpportunityClass: normalizePortfolioAllocationSlices(
+      record.allocationByOpportunityClass,
+    ),
+    drawdownBySleeve: normalizeDrawdownStates(record.drawdownBySleeve),
+    concentrationSignals: normalizeConcentrationSignals(record.concentrationSignals),
+    correlationSignals: normalizeCorrelationSignals(record.correlationSignals),
+    allocationDecisions: normalizeAllocationDecisions(record.allocationDecisions),
+    lastCorrelationUpdatedAt: readString(record.lastCorrelationUpdatedAt),
+    lastAllocationUpdatedAt: readString(record.lastAllocationUpdatedAt),
+  };
+}
+
+function normalizePortfolioAllocationSlices(
+  raw: unknown,
+): PortfolioLearningState['allocationByVariant'] {
+  if (!raw || typeof raw !== 'object') {
+    return {};
+  }
+
+  const next: PortfolioLearningState['allocationByVariant'] = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object') {
+      continue;
+    }
+    const record = value as Record<string, unknown>;
+    next[key] = {
+      sliceKey: readString(record.sliceKey) ?? key,
+      sleeveType: readSleeveType(record.sleeveType) ?? 'variant',
+      sleeveValue: readString(record.sleeveValue) ?? key,
+      sampleCount: readNumber(record.sampleCount),
+      allocatedCapital: readNumber(record.allocatedCapital),
+      expectedEvSum: readNumber(record.expectedEvSum),
+      realizedEvSum: readNumber(record.realizedEvSum),
+      realizedVsExpected: readNullableNumber(record.realizedVsExpected),
+      allocationShare: readNumber(record.allocationShare),
+      targetMultiplier: readNumber(record.targetMultiplier, 1),
+      lastUpdatedAt: readString(record.lastUpdatedAt),
+    };
+  }
+  return next;
+}
+
+function normalizeDrawdownStates(
+  raw: unknown,
+): PortfolioLearningState['drawdownBySleeve'] {
+  if (!raw || typeof raw !== 'object') {
+    return {};
+  }
+
+  const next: PortfolioLearningState['drawdownBySleeve'] = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object') {
+      continue;
+    }
+    const record = value as Record<string, unknown>;
+    next[key] = {
+      sleeveKey: readString(record.sleeveKey) ?? key,
+      sleeveType: readSleeveType(record.sleeveType) ?? 'variant',
+      sleeveValue: readString(record.sleeveValue) ?? key,
+      realizedEvCumulative: readNumber(record.realizedEvCumulative),
+      peakRealizedEv: readNumber(record.peakRealizedEv),
+      troughRealizedEv: readNumber(record.troughRealizedEv),
+      currentDrawdown: readNumber(record.currentDrawdown),
+      maxDrawdown: readNumber(record.maxDrawdown),
+      lastUpdatedAt: readString(record.lastUpdatedAt),
+    };
+  }
+  return next;
+}
+
+function normalizeConcentrationSignals(
+  raw: unknown,
+): PortfolioLearningState['concentrationSignals'] {
+  if (!raw || typeof raw !== 'object') {
+    return {};
+  }
+
+  const next: PortfolioLearningState['concentrationSignals'] = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object') {
+      continue;
+    }
+    const record = value as Record<string, unknown>;
+    next[key] = {
+      signalKey: readString(record.signalKey) ?? key,
+      sleeveType: readSleeveType(record.sleeveType) ?? 'variant',
+      sleeveValue: readString(record.sleeveValue) ?? key,
+      allocationShare: readNumber(record.allocationShare),
+      concentrationScore: readNumber(record.concentrationScore),
+      penaltyMultiplier: readNumber(record.penaltyMultiplier, 1),
+      severity: readSeverity(record.severity) ?? 'none',
+      reasons: Array.isArray(record.reasons)
+        ? record.reasons.filter((item): item is string => typeof item === 'string')
+        : [],
+      lastUpdatedAt: readString(record.lastUpdatedAt),
+    };
+  }
+  return next;
+}
+
+function normalizeCorrelationSignals(
+  raw: unknown,
+): PortfolioLearningState['correlationSignals'] {
+  if (!raw || typeof raw !== 'object') {
+    return {};
+  }
+
+  const next: PortfolioLearningState['correlationSignals'] = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object') {
+      continue;
+    }
+    const record = value as Record<string, unknown>;
+    next[key] = {
+      signalKey: readString(record.signalKey) ?? key,
+      leftVariantId: readString(record.leftVariantId) ?? 'unknown_left_variant',
+      rightVariantId: readString(record.rightVariantId) ?? 'unknown_right_variant',
+      sharedSampleCount: readNumber(record.sharedSampleCount),
+      overlapScore: readNumber(record.overlapScore),
+      realizedAlignment: readNumber(record.realizedAlignment),
+      penaltyMultiplier: readNumber(record.penaltyMultiplier, 1),
+      hiddenOverlap: readBoolean(record.hiddenOverlap) ?? false,
+      reasons: Array.isArray(record.reasons)
+        ? record.reasons.filter((item): item is string => typeof item === 'string')
+        : [],
+      lastUpdatedAt: readString(record.lastUpdatedAt),
+    };
+  }
+  return next;
+}
+
+function normalizeAllocationDecisions(
+  raw: unknown,
+): PortfolioLearningState['allocationDecisions'] {
+  if (!raw || typeof raw !== 'object') {
+    return {};
+  }
+
+  const next: PortfolioLearningState['allocationDecisions'] = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object') {
+      continue;
+    }
+    const record = value as Record<string, unknown>;
+    next[key] = {
+      decisionKey: readString(record.decisionKey) ?? key,
+      strategyVariantId: readString(record.strategyVariantId) ?? 'unknown_strategy_variant',
+      targetMultiplier: readNumber(record.targetMultiplier, 1),
+      status: readAllocationDecisionStatus(record.status) ?? 'hold',
+      reasons: Array.isArray(record.reasons)
+        ? record.reasons.filter((item): item is string => typeof item === 'string')
+        : [],
+      evidence:
+        record.evidence && typeof record.evidence === 'object'
+          ? (record.evidence as Record<string, unknown>)
+          : {},
+      decidedAt: readString(record.decidedAt),
+    };
+  }
+  return next;
+}
+
 function readErrorCode(error: unknown): string | undefined {
   return error && typeof error === 'object' && 'code' in error
     ? String((error as { code?: unknown }).code)
@@ -319,6 +574,37 @@ function readString(value: unknown): string | null {
 
 function readNumber(value: unknown, fallback = 0): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function readNullableNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function readBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null;
+}
+
+function readSleeveType(value: unknown): PortfolioLearningState['allocationByVariant'][string]['sleeveType'] | null {
+  return value === 'variant' || value === 'regime' || value === 'opportunity_class'
+    ? value
+    : null;
+}
+
+function readSeverity(value: unknown): PortfolioLearningState['concentrationSignals'][string]['severity'] | null {
+  return value === 'none' || value === 'low' || value === 'medium' || value === 'high'
+    ? value
+    : null;
+}
+
+function readAllocationDecisionStatus(
+  value: unknown,
+): PortfolioLearningState['allocationDecisions'][string]['status'] | null {
+  return value === 'increase' ||
+    value === 'hold' ||
+    value === 'reduce' ||
+    value === 'block_scale'
+    ? value
+    : null;
 }
 
 function readHealth(value: unknown): StrategyVariantState['health'] | null {

@@ -1,11 +1,16 @@
+import os from 'os';
+import path from 'path';
 import { randomUUID } from 'crypto';
 import { PrismaClient } from '@prisma/client';
 import { AppLogger } from '@worker/common/logger';
 import { BotRuntimeState } from '@worker/runtime/bot-state';
 import { appEnv } from '@worker/config/env';
 import {
+  AdaptiveMakerTakerPolicy,
+  ExecutionPolicyVersionStore,
   OrderIntentService,
 } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { buildStrategyVariantId } from '@polymarket-btc-5m-agentic-bot/domain';
 import { SignerHealth } from '@polymarket-btc-5m-agentic-bot/signing-engine';
 import { LiveTradeGuard } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { PreTradeFundingValidator } from '@polymarket-btc-5m-agentic-bot/risk-engine';
@@ -28,6 +33,7 @@ import {
   PolymarketNormalizedVenueError,
 } from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
 import { RuntimeControlRepository } from '@worker/runtime/runtime-control.repository';
+import { LearningStateStore } from '@worker/runtime/learning-state-store';
 import { AccountStateService } from '@worker/portfolio/account-state.service';
 import {
   OrderIntentRepository,
@@ -40,6 +46,19 @@ import {
 import { permissionsForRuntimeState } from '@worker/runtime/runtime-state-machine';
 import { MarketEligibilityService } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { VenueOperationalPolicyService } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import {
+  VenueHealthLearningStore,
+  VenueModePolicy,
+  VenueUncertaintyDetector,
+} from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
+import {
+  VersionLineageRegistry,
+  buildCalibrationVersionLineage,
+  buildExecutionPolicyVersionLineage,
+  buildFeatureSetVersionLineage,
+  buildRiskPolicyVersionLineage,
+  buildStrategyVersionLineage,
+} from '@worker/runtime/version-lineage-registry';
 
 type Outcome = 'YES' | 'NO';
 type VenueSide = 'BUY' | 'SELL';
@@ -73,6 +92,11 @@ export class ExecuteOrdersJob {
   private readonly marketEligibility = new MarketEligibilityService();
   private readonly orderIntentService = new OrderIntentService();
   private readonly operationalPolicy = new VenueOperationalPolicyService();
+  private readonly adaptiveMakerTakerPolicy = new AdaptiveMakerTakerPolicy();
+  private readonly versionLineageRegistry: VersionLineageRegistry;
+  private readonly venueHealthLearningStore: VenueHealthLearningStore;
+  private readonly venueUncertaintyDetector = new VenueUncertaintyDetector();
+  private readonly venueModePolicy = new VenueModePolicy();
   private readonly tradingClient = new OfficialPolymarketTradingClient({
     host: appEnv.POLY_CLOB_HOST,
     chainId: appEnv.POLY_CHAIN_ID,
@@ -87,6 +111,8 @@ export class ExecuteOrdersJob {
     maxClockSkewMs: appEnv.POLY_MAX_CLOCK_SKEW_MS,
   });
   private readonly runtimeControl: RuntimeControlRepository;
+  private readonly learningStateStore: LearningStateStore | null;
+  private readonly executionPolicyVersionStore: ExecutionPolicyVersionStore | null;
   private readonly externalPortfolioService: ExternalPortfolioService;
   private readonly accountStateService: Pick<AccountStateService, 'capture'>;
   private readonly orderIntentRepository: Pick<
@@ -97,6 +123,9 @@ export class ExecuteOrdersJob {
   constructor(
     private readonly prisma: PrismaClient,
     runtimeControl?: RuntimeControlRepository,
+    learningStateStore?: LearningStateStore,
+    versionLineageRegistry?: VersionLineageRegistry,
+    venueHealthLearningStore?: VenueHealthLearningStore,
   ) {
     this.runtimeControl =
       runtimeControl ??
@@ -111,6 +140,17 @@ export class ExecuteOrdersJob {
         orderReconcileIntervalMs: appEnv.BOT_ORDER_RECONCILE_INTERVAL_MS,
         portfolioRefreshIntervalMs: appEnv.BOT_PORTFOLIO_REFRESH_INTERVAL_MS,
       });
+    this.learningStateStore = learningStateStore ?? null;
+    this.executionPolicyVersionStore = this.learningStateStore
+      ? new ExecutionPolicyVersionStore({
+          loadState: () => this.learningStateStore!.load(),
+          saveState: (state) => this.learningStateStore!.save(state),
+        })
+      : null;
+    this.versionLineageRegistry =
+      versionLineageRegistry ?? new VersionLineageRegistry();
+    this.venueHealthLearningStore =
+      venueHealthLearningStore ?? createDefaultVenueHealthLearningStore(this.learningStateStore);
     this.externalPortfolioService = new ExternalPortfolioService(
       this.prisma,
       this.tradingClient,
@@ -161,6 +201,13 @@ export class ExecuteOrdersJob {
     }
 
     const activeSafetyState = await this.runtimeControl.getLatestSafetyState();
+    const venueMetrics = await this.venueHealthLearningStore.getCurrentMetrics();
+    const venueAssessment = this.venueUncertaintyDetector.evaluate(venueMetrics);
+    const venueMode = this.venueModePolicy.decide(venueAssessment);
+    await this.venueHealthLearningStore.setOperationalAssessment({
+      activeMode: venueMode.mode,
+      uncertaintyLabel: venueAssessment.label,
+    });
     if (activeSafetyState.haltRequested) {
       await this.prisma.auditEvent.create({
         data: {
@@ -243,6 +290,18 @@ export class ExecuteOrdersJob {
       const { tokenId, outcome, venueSide, action, inventoryEffect } = executionIntent;
       const isNewExposure = inventoryEffect === 'increase';
 
+      if (!venueMode.allowOrderSubmit) {
+        await this.rejectSignal(signal.id, `venue_mode_${venueMode.mode}`);
+        rejected += 1;
+        continue;
+      }
+
+      if (isNewExposure && venueMode.blockNewEntries) {
+        await this.rejectSignal(signal.id, `venue_mode_${venueMode.mode}`);
+        rejected += 1;
+        continue;
+      }
+
       if (isNewExposure && !activeSafetyState.allowNewEntries) {
         await this.rejectSignal(signal.id, 'safety_state_no_new_entries');
         rejected += 1;
@@ -268,6 +327,7 @@ export class ExecuteOrdersJob {
 
       const snapshotAgeMs = Date.now() - new Date(snapshot.observedAt).getTime();
       if (snapshotAgeMs > appEnv.BOT_MAX_MARKET_SNAPSHOT_AGE_MS) {
+        await this.venueHealthLearningStore.recordStaleDataInterval(snapshotAgeMs);
         await this.rejectSignal(signal.id, 'market_snapshot_stale');
         rejected += 1;
         continue;
@@ -308,6 +368,7 @@ export class ExecuteOrdersJob {
 
       const orderbookAgeMs = Date.now() - new Date(orderbook.observedAt).getTime();
       if (orderbookAgeMs > appEnv.BOT_MAX_ORDERBOOK_AGE_MS) {
+        await this.venueHealthLearningStore.recordStaleDataInterval(orderbookAgeMs);
         await this.rejectSignal(signal.id, 'orderbook_stale');
         rejected += 1;
         continue;
@@ -408,6 +469,28 @@ export class ExecuteOrdersJob {
       const bestBid = orderbook.bestBid ?? 0;
       const bestAsk = orderbook.bestAsk ?? 0;
       const urgency = this.executionUrgency(expiryAt, noTradeWindowSeconds);
+      const topLevelDepth = this.topLevelDepth(orderbook, venueSide);
+      const strategyVariantId = buildStrategyVariantId(signal.strategyVersionId);
+      const activeExecutionPolicy = this.executionPolicyVersionStore
+        ? await this.executionPolicyVersionStore.getActiveVersionForStrategy(
+            strategyVariantId,
+            signal.regime ?? null,
+          )
+        : null;
+      const adaptiveExecution = this.adaptiveMakerTakerPolicy.decide({
+        activePolicyVersion: activeExecutionPolicy,
+        marketContext: {
+          strategyVariantId,
+          regime: signal.regime ?? null,
+          action,
+          urgency,
+          spread:
+            typeof orderbook.spread === 'number' && Number.isFinite(orderbook.spread)
+              ? orderbook.spread
+              : null,
+          topLevelDepth,
+        },
+      });
 
       const marketable = this.marketableLimit.calculate({
         side: venueSide,
@@ -436,10 +519,11 @@ export class ExecuteOrdersJob {
         continue;
       }
 
-      const topLevelDepth = this.topLevelDepth(orderbook, venueSide);
       const capitalAwareDecisionSize =
         decision.positionSize *
-        (isNewExposure ? activeSafetyState.sizeMultiplier : 1);
+        (isNewExposure
+          ? activeSafetyState.sizeMultiplier * venueMode.sizeMultiplier
+          : 1);
       const initialSize = Math.max(0, capitalAwareDecisionSize / price);
       const size = topLevelDepth > 0 ? Math.min(initialSize, topLevelDepth * 0.8) : initialSize;
 
@@ -485,7 +569,8 @@ export class ExecuteOrdersJob {
           noTradeWindowSeconds,
           partialFillTolerance:
             action === 'ENTER' && urgency === 'high' ? 'all_or_nothing' : 'allow_partial',
-          preferResting: action === 'ENTER' && urgency !== 'high',
+          preferResting: adaptiveExecution.preferResting,
+          executionStyle: adaptiveExecution.executionStyle,
           venueConstraints: {
             tickSize,
             minOrderSize,
@@ -752,8 +837,12 @@ export class ExecuteOrdersJob {
           tokenId,
           attempts: (priorIntent?.attempts ?? 0) + 1,
         });
+        const submitStartedAtMs = Date.now();
         try {
           const response = await this.tradingClient.postOrder(payload);
+          await this.venueHealthLearningStore.recordRequest({
+            latencyMs: Date.now() - submitStartedAtMs,
+          });
 
           venueOrderId = response.orderId;
           lastVenueStatus = response.status;
@@ -799,6 +888,10 @@ export class ExecuteOrdersJob {
           const normalized = this.normalizeVenueError(error);
           await this.applyOperationalDecision(normalized);
           lastError = error instanceof Error ? error.message : String(error);
+          await this.venueHealthLearningStore.recordRequest({
+            latencyMs: Date.now() - submitStartedAtMs,
+            failureCategory: normalized?.category ?? normalized?.reasonCode ?? 'unknown',
+          });
           if (this.isUncertainSubmitError(normalized)) {
             await this.orderIntentRepository.record({
               intentId: orderIdentity.intentId,
@@ -980,8 +1073,10 @@ export class ExecuteOrdersJob {
         postedStatus === 'partially_filled' ||
         postedStatus === 'filled';
 
+      const auditEventId = randomUUID();
       await this.prisma.auditEvent.create({
         data: {
+          id: auditEventId,
           marketId: market.id,
           signalId: signal.id,
           orderId: localOrderId,
@@ -1009,6 +1104,10 @@ export class ExecuteOrdersJob {
             partialFillTolerance: orderPlan.partialFillTolerance,
             policyReasonCode: orderPlan.policyReasonCode,
             policyReasonMessage: orderPlan.policyReasonMessage,
+            learnedExecutionPolicyVersionId: adaptiveExecution.policyVersionId,
+            learnedExecutionMode: adaptiveExecution.mode,
+            learnedExecutionRationale: adaptiveExecution.rationale,
+            learnedExecutionStrategyVariantId: strategyVariantId,
             allowedOrderTypes: orderPlan.allowedOrderTypes,
             tickSize,
             minOrderSize,
@@ -1028,10 +1127,100 @@ export class ExecuteOrdersJob {
             expectedSlippage: slippage.expectedSlippage,
             safetyState: activeSafetyState.state,
             safetyReasonCodes: activeSafetyState.reasonCodes,
+            venueMode: venueMode.mode,
+            venueUncertainty: venueAssessment.label,
             liveExecutionEnabled: appEnv.BOT_LIVE_EXECUTION_ENABLED,
             error: lastError,
           } as object,
         },
+      });
+      const learningState = this.learningStateStore
+        ? await this.learningStateStore.load()
+        : null;
+      const calibration = signal.strategyVersionId && learningState
+        ? Object.values(learningState.calibration).find(
+            (candidate) =>
+              candidate.strategyVariantId === buildStrategyVariantId(signal.strategyVersionId!) &&
+              candidate.regime === (signal.regime ?? null),
+          ) ??
+          Object.values(learningState.calibration).find(
+            (candidate) =>
+              candidate.strategyVariantId === buildStrategyVariantId(signal.strategyVersionId!) &&
+              candidate.regime == null,
+          ) ??
+          null
+        : null;
+      await this.versionLineageRegistry.recordDecision({
+        decisionId: auditEventId,
+        decisionType: 'order_execution',
+        recordedAt: new Date().toISOString(),
+        summary: submitSucceeded
+          ? `Order submitted for signal ${signal.id}.`
+          : `Order rejected on submit for signal ${signal.id}.`,
+        signalId: signal.id,
+        orderId: localOrderId,
+        marketId: market.id,
+        strategyVariantId: buildStrategyVariantId(signal.strategyVersionId),
+        lineage: {
+          strategyVersion: buildStrategyVersionLineage({
+            strategyVersionId: signal.strategyVersionId,
+            strategyVariantId: buildStrategyVariantId(signal.strategyVersionId),
+          }),
+          featureSetVersion: buildFeatureSetVersionLineage({
+            featureSetId: 'btc-five-minute-execution',
+            parentStrategyVersionId: signal.strategyVersionId,
+            parameters: {
+              action,
+              urgency,
+              route: orderPlan.route,
+              executionStyle: orderPlan.executionStyle,
+            },
+          }),
+          calibrationVersion: buildCalibrationVersionLineage(calibration),
+          executionPolicyVersion: buildExecutionPolicyVersionLineage(activeExecutionPolicy),
+          riskPolicyVersion: buildRiskPolicyVersionLineage({
+            policyId: 'order-execution',
+            parameters: {
+              activeSafetyState,
+              venueMode,
+              signerHealth,
+              guard,
+            },
+          }),
+          allocationPolicyVersion: null,
+        },
+        replay: {
+          marketState: {
+            signal,
+            market,
+            marketSnapshot: snapshot,
+            orderbook,
+          },
+          runtimeState: {
+            activeSafetyState,
+          },
+          learningState: learningState
+            ? {
+                calibration,
+                executionLearning: learningState.executionLearning,
+              }
+            : null,
+          lineageState: {
+            activeExecutionPolicy,
+            adaptiveExecution,
+          },
+          activeParameterBundle: {
+            payload,
+            orderPlan,
+            feeModel,
+            makerQuality,
+            slippage,
+            duplicateExposureVerdict,
+          },
+          venueMode: venueMode.mode,
+          venueUncertainty: venueAssessment.label,
+        },
+        tags: ['wave5', 'order-execution', submitSucceeded ? 'submitted' : 'rejected'],
       });
 
       if (submitSucceeded) {
@@ -1423,4 +1612,22 @@ export class ExecuteOrdersJob {
     }
     return 'venue_submit_rejected';
   }
+}
+
+function createDefaultVenueHealthLearningStore(
+  learningStateStore?: LearningStateStore | null,
+): VenueHealthLearningStore {
+  if (learningStateStore) {
+    return new VenueHealthLearningStore(
+      path.join(learningStateStore.getPaths().rootDir, '..', 'venue-health'),
+    );
+  }
+
+  if (process.env.DATABASE_URL === 'postgresql://test') {
+    return new VenueHealthLearningStore(
+      path.join(os.tmpdir(), `venue-health-${randomUUID()}`),
+    );
+  }
+
+  return new VenueHealthLearningStore();
 }

@@ -5,3 +5,6 @@ export * from './market-discovery';
 export * from './official-trading-client';
 export * from './parsers/venue-parsers';
 export * from './polymarket-venue-awareness';
+export * from './venue/venue-health-learning-store';
+export * from './venue/venue-mode-policy';
+export * from './venue/venue-uncertainty-detector';

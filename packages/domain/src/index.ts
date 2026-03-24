@@ -7,3 +7,6 @@ export * from './learning-state';
 export * from './readiness';
 export * from './research';
 export * from './signal';
+export * from './strategy';
+export * from './strategy-variant';
+export * from './version-lineage';

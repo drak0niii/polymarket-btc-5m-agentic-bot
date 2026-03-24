@@ -151,6 +151,7 @@ export class OrderPlanner {
       noTradeWindowSeconds: input.noTradeWindowSeconds,
       partialFillTolerance: input.partialFillTolerance ?? null,
       preferResting: input.preferResting ?? null,
+      executionStyle: input.executionStyle ?? null,
     });
 
     return {

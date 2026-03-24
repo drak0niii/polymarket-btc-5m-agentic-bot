@@ -18,6 +18,7 @@ import { runPolymarketAuthenticatedSmoke } from '@worker/smoke/polymarket-auth-s
 import { MarketWebSocketStateService } from '@polymarket-btc-5m-agentic-bot/market-data';
 import { UserWebSocketStateService } from './user-websocket-state.service';
 import { DailyReviewJob } from '@worker/jobs/dailyReview.job';
+import { LearningStateStore } from './learning-state-store';
 
 const LEARNING_CYCLE_POLL_INTERVAL_MS = 60 * 60 * 1000;
 
@@ -118,6 +119,7 @@ export class BotRuntime {
     this.marketStreamService,
     this.userStreamService,
   );
+  private readonly learningStateStore = new LearningStateStore();
   private readonly stateStore = new BotStateStore(
     appEnv.BOT_DEFAULT_STATUS,
     (transition) => {
@@ -131,13 +133,17 @@ export class BotRuntime {
     this.stateStore,
     this.startupGateService,
   );
-  private readonly dailyReviewJob = new DailyReviewJob(this.prisma);
+  private readonly dailyReviewJob = new DailyReviewJob(
+    this.prisma,
+    this.learningStateStore,
+  );
   private readonly liveLoop = new LiveLoop(
     this.stateStore,
     this.prisma,
     this.runtimeControl,
     this.marketStreamService,
     this.userStreamService,
+    this.learningStateStore,
   );
   private heartbeatHandle: NodeJS.Timeout | null = null;
   private controlHandle: NodeJS.Timeout | null = null;

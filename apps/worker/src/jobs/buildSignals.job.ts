@@ -35,10 +35,47 @@ import { EdgeHalfLifePolicy } from '@polymarket-btc-5m-agentic-bot/signal-engine
 import { ResearchGovernancePolicy } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { RobustnessSuite } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { MultiObjectivePromotionScore } from '@polymarket-btc-5m-agentic-bot/signal-engine';
+import {
+  buildStrategyVariantId,
+  type LearningState,
+} from '@polymarket-btc-5m-agentic-bot/domain';
 import { DecisionLogService } from '@worker/runtime/decision-log.service';
+import { LearningStateStore } from '@worker/runtime/learning-state-store';
+import { StrategyDeploymentRegistry } from '@worker/runtime/strategy-deployment-registry';
+import { StrategyRolloutController } from '@worker/runtime/strategy-rollout-controller';
+import {
+  VersionLineageRegistry,
+  buildCalibrationVersionLineage,
+  buildFeatureSetVersionLineage,
+  buildRiskPolicyVersionLineage,
+  buildStrategyVersionLineage,
+} from '@worker/runtime/version-lineage-registry';
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function resolveCalibrationSnapshot(
+  learningState: LearningState,
+  strategyVersionId: string,
+  regime: string | null,
+) {
+  const strategyVariantId = buildStrategyVariantId(strategyVersionId);
+  const exact = Object.values(learningState.calibration).find(
+    (calibration) =>
+      calibration.strategyVariantId === strategyVariantId &&
+      calibration.regime === regime,
+  );
+  if (exact) {
+    return exact;
+  }
+
+  return (
+    Object.values(learningState.calibration).find(
+      (calibration) =>
+        calibration.strategyVariantId === strategyVariantId && calibration.regime == null,
+    ) ?? null
+  );
 }
 
 const MAX_SIGNAL_REBUILD_INTERVAL_MS = 20_000;
@@ -77,9 +114,23 @@ export class BuildSignalsJob {
   private readonly liquidityFilter = new LiquidityFilter();
   private readonly volatilityFilter = new VolatilityFilter();
   private readonly decisionLogService: DecisionLogService;
+  private readonly strategyDeploymentRegistry: StrategyDeploymentRegistry;
+  private readonly strategyRolloutController = new StrategyRolloutController();
+  private readonly learningStateStore: LearningStateStore;
+  private readonly versionLineageRegistry: VersionLineageRegistry;
 
-  constructor(private readonly prisma: PrismaClient) {
+  constructor(
+    private readonly prisma: PrismaClient,
+    strategyDeploymentRegistry?: StrategyDeploymentRegistry,
+    learningStateStore?: LearningStateStore,
+    versionLineageRegistry?: VersionLineageRegistry,
+  ) {
     this.decisionLogService = new DecisionLogService(prisma);
+    this.strategyDeploymentRegistry =
+      strategyDeploymentRegistry ?? new StrategyDeploymentRegistry();
+    this.learningStateStore = learningStateStore ?? new LearningStateStore();
+    this.versionLineageRegistry =
+      versionLineageRegistry ?? new VersionLineageRegistry();
   }
 
   async run(
@@ -105,14 +156,37 @@ export class BuildSignalsJob {
       return { created: 0 };
     }
 
-    const activeStrategyVersion = await this.prisma.strategyVersion.findFirst({
-      where: {
-        isActive: true,
-      },
-      orderBy: {
-        updatedAt: 'desc',
-      },
-    });
+    const strategyVersionModel = (this.prisma as any).strategyVersion;
+    const strategyVersions = strategyVersionModel?.findMany
+      ? ((await strategyVersionModel.findMany({
+          orderBy: [{ isActive: 'desc' }, { updatedAt: 'desc' }],
+        })) as Array<{ id: string; isActive: boolean; updatedAt: Date }>)
+      : strategyVersionModel?.findFirst
+        ? [await strategyVersionModel.findFirst({
+            where: {
+              isActive: true,
+            },
+            orderBy: {
+              updatedAt: 'desc',
+            },
+          })].filter(Boolean)
+        : [];
+    const strategyVersionById = new Map(
+      strategyVersions.map((version) => [version.id, version]),
+    );
+    const deploymentRegistry = await this.strategyDeploymentRegistry.load();
+    const configuredIncumbentStrategyVersionId =
+      deploymentRegistry.incumbentVariantId != null
+        ? deploymentRegistry.variants[deploymentRegistry.incumbentVariantId]?.strategyVersionId ??
+          null
+        : null;
+    const activeStrategyVersion =
+      (configuredIncumbentStrategyVersionId
+        ? strategyVersionById.get(configuredIncumbentStrategyVersionId)
+        : null) ??
+      strategyVersions.find((version) => version.isActive) ??
+      strategyVersions[0] ??
+      null;
 
     if (!activeStrategyVersion) {
       this.logger.warn(
@@ -129,6 +203,7 @@ export class BuildSignalsJob {
 
     let created = 0;
     const now = new Date();
+    const learningState = await this.learningStateStore.load();
 
     for (const market of markets) {
       const yesTokenId = market.tokenIdYes ?? market.tokenIdNo;
@@ -195,6 +270,21 @@ export class BuildSignalsJob {
         orderbook,
         expiresAt: market.expiresAt ? new Date(market.expiresAt).toISOString() : null,
       });
+      const strategyAssignment = this.strategyRolloutController.resolveSignalAssignment(
+        deploymentRegistry,
+        {
+          marketId: market.id,
+          observedAt: now.toISOString(),
+        },
+      );
+      const selectedStrategyVersion =
+        (strategyAssignment.strategyVersionId
+          ? strategyVersionById.get(strategyAssignment.strategyVersionId)
+          : null) ??
+        (deploymentRegistry.incumbentVariantId == null ? activeStrategyVersion : null);
+      if (!selectedStrategyVersion) {
+        continue;
+      }
       const regime = this.regimeClassifier.classify(features);
 
       const expiryCheck = this.noTradeNearExpiryFilter.evaluate({
@@ -328,7 +418,7 @@ export class BuildSignalsJob {
         }),
       });
       const researchGovernance = this.researchGovernancePolicy.evaluate({
-        strategyVersionId: activeStrategyVersion.id,
+        strategyVersionId: selectedStrategyVersion.id,
         edgeDefinitionVersion: edgeDefinition.version,
         validation: walkForward,
       });
@@ -409,7 +499,7 @@ export class BuildSignalsJob {
         minimumConfidence: edgeDefinition.admissionThresholdPolicy.minimumConfidence,
       });
 
-      await this.persistResearchGovernance(activeStrategyVersion.id, {
+      await this.persistResearchGovernance(selectedStrategyVersion.id, {
         edgeDefinitionVersion: edgeDefinition.version,
         governance: researchGovernance,
         robustness,
@@ -430,14 +520,15 @@ export class BuildSignalsJob {
           researchGovernance,
           robustness,
           promotion,
+          strategyAssignment,
         },
         createdAt: now.toISOString(),
       });
 
       if (!admission.admitted) {
-        await this.recordNoTradeDecision({
+        const noTradeDecision = await this.recordNoTradeDecision({
           marketId: market.id,
-          strategyVersionId: activeStrategyVersion.id,
+          strategyVersionId: selectedStrategyVersion.id,
           priorProbability: prior.probabilityUp,
           posteriorProbability: posterior.posteriorProbability,
           marketImpliedProb,
@@ -451,6 +542,90 @@ export class BuildSignalsJob {
             `family=${strategyFamily.family}`,
             `noTrade=${noTradeZone.reasons.join('|') || 'none'}`,
           ].join(','),
+        });
+        await this.versionLineageRegistry.recordDecision({
+          decisionId: noTradeDecision.signalDecisionId ?? noTradeDecision.signalId,
+          decisionType: 'signal_build',
+          recordedAt: now.toISOString(),
+          summary: `Signal build rejected for market ${market.id}.`,
+          signalId: noTradeDecision.signalId,
+          signalDecisionId: noTradeDecision.signalDecisionId,
+          marketId: market.id,
+          strategyVariantId:
+            strategyAssignment.variantId ??
+            buildStrategyVariantId(selectedStrategyVersion.id),
+          lineage: {
+            strategyVersion: buildStrategyVersionLineage({
+              strategyVersionId: selectedStrategyVersion.id,
+              strategyVariantId:
+                strategyAssignment.variantId ??
+                buildStrategyVariantId(selectedStrategyVersion.id),
+            }),
+            featureSetVersion: buildFeatureSetVersionLineage({
+              featureSetId: 'btc-five-minute-core',
+              parentStrategyVersionId: selectedStrategyVersion.id,
+              parameters: {
+                edgeDefinitionVersion: edgeDefinition.version,
+                family: strategyFamily.family,
+                regimeClassifier: 'RegimeClassifier',
+                executableEvModel: 'ExecutableEvModel',
+                marketEligibility: 'MarketEligibilityService',
+              },
+            }),
+            calibrationVersion: buildCalibrationVersionLineage(
+              resolveCalibrationSnapshot(
+                learningState,
+                selectedStrategyVersion.id,
+                regime.label,
+              ),
+            ),
+            executionPolicyVersion: null,
+            riskPolicyVersion: buildRiskPolicyVersionLineage({
+              policyId: 'signal-admission',
+              parameters: {
+                edgeDefinitionVersion: edgeDefinition.version,
+                admission,
+                noTradeWindowSeconds: appEnv.NO_TRADE_WINDOW_SECONDS,
+              },
+            }),
+            allocationPolicyVersion: null,
+          },
+          replay: {
+            marketState: {
+              market,
+              orderbook: latestOrderbook,
+              marketSnapshot: latestSnapshot,
+              features,
+              regime,
+              strategyAssignment,
+            },
+            runtimeState: {
+              runtimeState: options?.runtimeState ?? null,
+            },
+            learningState: {
+              lastCycleSummary: learningState.lastCycleSummary,
+              calibration: resolveCalibrationSnapshot(
+                learningState,
+                selectedStrategyVersion.id,
+                regime.label,
+              ),
+            },
+            lineageState: {
+              incumbentVariantId: deploymentRegistry.incumbentVariantId,
+              activeRollout: deploymentRegistry.activeRollout,
+            },
+            activeParameterBundle: {
+              edgeDefinition,
+              admission,
+              researchGovernance,
+              robustness,
+              promotion,
+              noTradeZone,
+            },
+            venueMode: null,
+            venueUncertainty: null,
+          },
+          tags: ['wave5', 'signal-build', 'rejected'],
         });
         await this.decisionLogService.record({
           category: 'admission',
@@ -466,10 +641,11 @@ export class BuildSignalsJob {
             noTradeZone,
             researchGovernance,
             robustness,
+            strategyAssignment,
           },
           createdAt: now.toISOString(),
         });
-        await this.persistWalkForwardDiagnostics(activeStrategyVersion.id, walkForward);
+        await this.persistWalkForwardDiagnostics(selectedStrategyVersion.id, walkForward);
         continue;
       }
 
@@ -485,7 +661,7 @@ export class BuildSignalsJob {
         data: {
           id: signalId,
           marketId: market.id,
-          strategyVersionId: activeStrategyVersion.id,
+          strategyVersionId: selectedStrategyVersion.id,
           side: 'BUY',
           tokenId,
           outcome: signalDirection,
@@ -501,6 +677,87 @@ export class BuildSignalsJob {
           observedAt: now,
         },
       });
+      await this.versionLineageRegistry.recordDecision({
+        decisionId: signalId,
+        decisionType: 'signal_build',
+        recordedAt: now.toISOString(),
+        summary: `Signal build admitted for market ${market.id}.`,
+        signalId,
+        marketId: market.id,
+        strategyVariantId:
+          strategyAssignment.variantId ?? buildStrategyVariantId(selectedStrategyVersion.id),
+        lineage: {
+          strategyVersion: buildStrategyVersionLineage({
+            strategyVersionId: selectedStrategyVersion.id,
+            strategyVariantId:
+              strategyAssignment.variantId ?? buildStrategyVariantId(selectedStrategyVersion.id),
+          }),
+          featureSetVersion: buildFeatureSetVersionLineage({
+            featureSetId: 'btc-five-minute-core',
+            parentStrategyVersionId: selectedStrategyVersion.id,
+            parameters: {
+              edgeDefinitionVersion: edgeDefinition.version,
+              family: strategyFamily.family,
+              regimeClassifier: 'RegimeClassifier',
+              executableEvModel: 'ExecutableEvModel',
+              marketEligibility: 'MarketEligibilityService',
+            },
+          }),
+          calibrationVersion: buildCalibrationVersionLineage(
+            resolveCalibrationSnapshot(
+              learningState,
+              selectedStrategyVersion.id,
+              regime.label,
+            ),
+          ),
+          executionPolicyVersion: null,
+          riskPolicyVersion: buildRiskPolicyVersionLineage({
+            policyId: 'signal-admission',
+            parameters: {
+              edgeDefinitionVersion: edgeDefinition.version,
+              executableEdge: admission.executableEdge,
+              noTradeWindowSeconds: appEnv.NO_TRADE_WINDOW_SECONDS,
+            },
+          }),
+          allocationPolicyVersion: null,
+        },
+        replay: {
+          marketState: {
+            market,
+            orderbook: latestOrderbook,
+            marketSnapshot: latestSnapshot,
+            features,
+            regime,
+            strategyAssignment,
+          },
+          runtimeState: {
+            runtimeState: options?.runtimeState ?? null,
+          },
+          learningState: {
+            lastCycleSummary: learningState.lastCycleSummary,
+            calibration: resolveCalibrationSnapshot(
+              learningState,
+              selectedStrategyVersion.id,
+              regime.label,
+            ),
+          },
+          lineageState: {
+            incumbentVariantId: deploymentRegistry.incumbentVariantId,
+            activeRollout: deploymentRegistry.activeRollout,
+          },
+          activeParameterBundle: {
+            edgeDefinition,
+            admission,
+            researchGovernance,
+            robustness,
+            promotion,
+            noTradeZone,
+          },
+          venueMode: null,
+          venueUncertainty: null,
+        },
+        tags: ['wave5', 'signal-build', 'admitted'],
+      });
       await this.decisionLogService.record({
         category: 'admission',
         eventType: 'signal.admission_decision',
@@ -515,11 +772,12 @@ export class BuildSignalsJob {
           researchGovernance,
           robustness,
           promotion,
+          strategyAssignment,
         },
         createdAt: now.toISOString(),
       });
 
-      await this.persistWalkForwardDiagnostics(activeStrategyVersion.id, walkForward);
+      await this.persistWalkForwardDiagnostics(selectedStrategyVersion.id, walkForward);
 
       created += 1;
     }
@@ -657,8 +915,9 @@ export class BuildSignalsJob {
     observedAt: Date;
     reasonCode: string;
     reasonMessage: string;
-  }): Promise<void> {
+  }): Promise<{ signalId: string; signalDecisionId: string | null }> {
     const signalId = randomUUID();
+    let signalDecisionId: string | null = null;
 
     await (this.prisma as any).signal.create({
       data: {
@@ -695,9 +954,10 @@ export class BuildSignalsJob {
     }).signalDecision;
 
     if (signalDecisionModel?.create) {
+      signalDecisionId = randomUUID();
       await signalDecisionModel.create({
         data: {
-          id: randomUUID(),
+          id: signalDecisionId,
           signalId,
           verdict: 'rejected',
           reasonCode: input.reasonCode,
@@ -708,6 +968,11 @@ export class BuildSignalsJob {
         },
       });
     }
+
+    return {
+      signalId,
+      signalDecisionId,
+    };
   }
 
   private async persistWalkForwardDiagnostics(

@@ -32,7 +32,12 @@ import {
 } from '../portfolio/external-portfolio.service';
 import { CancelReplacePolicy } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { DuplicateExposureGuard } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { AdaptiveMakerTakerPolicy } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { buildExecutionLearningContextKey } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { ExecutionSemanticsPolicy } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { ExecutionLearningStore } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { ExecutionPolicyUpdater } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { ExecutionPolicyVersionStore } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { FeeAccountingService } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { FillStateService } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { MakerQualityPolicy } from '@polymarket-btc-5m-agentic-bot/execution-engine';
@@ -120,6 +125,12 @@ import { ReplayEngine } from '../runtime/replay-engine';
 import { DailyReviewJob } from '../jobs/dailyReview.job';
 import { LearningEventLog } from '../runtime/learning-event-log';
 import { LearningStateStore } from '../runtime/learning-state-store';
+import { StrategyDeploymentRegistry } from '../runtime/strategy-deployment-registry';
+import {
+  createDefaultLearningState,
+  createDefaultExecutionLearningState,
+  createDefaultStrategyDeploymentRegistryState,
+} from '@polymarket-btc-5m-agentic-bot/domain';
 import {
   buildBalanceAllowancePayloadFixture,
   buildGammaMarketFixture,
@@ -129,6 +140,11 @@ import {
 } from '../fixtures/polymarket-venue-fixtures';
 import { WebSocketServer, WebSocket } from 'ws';
 import { ConfidenceShrinkagePolicy } from '@polymarket-btc-5m-agentic-bot/signal-engine';
+import { waveFiveChampionChallengerIntegrationTests } from './champion-challenger.integration.test';
+import { waveFiveExecutionLearningIntegrationTests } from './execution-learning.integration.test';
+import { waveFiveLearningCycleIntegrationTests } from './learning-cycle.integration.test';
+import { waveFiveQuarantineIntegrationTests } from './quarantine-policy.integration.test';
+import { waveFiveVersionLineageIntegrationTests } from './version-lineage.integration.test';
 
 const repoRoot = path.resolve(__dirname, '../../../..');
 
@@ -767,6 +783,123 @@ async function testBuildSignalsPersistsActiveStrategyVersion(): Promise<void> {
 
   assert.strictEqual(result.created >= 0, true);
   assert.strictEqual(createdStrategyVersionId, 'strategy-live-1');
+}
+
+async function testBuildSignalsUsesDeploymentRegistryAssignment(): Promise<void> {
+  let createdStrategyVersionId: string | null = null;
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'strategy-build-assignment-'));
+  const registry = new StrategyDeploymentRegistry(rootDir);
+  const state = createDefaultStrategyDeploymentRegistryState(
+    new Date('2026-03-24T00:00:00.000Z'),
+  );
+  state.incumbentVariantId = 'variant:strategy-challenger-2';
+  state.variants['variant:strategy-live-1'] = {
+    variantId: 'variant:strategy-live-1',
+    strategyVersionId: 'strategy-live-1',
+    status: 'shadow',
+    evaluationMode: 'shadow_only',
+    rolloutStage: 'shadow_only',
+    health: 'healthy',
+    lineage: {
+      variantId: 'variant:strategy-live-1',
+      strategyVersionId: 'strategy-live-1',
+      parentVariantId: null,
+      createdAt: '2026-03-20T00:00:00.000Z',
+      createdReason: 'test',
+    },
+    capitalAllocationPct: 0,
+    lastShadowEvaluatedAt: null,
+    createdAt: '2026-03-20T00:00:00.000Z',
+    updatedAt: '2026-03-20T00:00:00.000Z',
+  };
+  state.variants['variant:strategy-challenger-2'] = {
+    variantId: 'variant:strategy-challenger-2',
+    strategyVersionId: 'strategy-challenger-2',
+    status: 'incumbent',
+    evaluationMode: 'full',
+    rolloutStage: 'full',
+    health: 'healthy',
+    lineage: {
+      variantId: 'variant:strategy-challenger-2',
+      strategyVersionId: 'strategy-challenger-2',
+      parentVariantId: 'variant:strategy-live-1',
+      createdAt: '2026-03-20T00:00:00.000Z',
+      createdReason: 'test',
+    },
+    capitalAllocationPct: 1,
+    lastShadowEvaluatedAt: null,
+    createdAt: '2026-03-20T00:00:00.000Z',
+    updatedAt: '2026-03-20T00:00:00.000Z',
+  };
+  state.activeRollout = {
+    incumbentVariantId: 'variant:strategy-live-1',
+    challengerVariantId: 'variant:strategy-challenger-2',
+    stage: 'full',
+    challengerAllocationPct: 1,
+    rolloutSalt: 'salt',
+    appliedReason: 'test',
+    appliedAt: '2026-03-24T00:00:00.000Z',
+  };
+  await registry.save(state);
+
+  const prisma = {
+    strategyVersion: {
+      findMany: async () => [
+        {
+          id: 'strategy-live-1',
+          isActive: true,
+          updatedAt: new Date('2026-03-24T00:00:00.000Z'),
+        },
+        {
+          id: 'strategy-challenger-2',
+          isActive: false,
+          updatedAt: new Date('2026-03-24T00:01:00.000Z'),
+        },
+      ],
+    },
+    market: {
+      findMany: async () => [
+        {
+          id: 'm1',
+          slug: 'btc-5m-higher',
+          title: 'Will BTC be higher in 5 minutes?',
+          status: 'active',
+          tokenIdYes: 'yes1',
+          tokenIdNo: 'no1',
+          expiresAt: new Date(Date.now() + 120_000),
+          updatedAt: new Date(),
+        },
+      ],
+    },
+    orderbook: {
+      findFirst: async () => ({
+        bidLevels: [{ price: 0.48, size: 120 }],
+        askLevels: [{ price: 0.49, size: 120 }],
+        bestBid: 0.48,
+        bestAsk: 0.49,
+        spread: 0.01,
+        tickSize: 0.01,
+        minOrderSize: 1,
+        negRisk: false,
+        observedAt: new Date(),
+      }),
+    },
+    marketSnapshot: {
+      findFirst: async () => createFreshSnapshot(),
+    },
+    signal: {
+      findFirst: async () => null,
+      create: async ({ data }: { data: { strategyVersionId: string } }) => {
+        createdStrategyVersionId = data.strategyVersionId;
+      },
+    },
+  };
+
+  const job = new BuildSignalsJob(prisma as never, registry);
+  const result = await job.run(createHealthyBtcReference());
+
+  assert.strictEqual(result.created >= 0, true);
+  assert.strictEqual(createdStrategyVersionId, 'strategy-challenger-2');
 }
 
 async function testBtcFiveMinuteUniverseAdmissionAndRejection(): Promise<void> {
@@ -2755,6 +2888,51 @@ async function testExecutionSemanticsPolicySelectsExplicitOrderStyles(): Promise
   assert.strictEqual(partial.orderType, 'FAK');
   assert.strictEqual(timeBoxed.timeDiscipline, 'deadline');
   assert.strictEqual(allOrNothing.route, 'taker');
+}
+
+async function testAdaptiveMakerTakerPolicyUsesLearnedPolicyVersion(): Promise<void> {
+  const policy = new AdaptiveMakerTakerPolicy();
+  const decision = policy.decide({
+    activePolicyVersion: {
+      versionId: 'execution-policy:test:v1',
+      contextKey: 'execution:strategy:variant:strategy-live-1|regime:trend_burst',
+      strategyVariantId: 'variant:strategy-live-1',
+      regime: 'trend_burst',
+      mode: 'taker_preferred',
+      recommendedRoute: 'taker',
+      recommendedExecutionStyle: 'cross',
+      sampleCount: 8,
+      makerFillRateAssumption: 0.2,
+      takerFillRateAssumption: 0.95,
+      expectedFillDelayMs: 30_000,
+      expectedSlippage: 0.004,
+      adverseSelectionScore: 0.7,
+      cancelSuccessRate: 0.5,
+      partialFillRate: 0.25,
+      health: 'degraded',
+      rationale: ['maker_adverse_selection_detected'],
+      sourceCycleId: 'cycle-1',
+      supersedesVersionId: null,
+      createdAt: '2026-03-25T00:00:00.000Z',
+    },
+    marketContext: {
+      strategyVariantId: 'variant:strategy-live-1',
+      regime: 'trend_burst',
+      action: 'ENTER',
+      urgency: 'low',
+      spread: 0.01,
+      topLevelDepth: 50,
+    },
+  });
+
+  assert.strictEqual(decision.route, 'taker');
+  assert.strictEqual(decision.executionStyle, 'cross');
+  assert.strictEqual(decision.policyVersionId, 'execution-policy:test:v1');
+  assert.strictEqual(
+    decision.rationale.includes('learned_taker_preference_active') ||
+      decision.rationale.includes('learned_execution_risk_overrides_resting'),
+    true,
+  );
 }
 
 async function testVenueValidationRejectsShortGtdExpiration(): Promise<void> {
@@ -7593,11 +7771,7 @@ async function testLearningStateStorePersistsAndRecoversFromCorruption(): Promis
     lastLearningAt: '2026-03-21T00:00:00.000Z',
     regimeSnapshots: {},
     calibrationContexts: [],
-    executionLearning: {
-      version: 1,
-      updatedAt: null,
-      contexts: {},
-    },
+    executionLearning: createDefaultExecutionLearningState(),
     lastPromotionDecision: {
       decision: 'not_evaluated',
       reasons: [],
@@ -7632,6 +7806,92 @@ async function testLearningStateStorePersistsAndRecoversFromCorruption(): Promis
     fs.readdirSync(store.getPaths().corruptDir).some((file) => file.endsWith('.corrupt.json')),
     true,
   );
+}
+
+async function testExecutionLearningStorePersistsVersionedPolicyAcrossRestart(): Promise<void> {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'execution-learning-store-'));
+  const learningStateStore = new LearningStateStore(rootDir);
+  const adapter = {
+    loadState: () => learningStateStore.load(),
+    saveState: (state: ReturnType<typeof createDefaultLearningState>) =>
+      learningStateStore.save(state as never),
+  };
+  const executionLearningStore = new ExecutionLearningStore(adapter);
+  const versionStore = new ExecutionPolicyVersionStore(adapter);
+  const updater = new ExecutionPolicyUpdater(versionStore);
+
+  const updated = updater.update({
+    priorState: await executionLearningStore.getState(),
+    cycleId: 'cycle-execution-1',
+    now: new Date('2026-03-25T00:00:00.000Z'),
+    observations: [
+      {
+        strategyVariantId: 'variant:strategy-live-1',
+        regime: 'trend_burst',
+        route: 'maker',
+        fillRatio: 0.2,
+        fillDelayMs: 32_000,
+        slippage: 0.008,
+        cancelAttempted: true,
+        cancelSucceeded: false,
+        partiallyFilled: true,
+        observedAt: '2026-03-24T23:55:00.000Z',
+      },
+      {
+        strategyVariantId: 'variant:strategy-live-1',
+        regime: 'trend_burst',
+        route: 'maker',
+        fillRatio: 0.25,
+        fillDelayMs: 28_000,
+        slippage: 0.007,
+        cancelAttempted: true,
+        cancelSucceeded: false,
+        partiallyFilled: true,
+        observedAt: '2026-03-24T23:56:00.000Z',
+      },
+      {
+        strategyVariantId: 'variant:strategy-live-1',
+        regime: 'trend_burst',
+        route: 'maker',
+        fillRatio: 0.3,
+        fillDelayMs: 25_000,
+        slippage: 0.007,
+        cancelAttempted: true,
+        cancelSucceeded: true,
+        partiallyFilled: true,
+        observedAt: '2026-03-24T23:57:00.000Z',
+      },
+      {
+        strategyVariantId: 'variant:strategy-live-1',
+        regime: 'trend_burst',
+        route: 'taker',
+        fillRatio: 1,
+        fillDelayMs: 2_000,
+        slippage: 0.003,
+        cancelAttempted: false,
+        cancelSucceeded: null,
+        partiallyFilled: false,
+        observedAt: '2026-03-24T23:58:00.000Z',
+      },
+    ],
+  });
+
+  await executionLearningStore.saveState(updated.executionLearning);
+
+  const reloadedContext = await new ExecutionLearningStore(adapter).getForStrategy(
+    'variant:strategy-live-1',
+    'trend_burst',
+  );
+  const reloadedVersion = await new ExecutionPolicyVersionStore(adapter).getActiveVersionForStrategy(
+    'variant:strategy-live-1',
+    'trend_burst',
+  );
+
+  assert.ok(reloadedContext);
+  assert.ok(reloadedVersion);
+  assert.strictEqual(reloadedContext?.sampleCount, 4);
+  assert.strictEqual(reloadedContext?.makerPunished, true);
+  assert.strictEqual(reloadedVersion?.contextKey, reloadedContext?.contextKey);
 }
 
 async function testLearningEventLogAppendOnlyAndReadable(): Promise<void> {
@@ -7743,7 +8003,7 @@ async function testDailyReviewPersistsSummaryAndCalibration(): Promise<void> {
 
   const state = await learningStateStore.load();
   assert.strictEqual(Object.keys(state.calibration).length >= 1, true);
-  assert.strictEqual(Boolean(state.strategyVariants.strategyA), true);
+  assert.strictEqual(Boolean(state.strategyVariants['variant:strategyA']), true);
   assert.strictEqual(
     Object.values(state.calibration).some((calibration) => calibration.shrinkageFactor < 1),
     true,
@@ -7758,6 +8018,438 @@ async function testDailyReviewPersistsSummaryAndCalibration(): Promise<void> {
     events.some((event) => event.type === 'learning_cycle_completed'),
     true,
   );
+}
+
+async function testDailyReviewUpdatesExecutionLearningAndVersionsPolicy(): Promise<void> {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'daily-review-wave3-'));
+  const learningStateStore = new LearningStateStore(rootDir);
+  const learningEventLog = new LearningEventLog(rootDir);
+
+  const prisma = {
+    strategyVersion: {
+      findMany: async () => [],
+    },
+    executionDiagnostic: {
+      findMany: async () => [
+        {
+          orderId: 'order-1',
+          strategyVersionId: 'strategyA',
+          expectedEv: 0.05,
+          realizedEv: -0.01,
+          realizedSlippage: 0.002,
+          fillRate: 0.25,
+          regime: 'trend_burst',
+          capturedAt: new Date('2026-03-25T00:01:00.000Z'),
+          staleOrder: false,
+        },
+      ],
+    },
+    order: {
+      findMany: async () => [
+        {
+          id: 'order-1',
+          marketId: 'market-1',
+          tokenId: 'yes1',
+          side: 'BUY',
+          status: 'canceled',
+          strategyVersionId: 'strategyA',
+          createdAt: new Date('2026-03-25T00:00:00.000Z'),
+          postedAt: new Date('2026-03-25T00:00:02.000Z'),
+          acknowledgedAt: new Date('2026-03-25T00:00:03.000Z'),
+          canceledAt: new Date('2026-03-25T00:00:30.000Z'),
+          filledSize: 1,
+          remainingSize: 3,
+          size: 4,
+          signal: {
+            id: 'signal-1',
+            marketId: 'market-1',
+            strategyVersionId: 'strategyA',
+            posteriorProbability: 0.68,
+            expectedEv: 0.05,
+            regime: 'trend_burst',
+            observedAt: new Date('2026-03-25T00:00:00.000Z'),
+          },
+          market: {
+            id: 'market-1',
+            expiresAt: new Date('2026-03-25T00:10:00.000Z'),
+          },
+        },
+      ],
+    },
+    orderbook: {
+      findFirst: async () => ({
+        spread: 0.03,
+        askLevels: [{ price: 0.52, size: 8 }],
+        bidLevels: [{ price: 0.5, size: 5 }],
+      }),
+    },
+    fill: {
+      findMany: async () => [
+        {
+          orderId: 'order-1',
+          filledAt: new Date('2026-03-25T00:00:10.000Z'),
+        },
+      ],
+    },
+    auditEvent: {
+      findMany: async () => [
+        {
+          orderId: 'order-1',
+          eventType: 'order.submitted',
+          createdAt: new Date('2026-03-25T00:00:02.000Z'),
+          metadata: {
+            route: 'maker',
+            executionStyle: 'rest',
+          },
+        },
+        {
+          orderId: 'order-1',
+          eventType: 'order.cancel_requested',
+          createdAt: new Date('2026-03-25T00:00:28.000Z'),
+          metadata: {
+            reasonCode: 'cancel_request_pending_confirmation',
+          },
+        },
+      ],
+    },
+  };
+
+  const job = new DailyReviewJob(
+    prisma as never,
+    learningStateStore,
+    learningEventLog,
+  );
+  await job.run({
+    force: true,
+    now: new Date('2026-03-25T00:10:00.000Z'),
+  });
+
+  const state = await learningStateStore.load();
+  const contextKey = buildExecutionLearningContextKey('variant:strategyA', 'trend_burst');
+  assert.ok(state.executionLearning.contexts[contextKey]);
+  assert.strictEqual(
+    state.executionLearning.contexts[contextKey]?.activePolicyVersionId != null,
+    true,
+  );
+  assert.strictEqual(
+    Object.keys(state.executionLearning.policyVersions).length >= 1,
+    true,
+  );
+  assert.strictEqual(
+    Object.keys(state.strategyVariants['variant:strategyA']?.executionLearning.contexts ?? {})
+      .length >= 1,
+    true,
+  );
+
+  const events = await learningEventLog.readLatest(20);
+  assert.strictEqual(
+    events.some((event) => event.type === 'execution_learning_updated'),
+    true,
+  );
+  assert.strictEqual(
+    events.some((event) => event.type === 'execution_policy_versioned'),
+    true,
+  );
+}
+
+async function testDailyReviewRegistersChallengerAndStartsCanary(): Promise<void> {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'daily-review-wave2-'));
+  const learningStateStore = new LearningStateStore(rootDir);
+  const learningEventLog = new LearningEventLog(rootDir);
+  const deploymentRegistry = new StrategyDeploymentRegistry(rootDir);
+  const state = createDefaultLearningState(new Date('2026-03-24T00:00:00.000Z'));
+  state.strategyVariants['variant:strategy-live-1'] = {
+    strategyVariantId: 'variant:strategy-live-1',
+    health: 'healthy',
+    lastLearningAt: '2026-03-24T00:00:00.000Z',
+    regimeSnapshots: {
+      incumbent: {
+        key: 'incumbent',
+        regime: 'trend_burst',
+        liquidityBucket: 'balanced',
+        spreadBucket: 'normal',
+        timeToExpiryBucket: 'under_15m',
+        entryTimingBucket: 'early',
+        executionStyle: 'hybrid',
+        side: 'buy',
+        strategyVariantId: 'variant:strategy-live-1',
+        sampleCount: 8,
+        winRate: 0.5,
+        expectedEvSum: 0.08,
+        realizedEvSum: 0.08,
+        avgExpectedEv: 0.01,
+        avgRealizedEv: 0.01,
+        realizedVsExpected: 1,
+        avgFillRate: 0.9,
+        avgSlippage: 0.002,
+        health: 'healthy',
+        lastObservedAt: '2026-03-24T00:00:00.000Z',
+      },
+    },
+    calibrationContexts: ['strategy:variant:strategy-live-1|regime:all'],
+    executionLearning: {
+      ...createDefaultExecutionLearningState(),
+      updatedAt: '2026-03-24T00:00:00.000Z',
+    },
+    lastPromotionDecision: {
+      decision: 'not_evaluated',
+      reasons: [],
+      evidence: {},
+      decidedAt: null,
+    },
+    lastQuarantineDecision: {
+      status: 'none',
+      severity: 'none',
+      reasons: [],
+      scope: {},
+      decidedAt: null,
+    },
+    lastCapitalAllocationDecision: {
+      status: 'unchanged',
+      targetMultiplier: 1,
+      reasons: [],
+      decidedAt: null,
+    },
+  };
+  state.strategyVariants['variant:strategy-challenger-2'] = {
+    strategyVariantId: 'variant:strategy-challenger-2',
+    health: 'healthy',
+    lastLearningAt: '2026-03-24T00:00:00.000Z',
+    regimeSnapshots: {
+      challenger: {
+        key: 'challenger',
+        regime: 'trend_burst',
+        liquidityBucket: 'balanced',
+        spreadBucket: 'normal',
+        timeToExpiryBucket: 'under_15m',
+        entryTimingBucket: 'early',
+        executionStyle: 'hybrid',
+        side: 'buy',
+        strategyVariantId: 'variant:strategy-challenger-2',
+        sampleCount: 8,
+        winRate: 0.75,
+        expectedEvSum: 0.08,
+        realizedEvSum: 0.1,
+        avgExpectedEv: 0.01,
+        avgRealizedEv: 0.0125,
+        realizedVsExpected: 1.25,
+        avgFillRate: 0.88,
+        avgSlippage: 0.002,
+        health: 'healthy',
+        lastObservedAt: '2026-03-24T00:00:00.000Z',
+      },
+    },
+    calibrationContexts: ['strategy:variant:strategy-challenger-2|regime:all'],
+    executionLearning: {
+      ...createDefaultExecutionLearningState(),
+      updatedAt: '2026-03-24T00:00:00.000Z',
+    },
+    lastPromotionDecision: {
+      decision: 'not_evaluated',
+      reasons: [],
+      evidence: {},
+      decidedAt: null,
+    },
+    lastQuarantineDecision: {
+      status: 'none',
+      severity: 'none',
+      reasons: [],
+      scope: {},
+      decidedAt: null,
+    },
+    lastCapitalAllocationDecision: {
+      status: 'unchanged',
+      targetMultiplier: 1,
+      reasons: [],
+      decidedAt: null,
+    },
+  };
+  state.calibration['strategy:variant:strategy-challenger-2|regime:all'] = {
+    contextKey: 'strategy:variant:strategy-challenger-2|regime:all',
+    strategyVariantId: 'variant:strategy-challenger-2',
+    regime: null,
+    sampleCount: 8,
+    brierScore: 0.1,
+    logLoss: 0.3,
+    shrinkageFactor: 1,
+    overconfidenceScore: 0.02,
+    health: 'healthy',
+    version: 1,
+    driftSignals: ['calibration_stable'],
+    lastUpdatedAt: '2026-03-24T00:00:00.000Z',
+  };
+  await learningStateStore.save(state);
+
+  const prisma = {
+    strategyVersion: {
+      findMany: async () => [
+        {
+          id: 'strategy-live-1',
+          name: 'live',
+          isActive: true,
+          createdAt: new Date('2026-03-20T00:00:00.000Z'),
+          updatedAt: new Date('2026-03-24T00:00:00.000Z'),
+        },
+        {
+          id: 'strategy-challenger-2',
+          name: 'challenger',
+          isActive: false,
+          createdAt: new Date('2026-03-21T00:00:00.000Z'),
+          updatedAt: new Date('2026-03-24T00:05:00.000Z'),
+        },
+      ],
+    },
+    executionDiagnostic: {
+      findMany: async () => [],
+    },
+    order: {
+      findMany: async () => [],
+    },
+    orderbook: {
+      findFirst: async () => null,
+    },
+  };
+
+  const job = new DailyReviewJob(
+    prisma as never,
+    learningStateStore,
+    learningEventLog,
+    deploymentRegistry,
+  );
+  await job.run({
+    force: true,
+    now: new Date('2026-03-24T00:10:00.000Z'),
+  });
+
+  const registryState = await deploymentRegistry.load();
+  assert.strictEqual(registryState.incumbentVariantId, 'variant:strategy-live-1');
+  assert.strictEqual(
+    registryState.activeRollout?.challengerVariantId,
+    'variant:strategy-challenger-2',
+  );
+  assert.strictEqual(
+    registryState.activeRollout?.stage === 'canary_5pct' ||
+      registryState.activeRollout?.stage === 'canary_1pct',
+    true,
+  );
+
+  const events = await learningEventLog.readLatest(20);
+  assert.strictEqual(
+    events.some((event) => event.type === 'strategy_variant_registered'),
+    true,
+  );
+  assert.strictEqual(
+    events.some((event) => event.type === 'strategy_rollout_changed'),
+    true,
+  );
+}
+
+async function testEvaluateTradeOpportunitiesBlocksQuarantinedVariant(): Promise<void> {
+  let rejectedReason: string | null = null;
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'quarantined-variant-'));
+  const deploymentRegistry = new StrategyDeploymentRegistry(rootDir);
+  const state = createDefaultStrategyDeploymentRegistryState(
+    new Date('2026-03-24T00:00:00.000Z'),
+  );
+  state.incumbentVariantId = 'variant:strategy-live-1';
+  state.variants['variant:strategy-live-1'] = {
+    variantId: 'variant:strategy-live-1',
+    strategyVersionId: 'strategy-live-1',
+    status: 'quarantined',
+    evaluationMode: 'shadow_only',
+    rolloutStage: 'shadow_only',
+    health: 'quarantine_candidate',
+    lineage: {
+      variantId: 'variant:strategy-live-1',
+      strategyVersionId: 'strategy-live-1',
+      parentVariantId: null,
+      createdAt: '2026-03-20T00:00:00.000Z',
+      createdReason: 'test',
+    },
+    capitalAllocationPct: 0,
+    lastShadowEvaluatedAt: null,
+    createdAt: '2026-03-20T00:00:00.000Z',
+    updatedAt: '2026-03-20T00:00:00.000Z',
+  };
+  await deploymentRegistry.save(state);
+
+  const prisma = {
+    signal: {
+      findMany: async () => [createExecutionSignal()],
+      update: async () => null,
+    },
+    portfolioSnapshot: {
+      findFirst: async () => ({
+        bankroll: 1000,
+        availableCapital: 1000,
+        realizedPnlDay: 0,
+        consecutiveLosses: 0,
+        capturedAt: new Date(),
+      }),
+    },
+    position: {
+      findMany: async () => [],
+    },
+    order: {
+      findMany: async () => [],
+    },
+    signalDecision: {
+      findFirst: async () => null,
+      findMany: async () => [],
+      create: async ({ data }: { data: { reasonCode: string } }) => {
+        rejectedReason = data.reasonCode;
+      },
+    },
+    market: {
+      findMany: async () => [createMarket()],
+    },
+    orderbook: {
+      findFirst: async () => createFreshOrderbook(),
+    },
+    marketSnapshot: {
+      findFirst: async () => createFreshSnapshot(),
+    },
+    reconciliationCheckpoint: {
+      findFirst: async ({ where }: { where: { source: string } }) =>
+        createFreshReconciliationCheckpoint(where.source),
+    },
+    botRuntimeStatus: {
+      findUnique: async () => createFreshRuntimeStatus(),
+    },
+    executionDiagnostic: {
+      findMany: async () => [],
+    },
+    auditEvent: {
+      findMany: async () => [],
+    },
+  };
+
+  const runtimeControl = {
+    getLatestSafetyState: async () => ({
+      state: 'normal',
+      enteredAt: new Date(0).toISOString(),
+      reasonCodes: [],
+      sizeMultiplier: 1,
+      evaluationCadenceMultiplier: 1,
+      allowAggressiveEntries: true,
+      allowNewEntries: true,
+      haltRequested: false,
+      maxNewSignalsPerTick: 4,
+      evidence: {},
+    }),
+    recordSafetyStateTransition: async () => null,
+  };
+
+  const job = new EvaluateTradeOpportunitiesJob(
+    prisma as never,
+    runtimeControl as never,
+    deploymentRegistry,
+  );
+  const result = await job.run(createRuntimeConfig());
+
+  assert.strictEqual(result.approved, 0);
+  assert.strictEqual(result.rejected, 1);
+  assert.strictEqual(rejectedReason, 'strategy_variant_quarantined');
 }
 
 async function testConfidenceShrinkagePolicyReducesAggressiveness(): Promise<void> {
@@ -7782,6 +8474,154 @@ async function testConfidenceShrinkagePolicyReducesAggressiveness(): Promise<voi
   assert.strictEqual(decision.sizeMultiplier < 1, true);
 }
 
+async function testExecuteOrdersUsesLearnedExecutionPolicyVersion(): Promise<void> {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'execute-orders-wave3-'));
+  const learningStateStore = new LearningStateStore(rootDir);
+  const contextKey = buildExecutionLearningContextKey(
+    'variant:strategy-live-1',
+    'momentum_continuation',
+  );
+  const learningState = createDefaultLearningState(
+    new Date('2026-03-25T00:00:00.000Z'),
+  );
+  learningState.executionLearning = {
+    ...createDefaultExecutionLearningState(),
+    updatedAt: '2026-03-25T00:00:00.000Z',
+    lastPolicyChangeAt: '2026-03-25T00:00:00.000Z',
+    contexts: {
+      [contextKey]: {
+        contextKey,
+        strategyVariantId: 'variant:strategy-live-1',
+        regime: 'momentum_continuation',
+        sampleCount: 6,
+        makerSampleCount: 3,
+        takerSampleCount: 3,
+        makerFillRate: 0.25,
+        takerFillRate: 0.95,
+        averageFillDelayMs: 22_000,
+        averageSlippage: 0.004,
+        adverseSelectionScore: 0.55,
+        cancelSuccessRate: 0.6,
+        partialFillRate: 0.2,
+        makerPunished: true,
+        health: 'degraded',
+        notes: ['maker_adverse_selection_detected'],
+        activePolicyVersionId: 'execution-policy:test:v1',
+        lastUpdatedAt: '2026-03-25T00:00:00.000Z',
+      },
+    },
+    policyVersions: {
+      'execution-policy:test:v1': {
+        versionId: 'execution-policy:test:v1',
+        contextKey,
+        strategyVariantId: 'variant:strategy-live-1',
+        regime: 'momentum_continuation',
+        mode: 'taker_preferred',
+        recommendedRoute: 'taker',
+        recommendedExecutionStyle: 'cross',
+        sampleCount: 6,
+        makerFillRateAssumption: 0.25,
+        takerFillRateAssumption: 0.95,
+        expectedFillDelayMs: 22_000,
+        expectedSlippage: 0.004,
+        adverseSelectionScore: 0.55,
+        cancelSuccessRate: 0.6,
+        partialFillRate: 0.2,
+        health: 'degraded',
+        rationale: ['maker_adverse_selection_detected'],
+        sourceCycleId: 'cycle-1',
+        supersedesVersionId: null,
+        createdAt: '2026-03-25T00:00:00.000Z',
+      },
+    },
+    activePolicyVersionIds: {
+      [contextKey]: 'execution-policy:test:v1',
+    },
+  };
+  await learningStateStore.save(learningState);
+
+  let auditMetadata: Record<string, unknown> | null = null;
+  const prisma = {
+    signal: {
+      findMany: async () => [createExecutionSignal()],
+      update: async () => null,
+    },
+    signalDecision: {
+      findFirst: async () => ({ positionSize: 10, verdict: 'approved' }),
+      create: async () => null,
+    },
+    market: {
+      findUnique: async () => createMarket(),
+    },
+    marketSnapshot: {
+      findFirst: async () => createFreshSnapshot(),
+    },
+    orderbook: {
+      findFirst: async () => createFreshOrderbook(),
+    },
+    order: {
+      findFirst: async () => null,
+      create: async () => null,
+    },
+    auditEvent: {
+      create: async ({ data }: { data: { metadata: Record<string, unknown> } }) => {
+        auditMetadata = data.metadata;
+      },
+    },
+    portfolioSnapshot: {
+      findFirst: async () => createFreshPortfolioSnapshot(),
+    },
+    reconciliationCheckpoint: {
+      findFirst: async ({ where }: { where: { source: string } }) =>
+        createFreshReconciliationCheckpoint(where.source),
+    },
+    botRuntimeStatus: {
+      findUnique: async () => createFreshRuntimeStatus(),
+    },
+    liveConfig: {
+      findUnique: async () => ({ id: 'live', noTradeWindowSeconds: 30 }),
+    },
+  };
+
+  const job = new ExecuteOrdersJob(prisma as never, undefined, learningStateStore);
+  stubExternalPortfolioService(
+    job,
+    createExternalPortfolioSnapshot({
+      inventories: [
+        createExternalInventorySnapshot({
+          tokenId: 'yes1',
+          marketId: 'm1',
+          outcome: 'YES',
+          balance: 100,
+          allowance: 100,
+          reservedQuantity: 0,
+          freeQuantityBeforeAllowance: 100,
+          freeQuantityAfterAllowance: 100,
+          tradableSellHeadroom: 0,
+          availableQuantity: 0,
+          positionQuantity: 0,
+          markPrice: 0.51,
+          markedValue: 51,
+        }),
+      ],
+    }),
+  );
+  (job as any).tradingClient = {
+    postOrder: async () => ({
+      success: true,
+      orderId: 'venue-wave3-1',
+      status: 'acknowledged',
+    }),
+  };
+
+  const result = await job.run({ canSubmit: () => true });
+
+  assert.strictEqual(result.submitted, 1);
+  assert.strictEqual(auditMetadata?.['learnedExecutionPolicyVersionId'], 'execution-policy:test:v1');
+  assert.strictEqual(auditMetadata?.['executionStyle'], 'cross');
+  assert.strictEqual(auditMetadata?.['route'], 'taker');
+}
+
 async function run(): Promise<void> {
   const tests: Array<{ name: string; fn: () => Promise<void> }> = [
     { name: 'execution veto blocks submit', fn: testExecutionVetoBlocksSubmit },
@@ -7796,6 +8636,10 @@ async function run(): Promise<void> {
     {
       name: 'build signals persist active strategy version',
       fn: testBuildSignalsPersistsActiveStrategyVersion,
+    },
+    {
+      name: 'build signals uses deployment registry assignment',
+      fn: testBuildSignalsUsesDeploymentRegistryAssignment,
     },
     {
       name: 'open-order sync failure does not mutate states',
@@ -7828,6 +8672,10 @@ async function run(): Promise<void> {
     {
       name: 'execution semantics policy selects explicit order styles',
       fn: testExecutionSemanticsPolicySelectsExplicitOrderStyles,
+    },
+    {
+      name: 'adaptive maker taker policy uses learned policy version',
+      fn: testAdaptiveMakerTakerPolicyUsesLearnedPolicyVersion,
     },
     {
       name: 'venue rejects short GTD expiration',
@@ -7977,13 +8825,38 @@ async function run(): Promise<void> {
       fn: testLearningEventLogAppendOnlyAndReadable,
     },
     {
+      name: 'execution learning store persists versioned policy across restart',
+      fn: testExecutionLearningStorePersistsVersionedPolicyAcrossRestart,
+    },
+    {
       name: 'daily review persists summary and calibration',
       fn: testDailyReviewPersistsSummaryAndCalibration,
+    },
+    {
+      name: 'daily review updates execution learning and versions policy',
+      fn: testDailyReviewUpdatesExecutionLearningAndVersionsPolicy,
+    },
+    {
+      name: 'daily review registers challenger and starts canary rollout',
+      fn: testDailyReviewRegistersChallengerAndStartsCanary,
+    },
+    {
+      name: 'evaluate trade opportunities blocks quarantined variant',
+      fn: testEvaluateTradeOpportunitiesBlocksQuarantinedVariant,
     },
     {
       name: 'confidence shrinkage policy reduces aggressiveness',
       fn: testConfidenceShrinkagePolicyReducesAggressiveness,
     },
+    {
+      name: 'execute orders uses learned execution policy version',
+      fn: testExecuteOrdersUsesLearnedExecutionPolicyVersion,
+    },
+    ...waveFiveLearningCycleIntegrationTests,
+    ...waveFiveChampionChallengerIntegrationTests,
+    ...waveFiveExecutionLearningIntegrationTests,
+    ...waveFiveQuarantineIntegrationTests,
+    ...waveFiveVersionLineageIntegrationTests,
     {
       name: 'market stream connects bootstraps and supports dynamic subscriptions',
       fn: testMarketStreamConnectsBootstrapsAndSupportsDynamicSubscriptions,
