@@ -1,4 +1,10 @@
+import type {
+  HealthLabel,
+  NetEdgeBreakdown,
+  NetEdgeVenueUncertaintyLabel,
+} from '@polymarket-btc-5m-agentic-bot/domain';
 import type { EventMicrostructureFeatures } from './event-microstructure-model';
+import type { NetEdgeThresholdDecision } from './net-edge-threshold-policy';
 
 export type NoTradeZoneReason =
   | 'near_expiry'
@@ -8,7 +14,13 @@ export type NoTradeZoneReason =
   | 'thin_depth'
   | 'microstructure_chaos'
   | 'governance_failed'
-  | 'edge_half_life_expired';
+  | 'edge_half_life_expired'
+  | 'weak_net_edge'
+  | 'high_uncertainty'
+  | 'poor_calibration'
+  | 'poor_regime_health'
+  | 'poor_execution_context'
+  | 'venue_instability';
 
 export interface NoTradeZoneVerdict {
   blocked: boolean;
@@ -26,6 +38,12 @@ export class NoTradeZonePolicy {
     microstructure: EventMicrostructureFeatures;
     governanceHealthy: boolean;
     edgeHalfLifeHealthy: boolean;
+    netEdge?: NetEdgeBreakdown | null;
+    thresholdDecision?: NetEdgeThresholdDecision | null;
+    calibrationHealth?: HealthLabel | null;
+    regimeHealth?: HealthLabel | null;
+    executionContextHealthy?: boolean;
+    venueUncertaintyLabel?: NetEdgeVenueUncertaintyLabel | null;
   }): NoTradeZoneVerdict {
     const reasons: NoTradeZoneReason[] = [];
 
@@ -65,6 +83,46 @@ export class NoTradeZonePolicy {
 
     if (!input.edgeHalfLifeHealthy) {
       reasons.push('edge_half_life_expired');
+    }
+
+    if (input.thresholdDecision && !input.thresholdDecision.passed) {
+      reasons.push('weak_net_edge');
+    }
+
+    if (
+      input.netEdge &&
+      input.netEdge.uncertaintyPenalty.totalPenalty >=
+        Math.max(0.002, input.netEdge.grossForecastEdge * 0.35)
+    ) {
+      reasons.push('high_uncertainty');
+    }
+
+    if (
+      input.calibrationHealth === 'quarantine_candidate' ||
+      (input.calibrationHealth === 'degraded' &&
+        (input.thresholdDecision?.marginAboveThreshold ?? -1) < 0.002)
+    ) {
+      reasons.push('poor_calibration');
+    }
+
+    if (
+      input.regimeHealth === 'quarantine_candidate' ||
+      (input.regimeHealth === 'degraded' &&
+        (input.thresholdDecision?.marginAboveThreshold ?? -1) < 0.002)
+    ) {
+      reasons.push('poor_regime_health');
+    }
+
+    if (input.executionContextHealthy === false) {
+      reasons.push('poor_execution_context');
+    }
+
+    if (
+      input.venueUncertaintyLabel === 'unsafe' ||
+      (input.venueUncertaintyLabel === 'degraded' &&
+        (input.thresholdDecision?.marginAboveThreshold ?? 0) < 0.0015)
+    ) {
+      reasons.push('venue_instability');
     }
 
     return {

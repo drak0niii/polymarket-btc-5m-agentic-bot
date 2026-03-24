@@ -2,7 +2,9 @@ export * from './adaptive-maker-taker-policy';
 export * from './adverse-selection-monitor';
 export * from './cancel-replace-policy';
 export * from './duplicate-exposure-guard';
+export * from './entry-timing-efficiency-scorer';
 export * from './execution-diagnostics';
+export * from './execution-cost-calibrator';
 export * from './execution-learning-store';
 export * from './execution-policy-updater';
 export * from './execution-policy-version-store';
@@ -32,6 +34,8 @@ export {
   type ResolvedOrderIntent,
   type VenueOrderConstraints,
 } from './order-planner';
+export * from './realized-cost-model';
+export * from './size-vs-liquidity-policy';
 export * from './slippage-estimator';
 export {
   TradeIntentResolver,

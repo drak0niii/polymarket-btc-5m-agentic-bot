@@ -9,6 +9,7 @@ import { BuildSignalsJob } from '../jobs/buildSignals.job';
 import { ExecuteOrdersJob } from '../jobs/executeOrders.job';
 import { ManageOpenOrdersJob } from '../jobs/manageOpenOrders.job';
 import { ReconcileFillsJob } from '../jobs/reconcileFills.job';
+import { CapitalLeakReviewJob } from '../jobs/capitalLeakReview.job';
 import { EvaluateTradeOpportunitiesJob } from '../jobs/evaluateTradeOpportunities.job';
 import { MarketAnalysisAgent } from '../agents/market-analysis.agent';
 import { RiskVerificationAgent } from '../agents/risk-verification.agent';
@@ -34,6 +35,8 @@ import { CancelReplacePolicy } from '@polymarket-btc-5m-agentic-bot/execution-en
 import { DuplicateExposureGuard } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { AdaptiveMakerTakerPolicy } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { buildExecutionLearningContextKey } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { EntryTimingEfficiencyScorer } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { ExecutionCostCalibrator } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { ExecutionSemanticsPolicy } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { ExecutionLearningStore } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { ExecutionPolicyUpdater } from '@polymarket-btc-5m-agentic-bot/execution-engine';
@@ -43,19 +46,32 @@ import { FillStateService } from '@polymarket-btc-5m-agentic-bot/execution-engin
 import { MakerQualityPolicy } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { NegativeRiskPolicy } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { OrderIntentService } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { RealizedCostModel } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { SizeVsLiquidityPolicy } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { VenueOrderValidator } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { VenueFeeModel } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { ServerSigner, SignerHealth } from '@polymarket-btc-5m-agentic-bot/signing-engine';
 import { InventoryLiquidationPolicy } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { PreTradeFundingValidator } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { CapitalRampPolicyService } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { CapitalLeakAttribution } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { DeploymentTierPolicyService } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { ExecutionQualityKillSwitches } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { LossAttributionModel } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { MarginalEdgeCooldownPolicy } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { MaxLossPerOpportunityPolicy } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { MultiDimensionalPositionLimits } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { OpportunitySaturationDetector } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { ProductionReadinessDashboardService } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { RegimeCapitalPolicy } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { RegimeDisablePolicy } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { RegimeProfitabilityRanker } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { SafetyStateMachine } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { SizePenaltyEngine } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { TradeFrequencyGovernor } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { TradeAttributionService } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { TradeQualityHistoryStore } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import { UncertaintyWeightedSizing } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { VenueOperationalPolicyService } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { TradeIntentResolver } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import {
@@ -80,6 +96,8 @@ import { ExecutableEvModel } from '@polymarket-btc-5m-agentic-bot/signal-engine'
 import { FeatureBuilder } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { MarketEligibilityService } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { MultiObjectivePromotionScore } from '@polymarket-btc-5m-agentic-bot/signal-engine';
+import { NetEdgeEstimator } from '@polymarket-btc-5m-agentic-bot/signal-engine';
+import { NetEdgeThresholdPolicy } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { NoTradeZonePolicy } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { PriorModel } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { PosteriorUpdate } from '@polymarket-btc-5m-agentic-bot/signal-engine';
@@ -127,9 +145,13 @@ import { LearningEventLog } from '../runtime/learning-event-log';
 import { LearningStateStore } from '../runtime/learning-state-store';
 import { StrategyDeploymentRegistry } from '../runtime/strategy-deployment-registry';
 import {
+  buildStrategyVariantId,
   createDefaultLearningState,
   createDefaultExecutionLearningState,
+  createDefaultStrategyVariantState,
   createDefaultStrategyDeploymentRegistryState,
+  type TradeQualityLabel,
+  type TradeQualityScore,
 } from '@polymarket-btc-5m-agentic-bot/domain';
 import {
   buildBalanceAllowancePayloadFixture,
@@ -145,6 +167,11 @@ import { waveFiveExecutionLearningIntegrationTests } from './execution-learning.
 import { waveFiveLearningCycleIntegrationTests } from './learning-cycle.integration.test';
 import { waveFiveQuarantineIntegrationTests } from './quarantine-policy.integration.test';
 import { waveFiveVersionLineageIntegrationTests } from './version-lineage.integration.test';
+import { waveTwelveAntiOvertradingIntegrationTests } from './anti-overtrading.integration.test';
+import { waveTwelveCapitalLeakAttributionIntegrationTests } from './capital-leak-attribution.integration.test';
+import { waveTwelveNetEdgeGatingIntegrationTests } from './net-edge-gating.integration.test';
+import { waveTwelveRegimeProfitabilityIntegrationTests } from './regime-profitability.integration.test';
+import { waveTwelveUncertaintySizingIntegrationTests } from './uncertainty-sizing.integration.test';
 
 const repoRoot = path.resolve(__dirname, '../../../..');
 
@@ -285,6 +312,74 @@ function createFreshReconciliationCheckpoint(source: string) {
           allowNewEntries: true,
         },
       },
+    },
+  };
+}
+
+function createTradeQualityScoreFixture(
+  input?: Partial<Record<string, unknown>> & { label?: string; overallScore?: number },
+): TradeQualityScore {
+  const overallScore = input?.overallScore ?? 0.5;
+  const label: TradeQualityLabel =
+    input?.label === 'excellent' ||
+    input?.label === 'good' ||
+    input?.label === 'mixed' ||
+    input?.label === 'poor' ||
+    input?.label === 'destructive'
+      ? input.label
+      : 'mixed';
+  return {
+    tradeId: String(input?.tradeId ?? 'trade-fixture'),
+    orderId: String(input?.orderId ?? 'order-fixture'),
+    signalId: String(input?.signalId ?? 'signal-fixture'),
+    marketId: String(input?.marketId ?? 'm1'),
+    strategyVariantId: String(input?.strategyVariantId ?? 'variant:strategy-live-1'),
+    regime: String(input?.regime ?? 'momentum_continuation'),
+    marketContext: String(input?.marketContext ?? 'btc-5m-higher:YES'),
+    executionStyle: String(input?.executionStyle ?? 'hybrid'),
+    evaluatedAt: String(input?.evaluatedAt ?? '2026-03-24T00:00:00.000Z'),
+    label,
+    breakdown: {
+      forecastQuality: {
+        score: overallScore,
+        label,
+        reasons: [],
+        evidence: {},
+      },
+      calibrationQuality: {
+        score: overallScore,
+        label,
+        reasons: [],
+        evidence: {},
+      },
+      executionQuality: {
+        score: overallScore,
+        label,
+        reasons: [],
+        evidence: {},
+      },
+      timingQuality: {
+        score: overallScore,
+        label,
+        reasons: [],
+        evidence: {},
+      },
+      policyCompliance: {
+        score: overallScore,
+        label,
+        reasons: [],
+        evidence: {},
+      },
+      realizedOutcomeQuality: {
+        score: overallScore,
+        label,
+        reasons: [],
+        evidence: {
+          realizedEv: overallScore - 0.5,
+        },
+      },
+      overallScore,
+      reasons: [],
     },
   };
 }
@@ -633,7 +728,7 @@ async function testExecutionRejectsSignalWithoutStrategyVersion(): Promise<void>
       update: async () => null,
     },
     signalDecision: {
-      findFirst: async () => ({ positionSize: 10, verdict: 'approved' }),
+      findFirst: async () => ({ positionSize: 100, verdict: 'approved' }),
       create: async ({ data }: { data: { reasonCode: string } }) => {
         rejectionReason = data.reasonCode;
       },
@@ -1751,6 +1846,1230 @@ async function testNoTradeZonesHalfLifeAndSetupAwareAttribution(): Promise<void>
   assert.strictEqual(noTrade.blocked, true);
   assert.strictEqual(halfLife.expired, true);
   assert.strictEqual(record.bucket, 'bad_setup_fit');
+}
+
+async function testNetEdgePoliciesRejectLowMarginOpportunity(): Promise<void> {
+  const featureBuilder = new FeatureBuilder();
+  const microstructureModel = new EventMicrostructureModel();
+  const estimator = new NetEdgeEstimator();
+  const thresholdPolicy = new NetEdgeThresholdPolicy();
+  const noTradeZonePolicy = new NoTradeZonePolicy();
+
+  const features = featureBuilder.build({
+    candles: {
+      symbol: 'BTCUSD',
+      timeframe: '5m',
+      candles: createHealthyBtcReference().candles.slice(-8),
+    },
+    orderbook: createFreshOrderbook({ spread: 0.032 }) as any,
+    expiresAt: new Date(Date.now() + 180_000).toISOString(),
+  });
+  const microstructure = microstructureModel.derive({
+    features,
+    posteriorProbability: 0.68,
+    marketImpliedProbability: 0.5,
+  });
+  const netEdge = estimator.estimate({
+    grossForecastEdge: 0.02,
+    expectedEv: 0.012,
+    feeRate: 0.005,
+    spread: features.spread,
+    signalAgeMs: 45_000,
+    halfLifeMultiplier: 0.82,
+    topLevelDepth: features.topLevelDepth,
+    estimatedOrderSizeUnits: 40,
+    executionStyle: 'hybrid',
+    calibrationHealth: 'degraded',
+    calibrationShrinkageFactor: 0.74,
+    calibrationSampleCount: 12,
+    regimeHealth: 'degraded',
+    venueUncertaintyLabel: 'degraded',
+    venueMode: 'size-reduced',
+  });
+  const threshold = thresholdPolicy.evaluate({
+    baseMinimumNetEdge: 0.0025,
+    netEdge: netEdge.breakdown,
+    regimeHealth: 'degraded',
+    venueUncertaintyLabel: 'degraded',
+  });
+  const noTrade = noTradeZonePolicy.evaluate({
+    timeToExpirySeconds: features.timeToExpirySeconds,
+    noTradeWindowSeconds: 30,
+    btcFresh: true,
+    orderbookFresh: true,
+    spread: features.spread,
+    topLevelDepth: features.topLevelDepth,
+    microstructure,
+    governanceHealthy: true,
+    edgeHalfLifeHealthy: true,
+    netEdge: netEdge.breakdown,
+    thresholdDecision: threshold,
+    calibrationHealth: 'degraded',
+    regimeHealth: 'degraded',
+    executionContextHealthy: true,
+    venueUncertaintyLabel: 'degraded',
+  });
+
+  assert.strictEqual(netEdge.breakdown.finalNetEdge <= threshold.minimumNetEdge, true);
+  assert.strictEqual(threshold.passed, false);
+  assert.strictEqual(noTrade.blocked, true);
+  assert.strictEqual(noTrade.reasons.includes('weak_net_edge'), true);
+  assert.strictEqual(noTrade.reasons.includes('poor_calibration'), true);
+  assert.strictEqual(noTrade.reasons.includes('poor_regime_health'), true);
+}
+
+async function testRegimeProfitabilityPoliciesReduceDestructiveRegime(): Promise<void> {
+  const ranker = new RegimeProfitabilityRanker();
+  const capitalPolicy = new RegimeCapitalPolicy();
+  const disablePolicy = new RegimeDisablePolicy();
+  const recentTradeQualityScores = [
+    createTradeQualityScoreFixture({ label: 'destructive', overallScore: 0.22 }),
+    createTradeQualityScoreFixture({ label: 'poor', overallScore: 0.34 }),
+    createTradeQualityScoreFixture({ label: 'destructive', overallScore: 0.18 }),
+  ];
+
+  const assessment = ranker.rank({
+    strategyVariantId: 'variant:strategy-live-1',
+    regime: 'momentum_continuation',
+    regimeSnapshot: {
+      key: 'regime:momentum_continuation',
+      regime: 'momentum_continuation',
+      liquidityBucket: 'balanced',
+      spreadBucket: 'normal',
+      timeToExpiryBucket: 'under_15m',
+      entryTimingBucket: 'early',
+      executionStyle: 'hybrid',
+      side: 'buy',
+      strategyVariantId: 'variant:strategy-live-1',
+      sampleCount: 9,
+      winRate: 0.33,
+      expectedEvSum: 0.18,
+      realizedEvSum: -0.09,
+      avgExpectedEv: 0.02,
+      avgRealizedEv: -0.01,
+      realizedVsExpected: -0.5,
+      avgFillRate: 0.62,
+      avgSlippage: 0.005,
+      health: 'degraded',
+      lastObservedAt: '2026-03-27T00:00:00.000Z',
+    },
+    calibrationHealth: 'degraded',
+    executionContext: {
+      contextKey: 'execution:variant:strategy-live-1|regime:momentum_continuation',
+      strategyVariantId: 'variant:strategy-live-1',
+      regime: 'momentum_continuation',
+      sampleCount: 9,
+      makerSampleCount: 4,
+      takerSampleCount: 5,
+      makerFillRate: 0.4,
+      takerFillRate: 0.68,
+      averageFillDelayMs: 45_000,
+      averageSlippage: 0.005,
+      adverseSelectionScore: 0.6,
+      cancelSuccessRate: 0.7,
+      partialFillRate: 0.22,
+      makerPunished: true,
+      health: 'degraded',
+      notes: ['destructive_regime_fixture'],
+      activePolicyVersionId: null,
+      lastUpdatedAt: '2026-03-27T00:00:00.000Z',
+    },
+    recentTradeQualityScores,
+    currentDrawdownPct: 0.07,
+    maxDrawdownPct: 0.1,
+    recentLeakShare: 0.42,
+  });
+  const capitalDecision = capitalPolicy.decide({
+    assessment,
+    portfolioAllocationMultiplier: 0.8,
+  });
+  const disableDecision = disablePolicy.evaluate({
+    assessment,
+    recentTradeQualityScores,
+    recentLeakShare: 0.42,
+    recentLeakDominantCategory: 'overtrading',
+  });
+
+  assert.strictEqual(assessment.rank, 'avoid_regime');
+  assert.strictEqual(capitalDecision.blockNewTrades, true);
+  assert.strictEqual(disableDecision.status, 'disabled');
+  assert.strictEqual(disableDecision.blockNewTrades, true);
+}
+
+async function testWaveThreeGovernorsPreferReducedActivityOverMarginalActivity(): Promise<void> {
+  const frequencyGovernor = new TradeFrequencyGovernor();
+  const cooldownPolicy = new MarginalEdgeCooldownPolicy();
+  const saturationDetector = new OpportunitySaturationDetector();
+
+  const frequency = frequencyGovernor.evaluate({
+    regime: 'momentum_continuation',
+    regimeRank: 'marginal_regime',
+    opportunityClass: 'marginal_edge',
+    recentTradeCount: 1,
+    recentTradeQualityScore: 0.44,
+    recentCapitalLeakageShare: 0.34,
+    currentDrawdownPct: 0.05,
+  });
+  const cooldown = cooldownPolicy.evaluate({
+    opportunityClass: 'marginal_edge',
+    marginAboveThreshold: 0.0008,
+    recentMarginalApprovalCount: 2,
+    recentMarginalAttemptCount: 5,
+    recentLowQualityTradeShare: 0.4,
+  });
+  const saturation = saturationDetector.evaluate({
+    recentApprovedCount: 4,
+    recentStrongApprovalCount: 1,
+    recentMarginalApprovalCount: 3,
+    recentWeakRejectCount: 4,
+    recentAverageMarginAboveThreshold: 0.001,
+    recentTradeQualityScore: 0.48,
+    recentCapitalLeakageShare: 0.33,
+  });
+
+  assert.strictEqual(frequency.blockTrade, true);
+  assert.strictEqual(cooldown.blockTrade, true);
+  assert.strictEqual(saturation.label, 'saturated');
+  assert.strictEqual(saturation.blockTrade, true);
+}
+
+async function testEvaluateTradeOpportunitiesAppliesWaveThreeRegimeDiscipline(): Promise<void> {
+  let rejectedReason: string | null = null;
+  let rejectedMessage: string | null = null;
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phase12-wave3-'));
+  const deploymentRegistry = new StrategyDeploymentRegistry(rootDir);
+  const learningStateStore = new LearningStateStore(rootDir);
+  const tradeQualityHistoryStore = new TradeQualityHistoryStore(
+    path.join(rootDir, 'trade-quality'),
+  );
+  const registryState = createDefaultStrategyDeploymentRegistryState(
+    new Date('2026-03-24T00:00:00.000Z'),
+  );
+  registryState.incumbentVariantId = 'variant:strategy-live-1';
+  registryState.variants['variant:strategy-live-1'] = {
+    variantId: 'variant:strategy-live-1',
+    strategyVersionId: 'strategy-live-1',
+    status: 'incumbent',
+    evaluationMode: 'full',
+    rolloutStage: 'full',
+    health: 'degraded',
+    lineage: {
+      variantId: 'variant:strategy-live-1',
+      strategyVersionId: 'strategy-live-1',
+      parentVariantId: null,
+      createdAt: '2026-03-20T00:00:00.000Z',
+      createdReason: 'test',
+    },
+    capitalAllocationPct: 1,
+    lastShadowEvaluatedAt: null,
+    createdAt: '2026-03-20T00:00:00.000Z',
+    updatedAt: '2026-03-20T00:00:00.000Z',
+  };
+  await deploymentRegistry.save(registryState);
+
+  const learningState = createDefaultLearningState(
+    new Date('2026-03-24T00:00:00.000Z'),
+  );
+  learningState.strategyVariants['variant:strategy-live-1'] = {
+    ...createDefaultStrategyVariantState('variant:strategy-live-1'),
+    health: 'degraded',
+    regimeSnapshots: {
+      'regime:momentum_continuation': {
+        key: 'regime:momentum_continuation',
+        regime: 'momentum_continuation',
+        liquidityBucket: 'balanced',
+        spreadBucket: 'normal',
+        timeToExpiryBucket: 'under_15m',
+        entryTimingBucket: 'early',
+        executionStyle: 'hybrid',
+        side: 'buy',
+        strategyVariantId: 'variant:strategy-live-1',
+        sampleCount: 10,
+        winRate: 0.3,
+        expectedEvSum: 0.2,
+        realizedEvSum: -0.08,
+        avgExpectedEv: 0.02,
+        avgRealizedEv: -0.008,
+        realizedVsExpected: -0.4,
+        avgFillRate: 0.58,
+        avgSlippage: 0.005,
+        health: 'degraded',
+        lastObservedAt: '2026-03-24T00:00:00.000Z',
+      },
+    },
+    executionLearning: {
+      ...createDefaultExecutionLearningState(),
+      contexts: {
+        'execution:variant:strategy-live-1|regime:momentum_continuation': {
+          contextKey: 'execution:variant:strategy-live-1|regime:momentum_continuation',
+          strategyVariantId: 'variant:strategy-live-1',
+          regime: 'momentum_continuation',
+          sampleCount: 10,
+          makerSampleCount: 4,
+          takerSampleCount: 6,
+          makerFillRate: 0.42,
+          takerFillRate: 0.7,
+          averageFillDelayMs: 50_000,
+          averageSlippage: 0.0048,
+          adverseSelectionScore: 0.55,
+          cancelSuccessRate: 0.7,
+          partialFillRate: 0.24,
+          makerPunished: true,
+          health: 'degraded',
+          notes: ['wave3_fixture'],
+          activePolicyVersionId: null,
+          lastUpdatedAt: '2026-03-24T00:00:00.000Z',
+        },
+      },
+    },
+    lastCapitalAllocationDecision: {
+      status: 'hold',
+      targetMultiplier: 1,
+      reasons: ['fixture'],
+      decidedAt: '2026-03-24T00:00:00.000Z',
+    },
+  };
+  learningState.portfolioLearning.allocationDecisions['variant:strategy-live-1'] = {
+    decisionKey: 'allocation:variant:strategy-live-1',
+    strategyVariantId: 'variant:strategy-live-1',
+    targetMultiplier: 1,
+    status: 'hold',
+    reasons: ['fixture'],
+    evidence: {
+      currentDrawdown: 0.07,
+      maxDrawdown: 0.1,
+    },
+    decidedAt: '2026-03-24T00:00:00.000Z',
+  };
+  learningState.calibration['variant:strategy-live-1|regime:momentum_continuation'] = {
+    contextKey: 'variant:strategy-live-1|regime:momentum_continuation',
+    strategyVariantId: 'variant:strategy-live-1',
+    regime: 'momentum_continuation',
+    sampleCount: 10,
+    brierScore: 0.3,
+    logLoss: 0.85,
+    shrinkageFactor: 0.75,
+    overconfidenceScore: 0.22,
+    health: 'degraded',
+    version: 2,
+    driftSignals: ['wave3_fixture'],
+    lastUpdatedAt: '2026-03-24T00:00:00.000Z',
+  };
+  await learningStateStore.save(learningState);
+
+  await tradeQualityHistoryStore.append([
+    createTradeQualityScoreFixture({
+      tradeId: 'trade-1',
+      orderId: 'order-1',
+      signalId: 'old-1',
+      strategyVariantId: 'variant:strategy-live-1',
+      regime: 'momentum_continuation',
+      label: 'destructive',
+      overallScore: 0.2,
+    }),
+    createTradeQualityScoreFixture({
+      tradeId: 'trade-2',
+      orderId: 'order-2',
+      signalId: 'old-2',
+      strategyVariantId: 'variant:strategy-live-1',
+      regime: 'momentum_continuation',
+      label: 'poor',
+      overallScore: 0.34,
+    }),
+    createTradeQualityScoreFixture({
+      tradeId: 'trade-3',
+      orderId: 'order-3',
+      signalId: 'old-3',
+      strategyVariantId: 'variant:strategy-live-1',
+      regime: 'momentum_continuation',
+      label: 'destructive',
+      overallScore: 0.18,
+    }),
+  ]);
+
+  const prisma = {
+    signal: {
+      findMany: async () => [
+        createExecutionSignal({
+          observedAt: new Date(),
+          edge: 0.05,
+          expectedEv: 0.04,
+          regime: 'momentum_continuation',
+        }),
+      ],
+      update: async () => null,
+    },
+    portfolioSnapshot: {
+      findFirst: async () => ({
+        bankroll: 1000,
+        availableCapital: 1000,
+        deployableRiskNow: 1000,
+        workingBuyNotional: 0,
+        realizedPnlDay: 0,
+        consecutiveLosses: 0,
+        capturedAt: new Date(),
+      }),
+    },
+    position: {
+      findMany: async () => [],
+    },
+    order: {
+      findMany: async () => [],
+    },
+    signalDecision: {
+      findFirst: async () => null,
+      findMany: async () => [
+        { signalId: 'old-1', verdict: 'approved', decisionAt: new Date('2026-03-24T00:02:00.000Z') },
+        { signalId: 'old-2', verdict: 'approved', decisionAt: new Date('2026-03-24T00:03:00.000Z') },
+        { signalId: 'old-3', verdict: 'rejected', decisionAt: new Date('2026-03-24T00:04:00.000Z') },
+      ],
+      create: async ({ data }: { data: { reasonCode: string; reasonMessage?: string | null } }) => {
+        rejectedReason = data.reasonCode;
+        rejectedMessage = data.reasonMessage ?? null;
+      },
+    },
+    market: {
+      findMany: async () => [createMarket()],
+    },
+    orderbook: {
+      findFirst: async () => createFreshOrderbook({ spread: 0.02 }),
+    },
+    marketSnapshot: {
+      findFirst: async () => createFreshSnapshot(),
+    },
+    reconciliationCheckpoint: {
+      findFirst: async ({ where }: { where: { source: string } }) =>
+        createFreshReconciliationCheckpoint(where.source),
+    },
+    botRuntimeStatus: {
+      findUnique: async () => createFreshRuntimeStatus(),
+    },
+    executionDiagnostic: {
+      findMany: async () => [],
+    },
+    auditEvent: {
+      findMany: async () => [
+        {
+          signalId: 'old-1',
+          eventType: 'signal.execution_decision',
+          message: 'Execution admission approved for signal old-1.',
+          createdAt: new Date('2026-03-24T00:02:00.000Z'),
+          metadata: {
+            opportunityClass: 'marginal_edge',
+            netEdgeThreshold: { minimumNetEdge: 0.004, marginAboveThreshold: 0.0008 },
+            netEdgeDecision: { breakdown: { finalNetEdge: 0.0048 } },
+          },
+        },
+        {
+          signalId: 'old-2',
+          eventType: 'signal.execution_decision',
+          message: 'Execution admission approved for signal old-2.',
+          createdAt: new Date('2026-03-24T00:03:00.000Z'),
+          metadata: {
+            opportunityClass: 'marginal_edge',
+            netEdgeThreshold: { minimumNetEdge: 0.004, marginAboveThreshold: 0.001 },
+            netEdgeDecision: { breakdown: { finalNetEdge: 0.005 } },
+          },
+        },
+        {
+          signalId: 'old-3',
+          eventType: 'signal.execution_decision',
+          message: 'Execution admission rejected for signal old-3.',
+          createdAt: new Date('2026-03-24T00:04:00.000Z'),
+          metadata: {
+            reasons: ['weak_net_edge'],
+            opportunityClass: 'weak_edge',
+            netEdgeThreshold: { minimumNetEdge: 0.004, marginAboveThreshold: -0.001 },
+            netEdgeDecision: { breakdown: { finalNetEdge: 0.003 } },
+          },
+        },
+        {
+          eventType: 'capital.leak_review',
+          message: 'Capital leak review computed.',
+          createdAt: new Date('2026-03-24T00:01:00.000Z'),
+          metadata: {
+            report: {
+              generatedAt: '2026-03-24T00:01:00.000Z',
+              window: {
+                from: '2026-03-23T00:00:00.000Z',
+                to: '2026-03-24T00:00:00.000Z',
+              },
+              tradeCount: 3,
+              totalLeak: 0.12,
+              categoryTotals: { overtrading: 0.05 },
+              dominantCategory: 'overtrading',
+              dominantShare: 0.42,
+              byStrategyVariant: [],
+              byRegime: [
+                {
+                  groupKey: 'momentum_continuation',
+                  tradeCount: 3,
+                  totalLeak: 0.1,
+                  categoryTotals: { overtrading: 0.05 },
+                  dominantCategory: 'overtrading',
+                  dominantShare: 0.5,
+                },
+              ],
+              byMarketContext: [],
+              byExecutionStyle: [],
+              byTimeWindow: [],
+            },
+          },
+        },
+      ],
+      create: async () => null,
+    },
+  };
+
+  const runtimeControl = {
+    getLatestSafetyState: async () => ({
+      state: 'normal',
+      enteredAt: new Date(0).toISOString(),
+      reasonCodes: [],
+      sizeMultiplier: 1,
+      evaluationCadenceMultiplier: 1,
+      allowAggressiveEntries: true,
+      allowNewEntries: true,
+      haltRequested: false,
+      maxNewSignalsPerTick: 4,
+      evidence: {},
+    }),
+    recordSafetyStateTransition: async () => null,
+  };
+
+  const job = new EvaluateTradeOpportunitiesJob(
+    prisma as never,
+    runtimeControl as never,
+    deploymentRegistry,
+    learningStateStore,
+    undefined,
+    undefined,
+    tradeQualityHistoryStore,
+  );
+  const result = await job.run(createRuntimeConfig());
+
+  assert.strictEqual(result.approved, 0);
+  assert.strictEqual(result.rejected, 1);
+  assert.strictEqual(
+    [
+      'regime_capital_policy_blocked_capital',
+      'regime_disable_policy_disabled',
+      'trade_frequency_governor_blocked',
+      'marginal_edge_cooldown_active',
+      'opportunity_saturation_detected',
+    ].some(
+      (reason) => rejectedReason === reason || (rejectedMessage ?? '').includes(reason),
+    ),
+    true,
+  );
+}
+
+async function testWaveFourCostModelCalibratesExecutionReality(): Promise<void> {
+  const calibrator = new ExecutionCostCalibrator();
+  const costModel = new RealizedCostModel();
+  const timingScorer = new EntryTimingEfficiencyScorer();
+  const calibration = calibrator.calibrate({
+    activePolicyVersion: {
+      versionId: 'execution-policy:test:v2',
+      contextKey: 'execution:variant:strategy-live-1|regime:momentum_continuation',
+      strategyVariantId: 'variant:strategy-live-1',
+      regime: 'momentum_continuation',
+      mode: 'taker_preferred',
+      recommendedRoute: 'taker',
+      recommendedExecutionStyle: 'cross',
+      sampleCount: 8,
+      makerFillRateAssumption: 0.4,
+      takerFillRateAssumption: 0.7,
+      expectedFillDelayMs: 25_000,
+      expectedSlippage: 0.006,
+      adverseSelectionScore: 0.01,
+      cancelSuccessRate: 0.65,
+      partialFillRate: 0.2,
+      health: 'degraded',
+      rationale: ['fixture'],
+      sourceCycleId: 'cycle-wave4',
+      supersedesVersionId: null,
+      createdAt: '2026-03-24T00:00:00.000Z',
+    },
+    executionContext: {
+      contextKey: 'execution:variant:strategy-live-1|regime:momentum_continuation',
+      strategyVariantId: 'variant:strategy-live-1',
+      regime: 'momentum_continuation',
+      sampleCount: 8,
+      makerSampleCount: 3,
+      takerSampleCount: 5,
+      makerFillRate: 0.42,
+      takerFillRate: 0.72,
+      averageFillDelayMs: 28_000,
+      averageSlippage: 0.007,
+      adverseSelectionScore: 0.012,
+      cancelSuccessRate: 0.62,
+      partialFillRate: 0.25,
+      makerPunished: true,
+      health: 'degraded',
+      notes: ['fixture'],
+      activePolicyVersionId: 'execution-policy:test:v2',
+      lastUpdatedAt: '2026-03-24T00:00:00.000Z',
+    },
+    recentObservations: [
+      {
+        expectedFee: 0.001,
+        realizedFee: 0.0012,
+        expectedSlippage: 0.004,
+        realizedSlippage: 0.009,
+        edgeAtSignal: 0.03,
+        edgeAtFill: 0.019,
+        fillRate: 0.7,
+        staleOrder: false,
+        capturedAt: '2026-03-24T00:00:00.000Z',
+      },
+      {
+        expectedFee: 0.001,
+        realizedFee: 0.0011,
+        expectedSlippage: 0.0045,
+        realizedSlippage: 0.0085,
+        edgeAtSignal: 0.029,
+        edgeAtFill: 0.018,
+        fillRate: 0.68,
+        staleOrder: false,
+        capturedAt: '2026-03-24T00:05:00.000Z',
+      },
+    ],
+    cancelFailureRate: 0.3,
+    venueUncertaintyLabel: 'degraded',
+  });
+  const timing = timingScorer.score({
+    signalAgeMs: 18_000,
+    timeToExpirySeconds: 75,
+    halfLifeMultiplier: 0.62,
+    halfLifeExpired: false,
+    expectedFillDelayMs: calibration.expectedFillDelayMs,
+    microstructureDecayPressure: 0.78,
+  });
+  const cost = costModel.evaluate({
+    grossEdge: 0.02,
+    feeCost: calibration.feeCost,
+    slippageCost: calibration.slippageCost,
+    adverseSelectionCost: calibration.adverseSelectionCost,
+    fillDelayMs: 40_000,
+    expectedFillDelayMs: calibration.expectedFillDelayMs,
+    cancelReplaceOverheadCost: calibration.cancelReplaceOverheadCost,
+    missedOpportunityCost: calibration.missedOpportunityCost,
+  });
+
+  assert.strictEqual(calibration.slippageCost > 0.006, true);
+  assert.strictEqual(calibration.adverseSelectionCost > 0.005, true);
+  assert.strictEqual(timing.label, 'late');
+  assert.strictEqual((cost.retainedEdge ?? 1) < 0.02, true);
+  assert.strictEqual(cost.reasons.includes('cost_adjusted_edge_non_positive'), true);
+}
+
+async function testWaveFourSizingPoliciesReduceExposure(): Promise<void> {
+  const uncertaintySizing = new UncertaintyWeightedSizing();
+  const sizePenaltyEngine = new SizePenaltyEngine();
+  const liquidityPolicy = new SizeVsLiquidityPolicy();
+  const maxLossPolicy = new MaxLossPerOpportunityPolicy();
+
+  const penalty = sizePenaltyEngine.evaluate({
+    calibrationHealth: 'degraded',
+    executionHealth: 'degraded',
+    regimeHealth: 'watch',
+    venueUncertaintyLabel: 'degraded',
+    concentrationPenaltyMultiplier: 0.8,
+    correlationPenaltyMultiplier: 0.9,
+  });
+  const uncertainty = uncertaintySizing.evaluate({
+    basePositionSize: 100,
+    netEdge: 0.0045,
+    netEdgeThreshold: 0.0035,
+    calibrationHealth: 'degraded',
+    executionHealth: 'degraded',
+    regimeHealth: 'watch',
+    venueHealth: 'degraded',
+    currentDrawdownPct: 0.05,
+    sampleCount: 4,
+  });
+  const liquidity = liquidityPolicy.evaluate({
+    desiredNotional: uncertainty.adjustedPositionSize * penalty.multiplier,
+    desiredSizeUnits: 160,
+    price: 0.5,
+    topLevelDepth: 80,
+    spread: 0.03,
+    expectedSlippage: 0.011,
+    route: 'taker',
+  });
+  const lossCap = maxLossPolicy.evaluate({
+    candidatePositionSize: liquidity.allowedNotional,
+    bankroll: 1000,
+    availableCapital: 100,
+    maxPerTradeRiskPct: 1,
+    opportunityClass: 'marginal_edge',
+    signalConfidence: 0.55,
+  });
+
+  assert.strictEqual(penalty.multiplier < 1, true);
+  assert.strictEqual(uncertainty.adjustedPositionSize < 100, true);
+  assert.strictEqual(liquidity.allowedNotional < uncertainty.adjustedPositionSize * penalty.multiplier, true);
+  assert.strictEqual(lossCap.maxAllowedPositionSize < liquidity.allowedNotional, true);
+}
+
+async function testEvaluateTradeOpportunitiesAppliesWaveFourExecutionRealism(): Promise<void> {
+  let rejectedReason: string | null = null;
+  let rejectedMessage: string | null = null;
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phase12-wave4-eval-'));
+  const deploymentRegistry = new StrategyDeploymentRegistry(rootDir);
+  const learningStateStore = new LearningStateStore(rootDir);
+  const registryState = createDefaultStrategyDeploymentRegistryState(
+    new Date('2026-03-24T00:00:00.000Z'),
+  );
+  registryState.incumbentVariantId = 'variant:strategy-live-1';
+  registryState.variants['variant:strategy-live-1'] = {
+    variantId: 'variant:strategy-live-1',
+    strategyVersionId: 'strategy-live-1',
+    status: 'incumbent',
+    evaluationMode: 'full',
+    rolloutStage: 'full',
+    health: 'watch',
+    lineage: {
+      variantId: 'variant:strategy-live-1',
+      strategyVersionId: 'strategy-live-1',
+      parentVariantId: null,
+      createdAt: '2026-03-20T00:00:00.000Z',
+      createdReason: 'test',
+    },
+    capitalAllocationPct: 1,
+    lastShadowEvaluatedAt: null,
+    createdAt: '2026-03-20T00:00:00.000Z',
+    updatedAt: '2026-03-20T00:00:00.000Z',
+  };
+  await deploymentRegistry.save(registryState);
+
+  const learningState = createDefaultLearningState(new Date('2026-03-24T00:00:00.000Z'));
+  learningState.strategyVariants['variant:strategy-live-1'] = {
+    ...createDefaultStrategyVariantState('variant:strategy-live-1'),
+    health: 'watch',
+    regimeSnapshots: {
+      'regime:momentum_continuation': {
+        key: 'regime:momentum_continuation',
+        regime: 'momentum_continuation',
+        liquidityBucket: 'balanced',
+        spreadBucket: 'normal',
+        timeToExpiryBucket: 'under_15m',
+        entryTimingBucket: 'early',
+        executionStyle: 'hybrid',
+        side: 'buy',
+        strategyVariantId: 'variant:strategy-live-1',
+        sampleCount: 4,
+        winRate: 0.55,
+        expectedEvSum: 0.18,
+        realizedEvSum: 0.12,
+        avgExpectedEv: 0.022,
+        avgRealizedEv: 0.015,
+        realizedVsExpected: 0.67,
+        avgFillRate: 0.7,
+        avgSlippage: 0.006,
+        health: 'watch',
+        lastObservedAt: '2026-03-24T00:00:00.000Z',
+      },
+    },
+    executionLearning: {
+      ...createDefaultExecutionLearningState(),
+      contexts: {
+        'execution:strategy:variant:strategy-live-1|regime:momentum_continuation': {
+          contextKey: 'execution:strategy:variant:strategy-live-1|regime:momentum_continuation',
+          strategyVariantId: 'variant:strategy-live-1',
+          regime: 'momentum_continuation',
+          sampleCount: 8,
+          makerSampleCount: 3,
+          takerSampleCount: 5,
+          makerFillRate: 0.45,
+          takerFillRate: 0.68,
+          averageFillDelayMs: 30_000,
+          averageSlippage: 0.007,
+          adverseSelectionScore: 0.012,
+          cancelSuccessRate: 0.6,
+          partialFillRate: 0.2,
+          makerPunished: true,
+          health: 'degraded',
+          notes: ['wave4_fixture'],
+          activePolicyVersionId: 'execution-policy:wave4:v1',
+          lastUpdatedAt: '2026-03-24T00:00:00.000Z',
+        },
+      },
+      policyVersions: {
+        'execution-policy:wave4:v1': {
+          versionId: 'execution-policy:wave4:v1',
+          contextKey: 'execution:strategy:variant:strategy-live-1|regime:momentum_continuation',
+          strategyVariantId: 'variant:strategy-live-1',
+          regime: 'momentum_continuation',
+          mode: 'taker_preferred',
+          recommendedRoute: 'taker',
+          recommendedExecutionStyle: 'cross',
+          sampleCount: 8,
+          makerFillRateAssumption: 0.45,
+          takerFillRateAssumption: 0.68,
+          expectedFillDelayMs: 30_000,
+          expectedSlippage: 0.008,
+          adverseSelectionScore: 0.012,
+          cancelSuccessRate: 0.6,
+          partialFillRate: 0.2,
+          health: 'degraded',
+          rationale: ['wave4_fixture'],
+          sourceCycleId: 'cycle-wave4',
+          supersedesVersionId: null,
+          createdAt: '2026-03-24T00:00:00.000Z',
+        },
+      },
+      activePolicyVersionIds: {
+        'execution:strategy:variant:strategy-live-1|regime:momentum_continuation':
+          'execution-policy:wave4:v1',
+      },
+    },
+  };
+  learningState.calibration['variant:strategy-live-1|regime:momentum_continuation'] = {
+    contextKey: 'variant:strategy-live-1|regime:momentum_continuation',
+    strategyVariantId: 'variant:strategy-live-1',
+    regime: 'momentum_continuation',
+    sampleCount: 8,
+    brierScore: 0.22,
+    logLoss: 0.6,
+    shrinkageFactor: 0.85,
+    overconfidenceScore: 0.12,
+    health: 'watch',
+    version: 2,
+    driftSignals: [],
+    lastUpdatedAt: '2026-03-24T00:00:00.000Z',
+  };
+  await learningStateStore.save(learningState);
+
+  const prisma = {
+    signal: {
+      findMany: async () => [
+        createExecutionSignal({
+          observedAt: new Date(Date.now() - 10_000),
+          expectedEv: 0.015,
+          edge: 0.04,
+          regime: 'momentum_continuation',
+        }),
+      ],
+      update: async () => null,
+    },
+    portfolioSnapshot: {
+      findFirst: async () => ({
+        bankroll: 1000,
+        availableCapital: 1000,
+        deployableRiskNow: 1000,
+        workingBuyNotional: 0,
+        realizedPnlDay: 0,
+        consecutiveLosses: 0,
+        capturedAt: new Date(),
+      }),
+    },
+    position: { findMany: async () => [] },
+    order: { findMany: async () => [] },
+    signalDecision: {
+      findFirst: async () => null,
+      findMany: async () => [],
+      create: async ({ data }: { data: { reasonCode: string; reasonMessage: string } }) => {
+        rejectedReason = data.reasonCode;
+        rejectedMessage = data.reasonMessage;
+      },
+    },
+    market: { findMany: async () => [createMarket()] },
+    orderbook: {
+      findFirst: async () =>
+        createFreshOrderbook({
+          bestBid: 0.5,
+          bestAsk: 0.52,
+          spread: 0.02,
+          bidLevels: [{ price: 0.5, size: 60 }],
+          askLevels: [{ price: 0.52, size: 60 }],
+        }),
+    },
+    marketSnapshot: { findFirst: async () => createFreshSnapshot() },
+    reconciliationCheckpoint: {
+      findFirst: async ({ where }: { where: { source: string } }) =>
+        createFreshReconciliationCheckpoint(where.source),
+    },
+    botRuntimeStatus: { findUnique: async () => createFreshRuntimeStatus() },
+    executionDiagnostic: {
+      findMany: async () => [
+        {
+          strategyVersionId: 'strategy-live-1',
+          regime: 'momentum_continuation',
+          expectedFee: 0.001,
+          realizedFee: 0.0013,
+          expectedSlippage: 0.004,
+          realizedSlippage: 0.009,
+          edgeAtSignal: 0.03,
+          edgeAtFill: 0.017,
+          fillRate: 0.68,
+          staleOrder: false,
+          capturedAt: new Date(),
+        },
+      ],
+    },
+    auditEvent: { findMany: async () => [] },
+  };
+
+  const runtimeControl = {
+    getLatestSafetyState: async () => ({
+      state: 'normal',
+      enteredAt: new Date(0).toISOString(),
+      reasonCodes: [],
+      sizeMultiplier: 1,
+      evaluationCadenceMultiplier: 1,
+      allowAggressiveEntries: true,
+      allowNewEntries: true,
+      haltRequested: false,
+      maxNewSignalsPerTick: 4,
+      evidence: {},
+    }),
+    recordSafetyStateTransition: async () => null,
+  };
+
+  const job = new EvaluateTradeOpportunitiesJob(
+    prisma as never,
+    runtimeControl as never,
+    deploymentRegistry,
+    learningStateStore,
+  );
+  const result = await job.run(createRuntimeConfig());
+
+  assert.strictEqual(result.approved, 0);
+  assert.strictEqual(result.rejected, 1);
+  assert.strictEqual(
+    ['execution_cost_adjusted_edge_non_positive', 'entry_timing_blocks_opportunity'].some(
+      (reason) => rejectedReason === reason || (rejectedMessage ?? '').includes(reason),
+    ),
+    true,
+  );
+}
+
+async function testExecuteOrdersAppliesWaveFourExecutionCostReality(): Promise<void> {
+  let rejectionReason: string | null = null;
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phase12-wave4-exec-'));
+  const learningStateStore = new LearningStateStore(rootDir);
+  const contextKey = buildExecutionLearningContextKey(
+    'variant:strategy-live-1',
+    'momentum_continuation',
+  );
+  const learningState = createDefaultLearningState(new Date('2026-03-25T00:00:00.000Z'));
+  learningState.executionLearning = {
+    ...createDefaultExecutionLearningState(),
+    updatedAt: '2026-03-25T00:00:00.000Z',
+    contexts: {
+      [contextKey]: {
+        contextKey,
+        strategyVariantId: 'variant:strategy-live-1',
+        regime: 'momentum_continuation',
+        sampleCount: 6,
+        makerSampleCount: 2,
+        takerSampleCount: 4,
+        makerFillRate: 0.45,
+        takerFillRate: 0.7,
+        averageFillDelayMs: 28_000,
+        averageSlippage: 0.007,
+        adverseSelectionScore: 0.012,
+        cancelSuccessRate: 0.62,
+        partialFillRate: 0.2,
+        makerPunished: true,
+        health: 'degraded',
+        notes: ['wave4_fixture'],
+        activePolicyVersionId: 'execution-policy:wave4:v1',
+        lastUpdatedAt: '2026-03-25T00:00:00.000Z',
+      },
+    },
+    policyVersions: {
+      'execution-policy:wave4:v1': {
+        versionId: 'execution-policy:wave4:v1',
+        contextKey,
+        strategyVariantId: 'variant:strategy-live-1',
+        regime: 'momentum_continuation',
+        mode: 'taker_preferred',
+        recommendedRoute: 'taker',
+        recommendedExecutionStyle: 'cross',
+        sampleCount: 6,
+        makerFillRateAssumption: 0.45,
+        takerFillRateAssumption: 0.7,
+        expectedFillDelayMs: 28_000,
+        expectedSlippage: 0.008,
+        adverseSelectionScore: 0.012,
+        cancelSuccessRate: 0.62,
+        partialFillRate: 0.2,
+        health: 'degraded',
+        rationale: ['wave4_fixture'],
+        sourceCycleId: 'cycle-1',
+        supersedesVersionId: null,
+        createdAt: '2026-03-25T00:00:00.000Z',
+      },
+    },
+    activePolicyVersionIds: {
+      [contextKey]: 'execution-policy:wave4:v1',
+    },
+  };
+  await learningStateStore.save(learningState);
+
+  const prisma = {
+    signal: {
+      findMany: async () => [
+        createExecutionSignal({
+          expectedEv: 0.012,
+          edge: 0.03,
+          observedAt: new Date(Date.now() - 5_000),
+        }),
+      ],
+      update: async () => null,
+    },
+    signalDecision: {
+      findFirst: async () => ({ positionSize: 10, verdict: 'approved' }),
+      create: async ({ data }: { data: { reasonCode: string } }) => {
+        rejectionReason = data.reasonCode;
+      },
+    },
+    market: { findUnique: async () => createMarket() },
+    marketSnapshot: { findFirst: async () => createFreshSnapshot() },
+    orderbook: { findFirst: async () => createFreshOrderbook({ spread: 0.02, minOrderSize: 0.1 }) },
+    order: { findFirst: async () => null, create: async () => null },
+    auditEvent: { create: async () => null },
+    portfolioSnapshot: { findFirst: async () => createFreshPortfolioSnapshot() },
+    reconciliationCheckpoint: {
+      findFirst: async ({ where }: { where: { source: string } }) =>
+        createFreshReconciliationCheckpoint(where.source),
+    },
+    botRuntimeStatus: { findUnique: async () => createFreshRuntimeStatus() },
+    liveConfig: { findUnique: async () => ({ id: 'live', noTradeWindowSeconds: 30 }) },
+    executionDiagnostic: {
+      findMany: async () => [
+        {
+          strategyVersionId: 'strategy-live-1',
+          regime: 'momentum_continuation',
+          expectedFee: 0.001,
+          realizedFee: 0.0012,
+          expectedSlippage: 0.004,
+          realizedSlippage: 0.009,
+          edgeAtSignal: 0.028,
+          edgeAtFill: 0.016,
+          fillRate: 0.65,
+          staleOrder: false,
+          capturedAt: new Date(),
+        },
+      ],
+    },
+  };
+
+  const job = new ExecuteOrdersJob(prisma as never, undefined, learningStateStore);
+  stubExternalPortfolioService(job, createExternalPortfolioSnapshot());
+  (job as any).tradingClient = {
+    postOrder: async () => ({
+      success: true,
+      orderId: 'venue-o1',
+      status: 'acknowledged',
+    }),
+  };
+  const result = await job.run({ canSubmit: () => true });
+
+  assert.strictEqual(result.submitted, 0);
+  assert.strictEqual(result.rejected, 1);
+  assert.strictEqual(rejectionReason, 'execution_cost_adjusted_edge_non_positive');
+}
+
+async function testCapitalLeakAttributionDistinguishesLossSources(): Promise<void> {
+  const attribution = new CapitalLeakAttribution();
+  const result = attribution.attribute({
+    tradeId: 'trade-1',
+    orderId: 'order-1',
+    signalId: 'signal-1',
+    marketId: 'm1',
+    strategyVariantId: 'variant:strategy-live-1',
+    regime: 'momentum_continuation',
+    marketContext: 'btc-5m-higher:YES',
+    executionStyle: 'taker',
+    observedAt: new Date('2026-03-26T00:15:00.000Z').toISOString(),
+    expectedEv: 0.06,
+    realizedEv: -0.02,
+    expectedSlippage: 0.002,
+    realizedSlippage: 0.012,
+    edgeAtSignal: 0.04,
+    edgeAtFill: 0.018,
+    fillRate: 0.55,
+    allocatedNotional: 140,
+    recommendedNotional: 80,
+    calibrationHealth: 'degraded',
+    regimeHealth: 'degraded',
+    venueUncertaintyLabel: 'degraded',
+    netEdgeAtDecision: 0.001,
+    netEdgeThreshold: 0.003,
+    policyBreaches: ['no_trade_zone', 'weak_net_edge'],
+  });
+
+  assert.strictEqual(result.totalLeak > 0, true);
+  assert.strictEqual(
+    result.contributions.some((contribution) => contribution.category === 'slippage'),
+    true,
+  );
+  assert.strictEqual(
+    result.contributions.some((contribution) => contribution.category === 'missed_fills'),
+    true,
+  );
+  assert.strictEqual(
+    result.contributions.some((contribution) => contribution.category === 'overtrading'),
+    true,
+  );
+  assert.strictEqual(
+    result.contributions.some(
+      (contribution) => contribution.category === 'degraded_regime_trading',
+    ),
+    true,
+  );
+}
+
+async function testCapitalLeakReviewPersistsReportAndTradeQualityHistory(): Promise<void> {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'capital-leak-wave2-'));
+  const learningStateStore = new LearningStateStore(rootDir);
+  const tradeQualityHistoryStore = new TradeQualityHistoryStore(
+    path.join(rootDir, 'trade-quality'),
+  );
+  const learningState = createDefaultLearningState(new Date('2026-03-26T00:00:00.000Z'));
+  const strategyVariantId = buildStrategyVariantId('strategy-live-1');
+  learningState.strategyVariants[strategyVariantId] = {
+    ...createDefaultStrategyVariantState(strategyVariantId),
+    health: 'degraded',
+  };
+  learningState.calibration[`strategy:${strategyVariantId}|regime:momentum_continuation`] = {
+    contextKey: `strategy:${strategyVariantId}|regime:momentum_continuation`,
+    strategyVariantId,
+    regime: 'momentum_continuation',
+    sampleCount: 12,
+    brierScore: 0.24,
+    logLoss: 0.62,
+    shrinkageFactor: 0.72,
+    overconfidenceScore: 0.18,
+    health: 'degraded',
+    version: 1,
+    driftSignals: ['overconfidence_detected'],
+    lastUpdatedAt: '2026-03-25T00:00:00.000Z',
+  };
+  await learningStateStore.save(learningState);
+
+  const createdAuditEvents: Array<{ eventType: string; metadata?: Record<string, unknown> }> = [];
+  const decisionEvent = {
+    signalId: 'signal-1',
+    createdAt: new Date('2026-03-26T00:10:10.000Z'),
+    metadata: {
+      netEdgeDecision: {
+        breakdown: {
+          finalNetEdge: 0.001,
+        },
+      },
+      netEdgeThreshold: {
+        minimumNetEdge: 0.003,
+      },
+      noTradeZone: {
+        reasons: ['weak_net_edge', 'poor_calibration'],
+      },
+      venueAssessment: {
+        label: 'degraded',
+      },
+      reasons: ['weak_net_edge'],
+      rolloutControls: {
+        reasonCodes: [],
+      },
+    },
+  };
+
+  const prisma = {
+    executionDiagnostic: {
+      findMany: async () => [
+        {
+          orderId: 'order-1',
+          strategyVersionId: 'strategy-live-1',
+          expectedEv: 0.05,
+          realizedEv: -0.02,
+          expectedSlippage: 0.002,
+          realizedSlippage: 0.01,
+          edgeAtSignal: 0.035,
+          edgeAtFill: 0.016,
+          fillRate: 0.6,
+          staleOrder: false,
+          regime: 'momentum_continuation',
+          capturedAt: new Date('2026-03-26T00:10:30.000Z'),
+        },
+      ],
+    },
+    order: {
+      findMany: async () => [
+        {
+          id: 'order-1',
+          marketId: 'm1',
+          signalId: 'signal-1',
+          strategyVersionId: 'strategy-live-1',
+          price: 0.52,
+          size: 120,
+          status: 'filled',
+          createdAt: new Date('2026-03-26T00:09:00.000Z'),
+          signal: {
+            id: 'signal-1',
+            marketId: 'm1',
+            regime: 'momentum_continuation',
+            strategyVersionId: 'strategy-live-1',
+            expectedEv: 0.05,
+            edge: 0.035,
+          },
+          market: {
+            id: 'm1',
+            slug: 'btc-5m-higher',
+            title: 'Will BTC be higher in 5 minutes?',
+          },
+        },
+      ],
+    },
+    auditEvent: {
+      findMany: async ({ where }: { where?: { eventType?: string } }) => {
+        if (where?.eventType === 'signal.execution_decision') {
+          return [decisionEvent];
+        }
+        return [];
+      },
+      create: async ({ data }: { data: { eventType: string; metadata?: Record<string, unknown> } }) => {
+        createdAuditEvents.push(data);
+        return null;
+      },
+    },
+    signalDecision: {
+      findMany: async () => [
+        {
+          signalId: 'signal-1',
+          verdict: 'approved',
+          positionSize: 62.4,
+          decisionAt: new Date('2026-03-26T00:10:00.000Z'),
+        },
+      ],
+    },
+  };
+
+  const job = new CapitalLeakReviewJob(
+    prisma as never,
+    learningStateStore,
+    tradeQualityHistoryStore,
+    path.join(rootDir, 'capital-leak'),
+  );
+  const result = await job.run({
+    from: new Date('2026-03-26T00:00:00.000Z'),
+    to: new Date('2026-03-26T01:00:00.000Z'),
+    now: new Date('2026-03-26T01:05:00.000Z'),
+  });
+  const persistedScores = await tradeQualityHistoryStore.readLatest(10);
+
+  assert.strictEqual(result.report.tradeCount, 1);
+  assert.strictEqual(result.report.totalLeak > 0, true);
+  assert.strictEqual(fs.existsSync(result.reportPath), true);
+  assert.strictEqual(persistedScores.length, 1);
+  assert.strictEqual(persistedScores[0]?.label === 'poor' || persistedScores[0]?.label === 'destructive', true);
+  assert.strictEqual(
+    createdAuditEvents.some((event) => event.eventType === 'capital.leak_review'),
+    true,
+  );
 }
 
 async function testDeploymentTierCapitalRampChaosReplayAndReadiness(): Promise<void> {
@@ -8185,6 +9504,28 @@ async function testDailyReviewRegistersChallengerAndStartsCanary(): Promise<void
         health: 'healthy',
         lastObservedAt: '2026-03-24T00:00:00.000Z',
       },
+      incumbent_follow_through: {
+        key: 'incumbent_follow_through',
+        regime: 'range_reversal',
+        liquidityBucket: 'balanced',
+        spreadBucket: 'normal',
+        timeToExpiryBucket: 'under_15m',
+        entryTimingBucket: 'early',
+        executionStyle: 'hybrid',
+        side: 'buy',
+        strategyVariantId: 'variant:strategy-live-1',
+        sampleCount: 4,
+        winRate: 0.57,
+        expectedEvSum: 0.06,
+        realizedEvSum: 0.06,
+        avgExpectedEv: 0.0086,
+        avgRealizedEv: 0.0086,
+        realizedVsExpected: 1,
+        avgFillRate: 0.9,
+        avgSlippage: 0.002,
+        health: 'healthy',
+        lastObservedAt: '2026-03-24T00:00:00.000Z',
+      },
     },
     calibrationContexts: ['strategy:variant:strategy-live-1|regime:all'],
     executionLearning: {
@@ -8226,7 +9567,7 @@ async function testDailyReviewRegistersChallengerAndStartsCanary(): Promise<void
         executionStyle: 'hybrid',
         side: 'buy',
         strategyVariantId: 'variant:strategy-challenger-2',
-        sampleCount: 8,
+        sampleCount: 4,
         winRate: 0.75,
         expectedEvSum: 0.08,
         realizedEvSum: 0.1,
@@ -8234,6 +9575,28 @@ async function testDailyReviewRegistersChallengerAndStartsCanary(): Promise<void
         avgRealizedEv: 0.0125,
         realizedVsExpected: 1.25,
         avgFillRate: 0.88,
+        avgSlippage: 0.002,
+        health: 'healthy',
+        lastObservedAt: '2026-03-24T00:00:00.000Z',
+      },
+      challenger_follow_through: {
+        key: 'challenger_follow_through',
+        regime: 'range_reversal',
+        liquidityBucket: 'balanced',
+        spreadBucket: 'normal',
+        timeToExpiryBucket: 'under_15m',
+        entryTimingBucket: 'early',
+        executionStyle: 'hybrid',
+        side: 'buy',
+        strategyVariantId: 'variant:strategy-challenger-2',
+        sampleCount: 4,
+        winRate: 0.71,
+        expectedEvSum: 0.07,
+        realizedEvSum: 0.08,
+        avgExpectedEv: 0.01,
+        avgRealizedEv: 0.0114,
+        realizedVsExpected: 1.14,
+        avgFillRate: 0.89,
         avgSlippage: 0.002,
         health: 'healthy',
         lastObservedAt: '2026-03-24T00:00:00.000Z',
@@ -8857,6 +10220,11 @@ async function run(): Promise<void> {
     ...waveFiveExecutionLearningIntegrationTests,
     ...waveFiveQuarantineIntegrationTests,
     ...waveFiveVersionLineageIntegrationTests,
+    ...waveTwelveNetEdgeGatingIntegrationTests,
+    ...waveTwelveRegimeProfitabilityIntegrationTests,
+    ...waveTwelveUncertaintySizingIntegrationTests,
+    ...waveTwelveAntiOvertradingIntegrationTests,
+    ...waveTwelveCapitalLeakAttributionIntegrationTests,
     {
       name: 'market stream connects bootstraps and supports dynamic subscriptions',
       fn: testMarketStreamConnectsBootstrapsAndSupportsDynamicSubscriptions,
@@ -8937,6 +10305,46 @@ async function run(): Promise<void> {
     {
       name: 'no-trade zones half-life and setup-aware attribution fail closed',
       fn: testNoTradeZonesHalfLifeAndSetupAwareAttribution,
+    },
+    {
+      name: 'net-edge policies reject low-margin opportunities after costs',
+      fn: testNetEdgePoliciesRejectLowMarginOpportunity,
+    },
+    {
+      name: 'regime profitability policies reduce destructive regimes',
+      fn: testRegimeProfitabilityPoliciesReduceDestructiveRegime,
+    },
+    {
+      name: 'wave3 governors prefer reduced activity over marginal activity',
+      fn: testWaveThreeGovernorsPreferReducedActivityOverMarginalActivity,
+    },
+    {
+      name: 'evaluate trade opportunities applies wave3 regime discipline',
+      fn: testEvaluateTradeOpportunitiesAppliesWaveThreeRegimeDiscipline,
+    },
+    {
+      name: 'wave4 cost model calibrates execution reality',
+      fn: testWaveFourCostModelCalibratesExecutionReality,
+    },
+    {
+      name: 'wave4 sizing policies reduce exposure',
+      fn: testWaveFourSizingPoliciesReduceExposure,
+    },
+    {
+      name: 'evaluate trade opportunities applies wave4 execution realism',
+      fn: testEvaluateTradeOpportunitiesAppliesWaveFourExecutionRealism,
+    },
+    {
+      name: 'execute orders applies wave4 execution cost reality',
+      fn: testExecuteOrdersAppliesWaveFourExecutionCostReality,
+    },
+    {
+      name: 'capital leak attribution distinguishes structured loss sources',
+      fn: testCapitalLeakAttributionDistinguishesLossSources,
+    },
+    {
+      name: 'capital leak review persists report and trade quality history',
+      fn: testCapitalLeakReviewPersistsReportAndTradeQualityHistory,
     },
     {
       name: 'deployment tier capital ramp chaos replay and readiness fail closed',

@@ -7,12 +7,19 @@ import { BotRuntimeState } from '@worker/runtime/bot-state';
 import { appEnv } from '@worker/config/env';
 import {
   AdaptiveMakerTakerPolicy,
+  EntryTimingEfficiencyScorer,
+  ExecutionCostCalibrator,
   ExecutionPolicyVersionStore,
+  RealizedCostModel,
+  SizeVsLiquidityPolicy,
   OrderIntentService,
 } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { buildStrategyVariantId } from '@polymarket-btc-5m-agentic-bot/domain';
 import { SignerHealth } from '@polymarket-btc-5m-agentic-bot/signing-engine';
-import { LiveTradeGuard } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import {
+  LiveTradeGuard,
+  MaxLossPerOpportunityPolicy,
+} from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { PreTradeFundingValidator } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { MarketableLimit } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import { DuplicateExposureGuard } from '@polymarket-btc-5m-agentic-bot/execution-engine';
@@ -93,6 +100,11 @@ export class ExecuteOrdersJob {
   private readonly orderIntentService = new OrderIntentService();
   private readonly operationalPolicy = new VenueOperationalPolicyService();
   private readonly adaptiveMakerTakerPolicy = new AdaptiveMakerTakerPolicy();
+  private readonly executionCostCalibrator = new ExecutionCostCalibrator();
+  private readonly realizedCostModel = new RealizedCostModel();
+  private readonly sizeVsLiquidityPolicy = new SizeVsLiquidityPolicy();
+  private readonly entryTimingEfficiencyScorer = new EntryTimingEfficiencyScorer();
+  private readonly maxLossPerOpportunityPolicy = new MaxLossPerOpportunityPolicy();
   private readonly versionLineageRegistry: VersionLineageRegistry;
   private readonly venueHealthLearningStore: VenueHealthLearningStore;
   private readonly venueUncertaintyDetector = new VenueUncertaintyDetector();
@@ -231,6 +243,16 @@ export class ExecuteOrdersJob {
       },
       take: 20,
     });
+    const prismaAny = this.prisma as any;
+    const [recentExecutionDiagnostics, learningState] = await Promise.all([
+      prismaAny.executionDiagnostic?.findMany
+        ? prismaAny.executionDiagnostic.findMany({
+            orderBy: { capturedAt: 'desc' },
+            take: 80,
+          })
+        : Promise.resolve([]),
+      this.learningStateStore ? this.learningStateStore.load() : Promise.resolve(null),
+    ]);
 
     let submitted = 0;
     let rejected = 0;
@@ -477,6 +499,10 @@ export class ExecuteOrdersJob {
             signal.regime ?? null,
           )
         : null;
+      const executionContext =
+        activeExecutionPolicy?.contextKey && learningState
+          ? learningState.executionLearning.contexts[activeExecutionPolicy.contextKey] ?? null
+          : null;
       const adaptiveExecution = this.adaptiveMakerTakerPolicy.decide({
         activePolicyVersion: activeExecutionPolicy,
         marketContext: {
@@ -490,6 +516,41 @@ export class ExecuteOrdersJob {
               : null,
           topLevelDepth,
         },
+      });
+      if (
+        isNewExposure &&
+        !activeSafetyState.allowAggressiveEntries &&
+        adaptiveExecution.executionStyle === 'cross'
+      ) {
+        await this.rejectSignal(signal.id, 'safety_state_passive_only');
+        rejected += 1;
+        continue;
+      }
+      const executionCostCalibration = this.executionCostCalibrator.calibrate({
+        activePolicyVersion: activeExecutionPolicy,
+        executionContext,
+        recentObservations: this.selectRecentExecutionCostObservations(
+          recentExecutionDiagnostics,
+          signal.strategyVersionId,
+          signal.regime ?? null,
+        ),
+        cancelFailureRate: 0,
+        venueUncertaintyLabel: venueAssessment.label,
+      });
+      const entryTiming = this.entryTimingEfficiencyScorer.score({
+        signalAgeMs,
+        timeToExpirySeconds: Math.max(
+          0,
+          Math.floor((new Date(expiryAt).getTime() - Date.now()) / 1000),
+        ),
+        halfLifeMultiplier: Math.max(
+          0.1,
+          1 - signalAgeMs / Math.max(appEnv.BOT_MAX_SIGNAL_AGE_MS, 1),
+        ),
+        halfLifeExpired: signalAgeMs >= appEnv.BOT_MAX_SIGNAL_AGE_MS,
+        expectedFillDelayMs: executionCostCalibration.expectedFillDelayMs,
+        microstructureDecayPressure:
+          orderbook.spread != null ? Math.min(1, orderbook.spread / 0.05) : 0.5,
       });
 
       const marketable = this.marketableLimit.calculate({
@@ -525,7 +586,46 @@ export class ExecuteOrdersJob {
           ? activeSafetyState.sizeMultiplier * venueMode.sizeMultiplier
           : 1);
       const initialSize = Math.max(0, capitalAwareDecisionSize / price);
-      const size = topLevelDepth > 0 ? Math.min(initialSize, topLevelDepth * 0.8) : initialSize;
+      const liquidityDecision = this.sizeVsLiquidityPolicy.evaluate({
+        desiredNotional: capitalAwareDecisionSize,
+        desiredSizeUnits: initialSize,
+        price,
+        topLevelDepth,
+        spread: orderbook.spread ?? null,
+        expectedSlippage: Math.max(
+          executionCostCalibration.slippageCost,
+          this.slippageEstimator.estimate({
+            side: venueSide,
+            bestBid: bestBid > 0 ? bestBid : null,
+            bestAsk: bestAsk > 0 ? bestAsk : null,
+            targetSize: initialSize,
+            topLevelDepth,
+          }).expectedSlippage,
+        ),
+        route: adaptiveExecution.route,
+      });
+      const lossCapDecision = this.maxLossPerOpportunityPolicy.evaluate({
+        candidatePositionSize: Math.max(0, liquidityDecision.allowedNotional),
+        bankroll: Math.max(decision.positionSize, capitalAwareDecisionSize, 1) * 100,
+        availableCapital: Math.max(capitalAwareDecisionSize, 0) * 100,
+        maxPerTradeRiskPct: appEnv.MAX_PER_TRADE_RISK_PCT,
+        opportunityClass:
+          signal.expectedEv >= 0.03
+            ? 'strong_edge'
+            : signal.expectedEv >= 0.015
+              ? 'tradable_edge'
+              : signal.expectedEv > 0
+                ? 'marginal_edge'
+                : 'weak_edge',
+        signalConfidence: Math.max(0.2, Math.min(1, Math.abs(signal.posteriorProbability - 0.5) * 2)),
+      });
+      const size = Math.max(
+        0,
+        Math.min(
+          liquidityDecision.allowedSizeUnits,
+          lossCapDecision.maxAllowedPositionSize / Math.max(price, 1e-9),
+        ) * entryTiming.sizeMultiplier,
+      );
 
       if (!Number.isFinite(size) || size <= 0) {
         await this.rejectSignal(signal.id, 'invalid_size');
@@ -546,6 +646,31 @@ export class ExecuteOrdersJob {
         targetSize: size,
         topLevelDepth,
       });
+      const executionCostAssessment = this.realizedCostModel.evaluate({
+        grossEdge: signal.expectedEv,
+        feeCost: executionCostCalibration.feeCost,
+        slippageCost: Math.max(slippage.expectedSlippage, executionCostCalibration.slippageCost),
+        adverseSelectionCost: executionCostCalibration.adverseSelectionCost,
+        fillDelayMs: signalAgeMs + (executionCostCalibration.expectedFillDelayMs ?? 0),
+        expectedFillDelayMs: executionCostCalibration.expectedFillDelayMs,
+        cancelReplaceOverheadCost: executionCostCalibration.cancelReplaceOverheadCost,
+        missedOpportunityCost: executionCostCalibration.missedOpportunityCost,
+      });
+      if (entryTiming.blockTrade) {
+        await this.rejectSignal(signal.id, 'entry_timing_blocks_opportunity');
+        rejected += 1;
+        continue;
+      }
+      if (liquidityDecision.blockTrade) {
+        await this.rejectSignal(signal.id, 'liquidity_policy_blocks_size');
+        rejected += 1;
+        continue;
+      }
+      if (lossCapDecision.blockTrade && lossCapDecision.maxAllowedPositionSize <= 0) {
+        await this.rejectSignal(signal.id, 'max_loss_per_opportunity_blocked');
+        rejected += 1;
+        continue;
+      }
       if (slippage.severity === 'high' && signal.expectedEv <= slippage.expectedSlippage) {
         await this.rejectSignal(signal.id, 'expected_slippage_exceeds_edge');
         rejected += 1;
@@ -641,6 +766,14 @@ export class ExecuteOrdersJob {
         venueFeeFetchedAt: feeSnapshot?.fetchedAt ?? null,
         source: feeSnapshot ? 'venue_live' : 'fallback',
       });
+      const executionAdjustedEdge =
+        signal.expectedEv -
+        Math.max(0, executionCostAssessment.breakdown.totalCost - executionCostCalibration.feeCost);
+      if (executionAdjustedEdge <= 0) {
+        await this.rejectSignal(signal.id, 'execution_cost_adjusted_edge_non_positive');
+        rejected += 1;
+        continue;
+      }
       if (signal.expectedEv <= slippage.expectedSlippage + feeModel.expectedFeePerUnit) {
         await this.rejectSignal(signal.id, 'fee_adjusted_edge_non_positive');
         rejected += 1;
@@ -1026,7 +1159,6 @@ export class ExecuteOrdersJob {
         },
       });
 
-      const prismaAny = this.prisma as any;
       if (prismaAny.executionDiagnostic?.create) {
         const snapshot = this.executionDiagnostics.create({
           orderId: localOrderId,
@@ -1113,6 +1245,11 @@ export class ExecuteOrdersJob {
             minOrderSize,
             negRisk,
             feeModel,
+            executionCostCalibration,
+            executionCostAssessment,
+            liquidityDecision,
+            entryTiming,
+            lossCapDecision,
             makerQuality,
             negRiskVerdict,
             duplicateExposureVerdict,
@@ -1129,14 +1266,12 @@ export class ExecuteOrdersJob {
             safetyReasonCodes: activeSafetyState.reasonCodes,
             venueMode: venueMode.mode,
             venueUncertainty: venueAssessment.label,
+            executionAdjustedEdge,
             liveExecutionEnabled: appEnv.BOT_LIVE_EXECUTION_ENABLED,
             error: lastError,
           } as object,
         },
       });
-      const learningState = this.learningStateStore
-        ? await this.learningStateStore.load()
-        : null;
       const calibration = signal.strategyVersionId && learningState
         ? Object.values(learningState.calibration).find(
             (candidate) =>
@@ -1185,6 +1320,11 @@ export class ExecuteOrdersJob {
               venueMode,
               signerHealth,
               guard,
+              executionCostCalibration,
+              executionCostAssessment,
+              liquidityDecision,
+              entryTiming,
+              lossCapDecision,
             },
           }),
           allocationPolicyVersion: null,
@@ -1213,6 +1353,12 @@ export class ExecuteOrdersJob {
             payload,
             orderPlan,
             feeModel,
+            executionCostCalibration,
+            executionCostAssessment,
+            liquidityDecision,
+            entryTiming,
+            lossCapDecision,
+            executionAdjustedEdge,
             makerQuality,
             slippage,
             duplicateExposureVerdict,
@@ -1307,6 +1453,68 @@ export class ExecuteOrdersJob {
 
     const value = (source as Record<string, unknown>)[key];
     return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+  }
+
+  private readNumberField(source: unknown, key: string): number | null {
+    if (!source || typeof source !== 'object') {
+      return null;
+    }
+
+    const value = (source as Record<string, unknown>)[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+  }
+
+  private readBooleanField(source: unknown, key: string): boolean | null {
+    if (!source || typeof source !== 'object') {
+      return null;
+    }
+
+    const value = (source as Record<string, unknown>)[key];
+    return typeof value === 'boolean' ? value : null;
+  }
+
+  private readDateField(source: unknown, key: string): Date | null {
+    if (!source || typeof source !== 'object') {
+      return null;
+    }
+
+    const value = (source as Record<string, unknown>)[key];
+    if (value instanceof Date) {
+      return Number.isNaN(value.getTime()) ? null : value;
+    }
+    if (typeof value === 'string' || typeof value === 'number') {
+      const parsed = new Date(value);
+      return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+    return null;
+  }
+
+  private selectRecentExecutionCostObservations(
+    diagnostics: unknown[],
+    strategyVersionId: string | null,
+    regime: string | null,
+  ) {
+    return (diagnostics ?? [])
+      .filter(
+        (diagnostic) =>
+          (strategyVersionId == null ||
+            this.readStringField(diagnostic, 'strategyVersionId') === strategyVersionId) &&
+          (regime == null || this.readStringField(diagnostic, 'regime') === regime),
+      )
+      .slice(0, 20)
+      .map((diagnostic) => ({
+        expectedFee: this.readNumberField(diagnostic, 'expectedFee'),
+        realizedFee: this.readNumberField(diagnostic, 'realizedFee'),
+        expectedSlippage: this.readNumberField(diagnostic, 'expectedSlippage'),
+        realizedSlippage: this.readNumberField(diagnostic, 'realizedSlippage'),
+        edgeAtSignal: this.readNumberField(diagnostic, 'edgeAtSignal'),
+        edgeAtFill: this.readNumberField(diagnostic, 'edgeAtFill'),
+        fillRate: this.readNumberField(diagnostic, 'fillRate'),
+        staleOrder: this.readBooleanField(diagnostic, 'staleOrder') ?? false,
+        capturedAt:
+          this.readDateField(diagnostic, 'capturedAt')?.toISOString() ??
+          new Date(0).toISOString(),
+      }));
   }
 
   private estimateRecentTradeCount(volume: number | null): number {

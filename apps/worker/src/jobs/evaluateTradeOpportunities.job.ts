@@ -34,12 +34,21 @@ import {
   controlsForSafetyState,
 } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { SafetyStateMachine } from '@polymarket-btc-5m-agentic-bot/risk-engine';
-import { TradeIntentResolver } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import {
+  EntryTimingEfficiencyScorer,
+  ExecutionCostCalibrator,
+  RealizedCostModel,
+  SizeVsLiquidityPolicy,
+  TradeIntentResolver,
+} from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import {
   buildCalibrationContextKey,
   ConfidenceShrinkagePolicy,
   ExecutableEdgeEstimate,
   LiveCalibrationStore,
+  NetEdgeEstimator,
+  NetEdgeThresholdDecision,
+  NetEdgeThresholdPolicy,
   TradeAdmissionGate,
 } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { MarketEligibilityService } from '@polymarket-btc-5m-agentic-bot/signal-engine';
@@ -50,11 +59,29 @@ import { EventMicrostructureModel } from '@polymarket-btc-5m-agentic-bot/signal-
 import { FeatureBuilder } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { DeploymentTierPolicyService } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { CapitalRampPolicyService } from '@polymarket-btc-5m-agentic-bot/risk-engine';
+import {
+  MarginalEdgeCooldownPolicy,
+  MaxLossPerOpportunityPolicy,
+  OpportunityClass,
+  OpportunitySaturationDetector,
+  RegimeCapitalPolicy,
+  RegimeDisablePolicy,
+  RegimeProfitabilityRanker,
+  SizePenaltyEngine,
+  TradeFrequencyGovernor,
+  TradeQualityHistoryStore,
+  UncertaintyWeightedSizing,
+  type CapitalLeakCategory,
+  type CapitalLeakReport,
+} from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { DecisionLogService } from '@worker/runtime/decision-log.service';
 import { LearningStateStore } from '@worker/runtime/learning-state-store';
 import {
   buildStrategyVariantId,
   type CalibrationState,
+  type HealthLabel,
+  type NetEdgeDecision,
+  type TradeQualityScore,
 } from '@polymarket-btc-5m-agentic-bot/domain';
 import { StrategyDeploymentRegistry } from '@worker/runtime/strategy-deployment-registry';
 import { StrategyRolloutController } from '@worker/runtime/strategy-rollout-controller';
@@ -85,6 +112,14 @@ interface ResolvedEvaluationIntent {
   inventoryEffect: 'increase' | 'decrease';
 }
 
+interface RecentAdmissionEvent {
+  createdAt: string;
+  verdict: 'approved' | 'rejected' | 'unknown';
+  marginAboveThreshold: number | null;
+  opportunityClass: OpportunityClass;
+  reasons: string[];
+}
+
 export interface EvaluateTradeOpportunitiesResult {
   approved: number;
   rejected: number;
@@ -112,11 +147,20 @@ export class EvaluateTradeOpportunitiesJob {
   private readonly tradeAdmissionGate = new TradeAdmissionGate();
   private readonly edgeDefinitionService = new EdgeDefinitionService();
   private readonly noTradeZonePolicy = new NoTradeZonePolicy();
+  private readonly netEdgeEstimator = new NetEdgeEstimator();
+  private readonly netEdgeThresholdPolicy = new NetEdgeThresholdPolicy();
   private readonly edgeHalfLifePolicy = new EdgeHalfLifePolicy();
   private readonly microstructureModel = new EventMicrostructureModel();
   private readonly featureBuilder = new FeatureBuilder();
+  private readonly executionCostCalibrator = new ExecutionCostCalibrator();
+  private readonly realizedCostModel = new RealizedCostModel();
+  private readonly sizeVsLiquidityPolicy = new SizeVsLiquidityPolicy();
+  private readonly entryTimingEfficiencyScorer = new EntryTimingEfficiencyScorer();
   private readonly deploymentTierPolicy = new DeploymentTierPolicyService();
   private readonly capitalRampPolicy = new CapitalRampPolicyService();
+  private readonly uncertaintyWeightedSizing = new UncertaintyWeightedSizing();
+  private readonly sizePenaltyEngine = new SizePenaltyEngine();
+  private readonly maxLossPerOpportunityPolicy = new MaxLossPerOpportunityPolicy();
   private readonly accountStateService: AccountStateService;
   private readonly marketEligibility = new MarketEligibilityService();
   private readonly decisionLogService: DecisionLogService;
@@ -129,6 +173,13 @@ export class EvaluateTradeOpportunitiesJob {
   private readonly venueHealthLearningStore: VenueHealthLearningStore;
   private readonly venueUncertaintyDetector = new VenueUncertaintyDetector();
   private readonly venueModePolicy = new VenueModePolicy();
+  private readonly regimeProfitabilityRanker = new RegimeProfitabilityRanker();
+  private readonly regimeCapitalPolicy = new RegimeCapitalPolicy();
+  private readonly regimeDisablePolicy = new RegimeDisablePolicy();
+  private readonly tradeFrequencyGovernor = new TradeFrequencyGovernor();
+  private readonly marginalEdgeCooldownPolicy = new MarginalEdgeCooldownPolicy();
+  private readonly opportunitySaturationDetector = new OpportunitySaturationDetector();
+  private readonly tradeQualityHistoryStore: TradeQualityHistoryStore;
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -137,6 +188,7 @@ export class EvaluateTradeOpportunitiesJob {
     learningStateStore?: LearningStateStore,
     versionLineageRegistry?: VersionLineageRegistry,
     venueHealthLearningStore?: VenueHealthLearningStore,
+    tradeQualityHistoryStore?: TradeQualityHistoryStore,
   ) {
     this.accountStateService = new AccountStateService(prisma);
     this.decisionLogService = new DecisionLogService(prisma);
@@ -151,6 +203,8 @@ export class EvaluateTradeOpportunitiesJob {
       versionLineageRegistry ?? new VersionLineageRegistry();
     this.venueHealthLearningStore =
       venueHealthLearningStore ?? createDefaultVenueHealthLearningStore(this.learningStateStore);
+    this.tradeQualityHistoryStore =
+      tradeQualityHistoryStore ?? new TradeQualityHistoryStore();
   }
 
   async run(
@@ -201,6 +255,7 @@ export class EvaluateTradeOpportunitiesJob {
     const calibrationByContext = learningState.calibration;
     const deploymentRegistry = await this.strategyDeploymentRegistry.load();
     const venueMetrics = await this.venueHealthLearningStore.getCurrentMetrics();
+    const recentTradeQualityScores = await this.tradeQualityHistoryStore.readLatest(200);
     const venueAssessment = this.venueUncertaintyDetector.evaluate(venueMetrics);
     const venueMode = this.venueModePolicy.decide(venueAssessment);
     await this.venueHealthLearningStore.setOperationalAssessment({
@@ -341,6 +396,11 @@ export class EvaluateTradeOpportunitiesJob {
     });
     const marketById = new Map(markets.map((market) => [market.id, market]));
     const auditCoverage = this.decisionLogService.summarizeAuditCoverage(recentAuditEvents);
+    const latestCapitalLeakReport = this.readLatestCapitalLeakReport(recentAuditEvents);
+    const recentAdmissionEvents = this.readRecentAdmissionEvents(
+      recentAuditEvents,
+      recentSignalDecisions,
+    );
     const researchGovernanceHealthy =
       latestResearchGovernanceCheckpoint?.status === 'passed';
     const latestResearchDetails =
@@ -714,11 +774,39 @@ export class EvaluateTradeOpportunitiesJob {
         marketPrice: this.boundProbability(signal.marketImpliedProb),
         maxKellyFraction: config.maxKellyFraction,
       });
+      const strategyVariantId =
+        signal.strategyVersionId != null
+          ? buildStrategyVariantId(signal.strategyVersionId)
+          : null;
       const calibration =
         signal.strategyVersionId != null
           ? this.resolveCalibrationForSignal(
               calibrationByContext,
               signal.strategyVersionId,
+              signal.regime,
+            )
+          : null;
+      const executionContext =
+        strategyVariantId != null
+          ? this.resolveExecutionLearningContext(
+              learningState,
+              strategyVariantId,
+              signal.regime,
+            )
+          : null;
+      const activeExecutionPolicy =
+        strategyVariantId != null
+          ? this.resolveExecutionPolicyVersion(
+              learningState,
+              strategyVariantId,
+              signal.regime,
+            )
+          : null;
+      const regimeHealth =
+        strategyVariantId != null
+          ? this.resolveRegimeHealthForSignal(
+              learningState,
+              strategyVariantId,
               signal.regime,
             )
           : null;
@@ -751,7 +839,7 @@ export class EvaluateTradeOpportunitiesJob {
         mildMultiplier: 0.75,
         severeMultiplier: 0.5,
       });
-      const positionSize = Math.max(
+      const provisionalPositionSize = Math.max(
         0,
         contraction.adjustedSize *
           (isNewExposure
@@ -771,7 +859,7 @@ export class EvaluateTradeOpportunitiesJob {
       if (sizing.riskBudget <= 0) {
         reasons.push('risk_budget_exhausted');
       }
-      if (positionSize <= 0) {
+      if (provisionalPositionSize <= 0) {
         reasons.push('position_size_zero');
       }
       if (isNewExposure && (portfolioAllocationDecision?.targetMultiplier ?? 1) <= 0) {
@@ -784,20 +872,37 @@ export class EvaluateTradeOpportunitiesJob {
         reasons.unshift(...[...rolloutControls.reasonCodes].reverse());
       }
 
+      const topLevelDepth = orderbook && venueSide
+        ? this.topLevelDepth(orderbook, venueSide)
+        : 0;
+      const referencePrice =
+        orderbook && venueSide
+          ? venueSide === 'BUY'
+            ? (orderbook.bestAsk ?? 0)
+            : (orderbook.bestBid ?? 0)
+          : null;
+      const estimatedSizeUnits =
+        referencePrice != null && Number.isFinite(referencePrice) && referencePrice > 0
+          ? provisionalPositionSize / referencePrice
+          : null;
+
       if (resolvedIntent && orderbook && venueSide) {
-        const topLevelDepth = this.topLevelDepth(orderbook, venueSide);
         if (topLevelDepth <= 0) {
           reasons.push('top_level_liquidity_missing');
         }
 
-        const referencePrice =
-          venueSide === 'BUY' ? (orderbook.bestAsk ?? 0) : (orderbook.bestBid ?? 0);
-
-        if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
+        if (
+          referencePrice == null ||
+          !Number.isFinite(referencePrice) ||
+          referencePrice <= 0
+        ) {
           reasons.push('reference_price_missing');
         } else {
-          const estimatedSizeUnits = positionSize / referencePrice;
-          if (!Number.isFinite(estimatedSizeUnits) || estimatedSizeUnits <= 0) {
+          if (
+            estimatedSizeUnits == null ||
+            !Number.isFinite(estimatedSizeUnits) ||
+            estimatedSizeUnits <= 0
+          ) {
             reasons.push('estimated_order_size_invalid');
           } else if (topLevelDepth > 0 && estimatedSizeUnits > topLevelDepth * 0.8) {
             reasons.push('insufficient_top_level_liquidity');
@@ -809,7 +914,7 @@ export class EvaluateTradeOpportunitiesJob {
               outcome: resolvedIntent.outcome,
               expiryAt: expiry,
               signal,
-              notional: positionSize,
+              notional: provisionalPositionSize,
             });
             const positionLimitVerdict = this.multiDimensionalPositionLimits.evaluate({
               candidate: candidateExposure,
@@ -871,7 +976,7 @@ export class EvaluateTradeOpportunitiesJob {
         reasons.push(eligibility.reasonMessage ?? eligibility.reasonCode);
       }
 
-      const liquidityHealthy =
+      const liquidityHealthyBase =
         !!orderbook &&
         orderbook.bestBid != null &&
         orderbook.bestAsk != null &&
@@ -895,10 +1000,14 @@ export class EvaluateTradeOpportunitiesJob {
         !reasons.includes('research_governance_blocked') &&
         !reasons.includes('robustness_evidence_missing') &&
         !reasons.includes('audit_coverage_unhealthy');
-
-      const regimeAllowed =
-        signal.regime !== 'illiquid_noisy_book' &&
-        signal.regime !== 'near_resolution_microstructure_chaos';
+      const executionContextHealthy =
+        liquidityHealthyBase &&
+        freshnessHealthy &&
+        riskHealthy &&
+        operationalTruth.venueHealthy &&
+        operationalTruth.reconciliationHealthy &&
+        !venueMode.blockNewEntries &&
+        venueAssessment.label !== 'unsafe';
       const evaluationMicrostructure = this.buildEvaluationMicrostructure({
         signal,
         orderbook,
@@ -910,37 +1019,300 @@ export class EvaluateTradeOpportunitiesJob {
         timeToExpirySeconds: evaluationMicrostructure.timeToExpirySeconds,
         microstructure: evaluationMicrostructure.microstructure,
       });
+      const netEdgeDecision = this.netEdgeEstimator.estimate({
+        grossForecastEdge: Math.abs(signal.edge ?? 0),
+        expectedEv: signal.expectedEv,
+        feeRate: DEFAULT_FEE_RATE,
+        spread: orderbook?.spread ?? null,
+        signalAgeMs,
+        halfLifeMultiplier: halfLife.decayMultiplier,
+        topLevelDepth,
+        estimatedOrderSizeUnits: estimatedSizeUnits,
+        executionStyle: 'hybrid',
+        calibrationHealth: calibration?.health ?? null,
+        calibrationShrinkageFactor: calibration?.shrinkageFactor ?? null,
+        calibrationSampleCount: calibration?.sampleCount ?? null,
+        regimeHealth,
+        venueUncertaintyLabel: venueAssessment.label,
+        venueMode: venueMode.mode,
+      });
+      const netEdgeThreshold = this.netEdgeThresholdPolicy.evaluate({
+        baseMinimumNetEdge:
+          this.edgeDefinitionService.getDefinition().admissionThresholdPolicy.minimumNetEdge *
+          shrinkage.thresholdMultiplier,
+        netEdge: netEdgeDecision.breakdown,
+        regimeHealth,
+        venueUncertaintyLabel: venueAssessment.label,
+      });
+      const executionCostCalibration = this.executionCostCalibrator.calibrate({
+        activePolicyVersion: activeExecutionPolicy,
+        executionContext,
+        recentObservations: this.selectRecentExecutionCostObservations(
+          recentExecutionDiagnostics,
+          signal.strategyVersionId,
+          signal.regime ?? null,
+        ),
+        cancelFailureRate: this.calculateCancelFailureRate(recentAuditEvents),
+        venueUncertaintyLabel: venueAssessment.label,
+      });
+      const entryTiming = this.entryTimingEfficiencyScorer.score({
+        signalAgeMs,
+        timeToExpirySeconds: evaluationMicrostructure.timeToExpirySeconds,
+        halfLifeMultiplier: halfLife.decayMultiplier,
+        halfLifeExpired: halfLife.expired,
+        expectedFillDelayMs: executionCostCalibration.expectedFillDelayMs,
+        microstructureDecayPressure: evaluationMicrostructure.microstructure.decayPressure,
+      });
+      const executionCostAssessment = this.realizedCostModel.evaluate({
+        grossEdge: netEdgeDecision.breakdown.finalNetEdge,
+        feeCost: executionCostCalibration.feeCost,
+        slippageCost: executionCostCalibration.slippageCost,
+        adverseSelectionCost: executionCostCalibration.adverseSelectionCost,
+        fillDelayMs: signalAgeMs + (executionCostCalibration.expectedFillDelayMs ?? 0),
+        expectedFillDelayMs: executionCostCalibration.expectedFillDelayMs,
+        cancelReplaceOverheadCost: executionCostCalibration.cancelReplaceOverheadCost,
+        missedOpportunityCost: executionCostCalibration.missedOpportunityCost,
+      });
+      const additionalExecutionCost = this.additionalExecutionCost(
+        netEdgeDecision.breakdown,
+        executionCostAssessment,
+      );
       const noTradeZone = this.noTradeZonePolicy.evaluate({
         timeToExpirySeconds: evaluationMicrostructure.timeToExpirySeconds,
         noTradeWindowSeconds: config.noTradeWindowSeconds,
         btcFresh: true,
         orderbookFresh: !reasons.includes('orderbook_stale'),
         spread: orderbook?.spread ?? Number.POSITIVE_INFINITY,
-        topLevelDepth: orderbook ? this.topLevelDepth(orderbook, venueSide ?? 'BUY') : 0,
+        topLevelDepth,
         microstructure: evaluationMicrostructure.microstructure,
         governanceHealthy: researchGovernanceHealthy,
         edgeHalfLifeHealthy: !halfLife.expired,
+        netEdge: netEdgeDecision.breakdown,
+        thresholdDecision: netEdgeThreshold,
+        calibrationHealth: calibration?.health ?? null,
+        regimeHealth,
+        executionContextHealthy,
+        venueUncertaintyLabel: venueAssessment.label,
       });
-      const executableEdge = this.buildExecutableEdgeEstimate({
-        rawEdge: Math.abs(signal.edge ?? 0),
-        expectedEv: signal.expectedEv,
+      const calibratedExecutableEdge = this.buildExecutableEdgeEstimate(
+        netEdgeDecision,
+        netEdgeThreshold,
+        additionalExecutionCost,
+      );
+      const sizingSignalConfidence = Math.min(
+        this.boundProbability(Math.abs(signal.posteriorProbability - 0.5) * 2),
+        netEdgeDecision.breakdown.confidence,
+      );
+      const opportunityClass = this.classifyOpportunityClass(
+        calibratedExecutableEdge.finalNetEdge ?? 0,
+        netEdgeThreshold.minimumNetEdge,
+      );
+      const recentVariantTradeQuality = this.filterRecentTradeQualityScores(
+        recentTradeQualityScores,
+        strategyVariantId,
+        signal.regime ?? null,
+      );
+      const regimeLeakGroup = this.findRegimeLeakGroup(latestCapitalLeakReport, signal.regime ?? null);
+      const currentDrawdownPct = this.readNumberRecordField(
+        portfolioAllocationDecision?.evidence,
+        'currentDrawdown',
+      );
+      const maxDrawdownPct = this.readNumberRecordField(
+        portfolioAllocationDecision?.evidence,
+        'maxDrawdown',
+      );
+      const regimeProfitability = this.regimeProfitabilityRanker.rank({
+        strategyVariantId,
+        regime: signal.regime ?? null,
+        regimeSnapshot: this.resolveRegimeSnapshot(
+          learningState,
+          strategyVariantId,
+          signal.regime ?? null,
+        ),
+        calibrationHealth: calibration?.health ?? null,
+        executionContext,
+        recentTradeQualityScores: recentVariantTradeQuality,
+        currentDrawdownPct,
+        maxDrawdownPct,
+        recentLeakShare: regimeLeakGroup?.dominantShare ?? latestCapitalLeakReport?.dominantShare ?? null,
+      });
+      const regimeCapitalTreatment = this.regimeCapitalPolicy.decide({
+        assessment: regimeProfitability,
+        portfolioAllocationMultiplier: portfolioAllocationDecision?.targetMultiplier ?? 1,
+      });
+      const regimeDisableDecision = this.regimeDisablePolicy.evaluate({
+        assessment: regimeProfitability,
+        recentTradeQualityScores: recentVariantTradeQuality,
+        recentLeakShare: regimeLeakGroup?.dominantShare ?? latestCapitalLeakReport?.dominantShare ?? null,
+        recentLeakDominantCategory:
+          regimeLeakGroup?.dominantCategory ?? latestCapitalLeakReport?.dominantCategory ?? null,
+      });
+      const recentTradeQualityScore =
+        recentVariantTradeQuality.length > 0
+          ? recentVariantTradeQuality.reduce(
+              (sum, score) => sum + score.breakdown.overallScore,
+              0,
+            ) / recentVariantTradeQuality.length
+          : null;
+      const tradeFrequencyDecision = this.tradeFrequencyGovernor.evaluate({
+        regime: signal.regime ?? null,
+        regimeRank: regimeProfitability.rank,
+        opportunityClass,
+        recentTradeCount: recentVariantTradeQuality.length,
+        recentTradeQualityScore,
+        recentCapitalLeakageShare:
+          regimeLeakGroup?.dominantShare ?? latestCapitalLeakReport?.dominantShare ?? null,
+        currentDrawdownPct: Math.max(0, currentDrawdownPct ?? dailyLossRatio),
+      });
+      const recentMarginalActivity = this.summarizeMarginalActivity(recentAdmissionEvents);
+      const lowQualityTradeShare =
+        recentVariantTradeQuality.length > 0
+          ? recentVariantTradeQuality.filter(
+              (score) => score.label === 'poor' || score.label === 'destructive',
+            ).length / recentVariantTradeQuality.length
+          : 0;
+      const marginalEdgeCooldown = this.marginalEdgeCooldownPolicy.evaluate({
+        opportunityClass,
+        marginAboveThreshold: netEdgeThreshold.marginAboveThreshold,
+        recentMarginalApprovalCount: recentMarginalActivity.marginalApprovalCount,
+        recentMarginalAttemptCount:
+          recentMarginalActivity.marginalApprovalCount +
+          recentMarginalActivity.weakRejectCount,
+        recentLowQualityTradeShare: lowQualityTradeShare,
+      });
+      const opportunitySaturation = this.opportunitySaturationDetector.evaluate({
+        recentApprovedCount: recentMarginalActivity.approvedCount,
+        recentStrongApprovalCount: recentMarginalActivity.strongApprovalCount,
+        recentMarginalApprovalCount: recentMarginalActivity.marginalApprovalCount,
+        recentWeakRejectCount: recentMarginalActivity.weakRejectCount,
+        recentAverageMarginAboveThreshold: recentMarginalActivity.averageMarginAboveThreshold,
+        recentTradeQualityScore,
+        recentCapitalLeakageShare:
+          regimeLeakGroup?.dominantShare ?? latestCapitalLeakReport?.dominantShare ?? null,
+      });
+      const regimeAllowed =
+        signal.regime !== 'illiquid_noisy_book' &&
+        signal.regime !== 'near_resolution_microstructure_chaos' &&
+        !regimeDisableDecision.blockNewTrades &&
+        !regimeCapitalTreatment.blockNewTrades;
+      const waveThreePositionSize = Math.max(
+        0,
+        provisionalPositionSize *
+          (isNewExposure
+            ? regimeCapitalTreatment.capitalMultiplier *
+              regimeDisableDecision.sizeMultiplier *
+              tradeFrequencyDecision.sizeMultiplier *
+              marginalEdgeCooldown.sizeMultiplier *
+              opportunitySaturation.sizeMultiplier
+            : 1),
+      );
+      const sampleCount =
+        calibration?.sampleCount ??
+        executionContext?.sampleCount ??
+        this.resolveRegimeSnapshot(learningState, strategyVariantId, signal.regime ?? null)
+          ?.sampleCount ??
+        null;
+      const sizePenalty = this.sizePenaltyEngine.evaluate({
+        calibrationHealth: calibration?.health ?? null,
+        executionHealth: executionContext?.health ?? activeExecutionPolicy?.health ?? null,
+        regimeHealth,
+        venueUncertaintyLabel: venueAssessment.label,
+        concentrationPenaltyMultiplier: this.readNumberRecordField(
+          portfolioAllocationDecision?.evidence,
+          'concentrationPenaltyMultiplier',
+        ),
+        correlationPenaltyMultiplier: this.readNumberRecordField(
+          portfolioAllocationDecision?.evidence,
+          'correlationPenaltyMultiplier',
+        ),
+      });
+      const uncertaintySizing = this.uncertaintyWeightedSizing.evaluate({
+        basePositionSize: waveThreePositionSize,
+        netEdge: calibratedExecutableEdge.finalNetEdge ?? 0,
+        netEdgeThreshold: netEdgeThreshold.minimumNetEdge,
+        calibrationHealth: calibration?.health ?? null,
+        executionHealth: executionContext?.health ?? activeExecutionPolicy?.health ?? null,
+        regimeHealth,
+        venueHealth: venueAssessment.label,
+        currentDrawdownPct: Math.max(0, currentDrawdownPct ?? dailyLossRatio),
+        sampleCount,
+      });
+      const timingAdjustedPositionSize = Math.max(
+        0,
+        uncertaintySizing.adjustedPositionSize *
+          sizePenalty.multiplier *
+          entryTiming.sizeMultiplier,
+      );
+      const liquidityDecision = this.sizeVsLiquidityPolicy.evaluate({
+        desiredNotional: timingAdjustedPositionSize,
+        desiredSizeUnits:
+          referencePrice != null && referencePrice > 0
+            ? timingAdjustedPositionSize / referencePrice
+            : 0,
+        price: referencePrice ?? 0,
+        topLevelDepth,
         spread: orderbook?.spread ?? null,
-        signalAgeMs,
-        halfLifeMultiplier: halfLife.decayMultiplier,
-        freshnessHealthy,
-        availableCapital: remainingCapital,
+        expectedSlippage: Math.max(
+          netEdgeDecision.breakdown.costEstimate.slippageCost,
+          executionCostCalibration.slippageCost,
+        ),
+        route: activeExecutionPolicy?.recommendedRoute ?? 'taker',
       });
-      const calibratedExecutableEdge: ExecutableEdgeEstimate = {
-        ...executableEdge,
-        threshold: executableEdge.threshold * shrinkage.thresholdMultiplier,
-      };
+      const cappedByLiquidityPositionSize = Math.max(
+        0,
+        Math.min(timingAdjustedPositionSize, liquidityDecision.allowedNotional),
+      );
+      const maxLossDecision = this.maxLossPerOpportunityPolicy.evaluate({
+        candidatePositionSize: cappedByLiquidityPositionSize,
+        bankroll,
+        availableCapital: remainingCapital,
+        maxPerTradeRiskPct: config.maxPerTradeRiskPct,
+        opportunityClass,
+        signalConfidence: sizingSignalConfidence,
+      });
+      const positionSize = Math.max(
+        0,
+        Math.min(cappedByLiquidityPositionSize, maxLossDecision.maxAllowedPositionSize),
+      );
+      const liquidityHealthy = liquidityHealthyBase && !liquidityDecision.blockTrade;
+
+      if (isNewExposure && regimeCapitalTreatment.blockNewTrades) {
+        reasons.push(`regime_capital_policy_${regimeCapitalTreatment.treatment}`);
+      }
+      if (isNewExposure && regimeDisableDecision.blockNewTrades) {
+        reasons.push(`regime_disable_policy_${regimeDisableDecision.status}`);
+      }
+      if (isNewExposure && tradeFrequencyDecision.blockTrade) {
+        reasons.push('trade_frequency_governor_blocked');
+      }
+      if (isNewExposure && marginalEdgeCooldown.blockTrade) {
+        reasons.push('marginal_edge_cooldown_active');
+      }
+      if (isNewExposure && opportunitySaturation.blockTrade) {
+        reasons.push('opportunity_saturation_detected');
+      }
+      if (entryTiming.blockTrade) {
+        reasons.push('entry_timing_blocks_opportunity');
+      }
+      if ((calibratedExecutableEdge.finalNetEdge ?? 0) <= 0) {
+        reasons.push('execution_cost_adjusted_edge_non_positive');
+      }
+      if (liquidityDecision.blockTrade) {
+        reasons.push('liquidity_policy_blocks_size');
+      }
+      if (maxLossDecision.blockTrade) {
+        reasons.push('max_loss_per_opportunity_blocked');
+      }
+      if (isNewExposure && positionSize <= 0) {
+        reasons.push('wave4_position_size_zero');
+      }
 
       const admission = this.tradeAdmissionGate.evaluate({
         edgeDefinitionVersion: this.edgeDefinitionService.getDefinition().version,
         signalPresent: reasons.length === 0 || !reasons.includes('market_missing'),
-        directionalEdge: Math.abs(halfLife.effectiveEdge ?? signal.edge ?? 0),
+        directionalEdge: netEdgeDecision.breakdown.grossForecastEdge,
         executableEv: calibratedExecutableEdge.finalNetEdge,
-        signalConfidence: this.boundProbability(Math.abs(signal.posteriorProbability - 0.5) * 2),
+        signalConfidence: sizingSignalConfidence,
         walkForwardConfidence:
           signal.expectedEv > 0 && Math.abs(signal.edge ?? 0) > 0
             ? this.boundProbability(signal.expectedEv / Math.abs(signal.edge ?? 0))
@@ -953,10 +1325,8 @@ export class EvaluateTradeOpportunitiesJob {
         regimeAllowed,
         noTradeZoneBlocked: noTradeZone.blocked,
         halfLifeExpired: halfLife.expired,
-        paperEdgeDetected:
-          (calibratedExecutableEdge.rawModelEdge ?? 0) > calibratedExecutableEdge.threshold &&
-          (calibratedExecutableEdge.finalNetEdge ?? 0) <= calibratedExecutableEdge.threshold,
-        admissionThreshold: calibratedExecutableEdge.threshold,
+        paperEdgeDetected: netEdgeDecision.breakdown.paperEdgeBlocked,
+        admissionThreshold: netEdgeThreshold.minimumNetEdge,
         executableEdge: calibratedExecutableEdge,
         minimumConfidence:
           this.edgeDefinitionService.getDefinition().admissionThresholdPolicy.minimumConfidence,
@@ -996,10 +1366,27 @@ export class EvaluateTradeOpportunitiesJob {
             deploymentTier,
             capitalRamp,
             executableEdge: calibratedExecutableEdge,
+            netEdgeDecision,
+            netEdgeThreshold,
+            executionCostCalibration,
+            executionCostAssessment,
+            entryTiming,
+            opportunityClass,
             noTradeZone,
             halfLife,
             auditCoverage,
             calibration,
+            regimeHealth,
+            regimeProfitability,
+            regimeCapitalTreatment,
+            regimeDisableDecision,
+            tradeFrequencyDecision,
+            marginalEdgeCooldown,
+            opportunitySaturation,
+            uncertaintySizing,
+            sizePenalty,
+            liquidityDecision,
+            maxLossDecision,
             shrinkage,
             portfolioAllocationDecision,
             rolloutControls,
@@ -1017,16 +1404,11 @@ export class EvaluateTradeOpportunitiesJob {
           signalDecisionId: decisionId,
           marketId: signal.marketId,
           strategyVariantId:
-            signal.strategyVersionId != null
-              ? buildStrategyVariantId(signal.strategyVersionId)
-              : null,
+            strategyVariantId,
           lineage: {
             strategyVersion: buildStrategyVersionLineage({
               strategyVersionId: signal.strategyVersionId,
-              strategyVariantId:
-                signal.strategyVersionId != null
-                  ? buildStrategyVariantId(signal.strategyVersionId)
-                  : null,
+              strategyVariantId,
             }),
             featureSetVersion: buildFeatureSetVersionLineage({
               featureSetId: 'btc-five-minute-live-signal',
@@ -1045,6 +1427,20 @@ export class EvaluateTradeOpportunitiesJob {
                 runtimeConfig: config,
                 deploymentTier,
                 capitalRamp,
+                netEdgeThreshold,
+                executionCostCalibration,
+                executionCostAssessment,
+                entryTiming,
+                regimeProfitability,
+                regimeCapitalTreatment,
+                regimeDisableDecision,
+                tradeFrequencyDecision,
+                marginalEdgeCooldown,
+                opportunitySaturation,
+                uncertaintySizing,
+                sizePenalty,
+                liquidityDecision,
+                maxLossDecision,
                 rolloutControls,
                 safetyState: nextSafetyState,
                 venueMode,
@@ -1072,7 +1468,10 @@ export class EvaluateTradeOpportunitiesJob {
             },
             learningState: {
               calibration,
+              executionContext,
+              activeExecutionPolicy,
               portfolioAllocationDecision,
+              regimeProfitability,
               lastCycleSummary: learningState.lastCycleSummary,
             },
             lineageState: {
@@ -1083,16 +1482,33 @@ export class EvaluateTradeOpportunitiesJob {
               deploymentTier,
               capitalRamp,
               executableEdge: calibratedExecutableEdge,
+              netEdgeDecision,
+              netEdgeThreshold,
+              executionCostCalibration,
+              executionCostAssessment,
+              entryTiming,
+              opportunityClass,
               noTradeZone,
               halfLife,
               shrinkage,
+              regimeHealth,
+              regimeProfitability,
+              regimeCapitalTreatment,
+              regimeDisableDecision,
+              tradeFrequencyDecision,
+              marginalEdgeCooldown,
+              opportunitySaturation,
+              uncertaintySizing,
+              sizePenalty,
+              liquidityDecision,
+              maxLossDecision,
               rolloutControls,
               venueAssessment,
             },
             venueMode: venueMode.mode,
             venueUncertainty: venueAssessment.label,
           },
-          tags: ['wave5', 'signal-execution', 'rejected'],
+          tags: ['wave5', 'phase12_wave1', 'phase12_wave3', 'signal-execution', 'rejected'],
         });
         rejected += 1;
         continue;
@@ -1133,10 +1549,27 @@ export class EvaluateTradeOpportunitiesJob {
           deploymentTier,
           capitalRamp,
           executableEdge: calibratedExecutableEdge,
+          netEdgeDecision,
+          netEdgeThreshold,
+          executionCostCalibration,
+          executionCostAssessment,
+          entryTiming,
+          opportunityClass,
           noTradeZone,
           halfLife,
           positionSize,
           calibration,
+          regimeHealth,
+          regimeProfitability,
+          regimeCapitalTreatment,
+          regimeDisableDecision,
+          tradeFrequencyDecision,
+          marginalEdgeCooldown,
+          opportunitySaturation,
+          uncertaintySizing,
+          sizePenalty,
+          liquidityDecision,
+          maxLossDecision,
           shrinkage,
           portfolioAllocationDecision,
           rolloutControls,
@@ -1154,16 +1587,11 @@ export class EvaluateTradeOpportunitiesJob {
         signalDecisionId: decisionId,
         marketId: signal.marketId,
         strategyVariantId:
-          signal.strategyVersionId != null
-            ? buildStrategyVariantId(signal.strategyVersionId)
-            : null,
+          strategyVariantId,
         lineage: {
           strategyVersion: buildStrategyVersionLineage({
             strategyVersionId: signal.strategyVersionId,
-            strategyVariantId:
-              signal.strategyVersionId != null
-                ? buildStrategyVariantId(signal.strategyVersionId)
-                : null,
+            strategyVariantId,
           }),
           featureSetVersion: buildFeatureSetVersionLineage({
             featureSetId: 'btc-five-minute-live-signal',
@@ -1178,15 +1606,29 @@ export class EvaluateTradeOpportunitiesJob {
           executionPolicyVersion: null,
           riskPolicyVersion: buildRiskPolicyVersionLineage({
             policyId: 'trade-evaluation',
-            parameters: {
-              runtimeConfig: config,
-              deploymentTier,
-              capitalRamp,
-              rolloutControls,
-              safetyState: nextSafetyState,
-              venueMode,
-            },
-          }),
+              parameters: {
+                runtimeConfig: config,
+                deploymentTier,
+                capitalRamp,
+                netEdgeThreshold,
+                executionCostCalibration,
+                executionCostAssessment,
+                entryTiming,
+                regimeProfitability,
+                regimeCapitalTreatment,
+                regimeDisableDecision,
+                tradeFrequencyDecision,
+                marginalEdgeCooldown,
+                opportunitySaturation,
+                uncertaintySizing,
+                sizePenalty,
+                liquidityDecision,
+                maxLossDecision,
+                rolloutControls,
+                safetyState: nextSafetyState,
+                venueMode,
+              },
+            }),
           allocationPolicyVersion: portfolioAllocationDecision
             ? buildAllocationPolicyVersionLineage({
                 policyId: 'capital-allocation-engine',
@@ -1209,7 +1651,10 @@ export class EvaluateTradeOpportunitiesJob {
           },
           learningState: {
             calibration,
+            executionContext,
+            activeExecutionPolicy,
             portfolioAllocationDecision,
+            regimeProfitability,
             lastCycleSummary: learningState.lastCycleSummary,
           },
           lineageState: {
@@ -1220,9 +1665,26 @@ export class EvaluateTradeOpportunitiesJob {
             deploymentTier,
             capitalRamp,
             executableEdge: calibratedExecutableEdge,
+            netEdgeDecision,
+            netEdgeThreshold,
+            executionCostCalibration,
+            executionCostAssessment,
+            entryTiming,
+            opportunityClass,
             noTradeZone,
             halfLife,
             positionSize,
+            regimeHealth,
+            regimeProfitability,
+            regimeCapitalTreatment,
+            regimeDisableDecision,
+            tradeFrequencyDecision,
+            marginalEdgeCooldown,
+            opportunitySaturation,
+            uncertaintySizing,
+            sizePenalty,
+            liquidityDecision,
+            maxLossDecision,
             shrinkage,
             rolloutControls,
             venueAssessment,
@@ -1230,7 +1692,7 @@ export class EvaluateTradeOpportunitiesJob {
           venueMode: venueMode.mode,
           venueUncertainty: venueAssessment.label,
         },
-        tags: ['wave5', 'signal-execution', 'approved'],
+        tags: ['wave5', 'phase12_wave1', 'phase12_wave3', 'signal-execution', 'approved'],
       });
 
       if (isNewExposure) {
@@ -1449,41 +1911,31 @@ export class EvaluateTradeOpportunitiesJob {
     };
   }
 
-  private buildExecutableEdgeEstimate(input: {
-    rawEdge: number;
-    expectedEv: number;
-    spread: number | null;
-    signalAgeMs: number;
-    halfLifeMultiplier: number;
-    freshnessHealthy: boolean;
-    availableCapital: number;
-  }): ExecutableEdgeEstimate {
-    const threshold = this.edgeDefinitionService.getDefinition().admissionThresholdPolicy.minimumNetEdge;
-    const spreadAdjustedEdge = input.rawEdge - Math.max(0, input.spread ?? 0);
-    const slippageAdjustedEdge = spreadAdjustedEdge - Math.max(0, (input.spread ?? 0) * 0.5);
-    const feeAdjustedEdge = slippageAdjustedEdge - DEFAULT_FEE_RATE;
-    const timeoutAdjustedEdge = feeAdjustedEdge - Math.min(0.01, input.signalAgeMs / 100_000);
-    const staleSignalAdjustedEdge = timeoutAdjustedEdge * input.halfLifeMultiplier;
-    const inventoryAdjustedEdge =
-      staleSignalAdjustedEdge -
-      (input.availableCapital <= 0 ? threshold : 0);
-
+  private buildExecutableEdgeEstimate(
+    netEdgeDecision: NetEdgeDecision,
+    thresholdDecision: NetEdgeThresholdDecision,
+    additionalExecutionCost = 0,
+  ): ExecutableEdgeEstimate {
+    const spreadAdjustedEdge =
+      netEdgeDecision.breakdown.grossForecastEdge -
+      netEdgeDecision.breakdown.costEstimate.spreadComponent;
+    const finalNetEdge = netEdgeDecision.breakdown.finalNetEdge - Math.max(0, additionalExecutionCost);
     return {
       edgeDefinitionVersion: this.edgeDefinitionService.getDefinition().version,
-      executionStyle: 'hybrid',
-      rawModelEdge: input.rawEdge,
+      executionStyle: netEdgeDecision.breakdown.executionStyle,
+      rawModelEdge: netEdgeDecision.breakdown.grossForecastEdge,
       spreadAdjustedEdge,
-      slippageAdjustedEdge,
-      feeAdjustedEdge,
-      timeoutAdjustedEdge,
-      staleSignalAdjustedEdge,
-      inventoryAdjustedEdge,
-      finalNetEdge: inventoryAdjustedEdge,
-      threshold,
-      missingInputs: Number.isFinite(input.expectedEv) ? [] : ['expected_ev'],
-      staleInputs: input.freshnessHealthy ? [] : ['stale_market_inputs'],
-      paperEdgeBlocked: input.rawEdge > threshold && inventoryAdjustedEdge <= threshold,
-      confidence: input.expectedEv > threshold ? 0.7 : 0.3,
+      slippageAdjustedEdge: netEdgeDecision.breakdown.afterSlippageEdge,
+      feeAdjustedEdge: netEdgeDecision.breakdown.afterFeesEdge,
+      timeoutAdjustedEdge: netEdgeDecision.breakdown.afterAdverseSelectionEdge,
+      staleSignalAdjustedEdge: netEdgeDecision.breakdown.afterUncertaintyEdge,
+      inventoryAdjustedEdge: finalNetEdge,
+      finalNetEdge,
+      threshold: thresholdDecision.minimumNetEdge,
+      missingInputs: netEdgeDecision.breakdown.missingInputs,
+      staleInputs: netEdgeDecision.breakdown.staleInputs,
+      paperEdgeBlocked: netEdgeDecision.breakdown.paperEdgeBlocked,
+      confidence: netEdgeDecision.breakdown.confidence,
     };
   }
 
@@ -1505,6 +1957,302 @@ export class EvaluateTradeOpportunitiesJob {
     strategyVariantId: string,
   ) {
     return learningState.portfolioLearning.allocationDecisions[strategyVariantId] ?? null;
+  }
+
+  private resolveExecutionPolicyVersion(
+    learningState: Awaited<ReturnType<LearningStateStore['load']>>,
+    strategyVariantId: string,
+    regime: string | null,
+  ) {
+    const context = this.resolveExecutionLearningContext(learningState, strategyVariantId, regime);
+    const versionId =
+      context?.activePolicyVersionId ??
+      Object.entries(learningState.executionLearning.activePolicyVersionIds).find(([key]) =>
+        key.includes(strategyVariantId) && key.includes(`regime:${regime ?? 'all'}`),
+      )?.[1] ??
+      null;
+    return versionId ? learningState.executionLearning.policyVersions[versionId] ?? null : null;
+  }
+
+  private resolveRegimeHealthForSignal(
+    learningState: Awaited<ReturnType<LearningStateStore['load']>>,
+    strategyVariantId: string,
+    regime: string | null,
+  ): HealthLabel | null {
+    const variant = learningState.strategyVariants[strategyVariantId] ?? null;
+    if (!variant) {
+      return null;
+    }
+
+    const snapshots = Object.values(variant.regimeSnapshots).filter(
+      (snapshot) => snapshot.regime === regime,
+    );
+    if (snapshots.length === 0) {
+      return variant.health ?? null;
+    }
+
+    const priority: Record<HealthLabel, number> = {
+      healthy: 0,
+      watch: 1,
+      degraded: 2,
+      quarantine_candidate: 3,
+    };
+    return snapshots.reduce<HealthLabel>(
+      (worst, snapshot) =>
+        priority[snapshot.health] > priority[worst] ? snapshot.health : worst,
+      variant.health ?? 'healthy',
+    );
+  }
+
+  private resolveRegimeSnapshot(
+    learningState: Awaited<ReturnType<LearningStateStore['load']>>,
+    strategyVariantId: string | null,
+    regime: string | null,
+  ) {
+    if (!strategyVariantId) {
+      return null;
+    }
+
+    const variant = learningState.strategyVariants[strategyVariantId] ?? null;
+    if (!variant) {
+      return null;
+    }
+
+    const matching = Object.values(variant.regimeSnapshots)
+      .filter((snapshot) => snapshot.regime === regime)
+      .sort((left, right) => right.sampleCount - left.sampleCount);
+    return matching[0] ?? null;
+  }
+
+  private resolveExecutionLearningContext(
+    learningState: Awaited<ReturnType<LearningStateStore['load']>>,
+    strategyVariantId: string | null,
+    regime: string | null,
+  ) {
+    if (!strategyVariantId) {
+      return null;
+    }
+
+    const variant = learningState.strategyVariants[strategyVariantId] ?? null;
+    if (!variant) {
+      return null;
+    }
+
+    const matching = Object.values(variant.executionLearning.contexts)
+      .filter((context) => context.regime === regime)
+      .sort((left, right) => right.sampleCount - left.sampleCount);
+    return matching[0] ?? null;
+  }
+
+  private classifyOpportunityClass(
+    finalNetEdge: number,
+    minimumNetEdge: number,
+  ): OpportunityClass {
+    const margin = finalNetEdge - minimumNetEdge;
+    if (margin >= Math.max(0.004, minimumNetEdge)) {
+      return 'strong_edge';
+    }
+    if (margin >= 0.0015) {
+      return 'tradable_edge';
+    }
+    if (margin >= 0) {
+      return 'marginal_edge';
+    }
+    return 'weak_edge';
+  }
+
+  private filterRecentTradeQualityScores(
+    scores: TradeQualityScore[],
+    strategyVariantId: string | null,
+    regime: string | null,
+  ): TradeQualityScore[] {
+    return scores.filter(
+      (score) =>
+        (strategyVariantId == null || score.strategyVariantId === strategyVariantId) &&
+        (regime == null || score.regime === regime),
+    );
+  }
+
+  private selectRecentExecutionCostObservations(
+    diagnostics: unknown[],
+    strategyVersionId: string | null,
+    regime: string | null,
+  ) {
+    return (diagnostics ?? [])
+      .filter(
+        (diagnostic) =>
+          (strategyVersionId == null ||
+            this.readStringField(diagnostic, 'strategyVersionId') === strategyVersionId) &&
+          (regime == null || this.readStringField(diagnostic, 'regime') === regime),
+      )
+      .slice(0, 20)
+      .map((diagnostic) => ({
+        expectedFee: this.readNumberField(diagnostic, 'expectedFee'),
+        realizedFee: this.readNumberField(diagnostic, 'realizedFee'),
+        expectedSlippage: this.readNumberField(diagnostic, 'expectedSlippage'),
+        realizedSlippage: this.readNumberField(diagnostic, 'realizedSlippage'),
+        edgeAtSignal: this.readNumberField(diagnostic, 'edgeAtSignal'),
+        edgeAtFill: this.readNumberField(diagnostic, 'edgeAtFill'),
+        fillRate: this.readNumberField(diagnostic, 'fillRate'),
+        staleOrder: this.readBooleanField(diagnostic, 'staleOrder') ?? false,
+        capturedAt:
+          this.readDateRecordField(diagnostic, 'capturedAt')?.toISOString() ??
+          new Date(0).toISOString(),
+      }));
+  }
+
+  private calculateCancelFailureRate(auditEvents: unknown[]): number {
+    const requested = this.countAuditEvents(auditEvents, 'order.cancel_requested');
+    const failed = this.countAuditEvents(auditEvents, 'order.cancel_failed');
+    if (requested <= 0) {
+      return 0;
+    }
+    return Math.min(1, failed / requested);
+  }
+
+  private additionalExecutionCost(
+    netEdgeBreakdown: NetEdgeDecision['breakdown'],
+    executionCostAssessment: ReturnType<RealizedCostModel['evaluate']>,
+  ): number {
+    return Math.max(
+      0,
+      Math.max(0, executionCostAssessment.breakdown.feeCost - netEdgeBreakdown.costEstimate.feeCost) +
+        Math.max(
+          0,
+          executionCostAssessment.breakdown.slippageCost -
+            netEdgeBreakdown.costEstimate.slippageCost,
+        ) +
+        Math.max(
+          0,
+          executionCostAssessment.breakdown.adverseSelectionCost -
+            netEdgeBreakdown.costEstimate.adverseSelectionCost,
+        ) +
+        executionCostAssessment.breakdown.fillDecayCost +
+        executionCostAssessment.breakdown.cancelReplaceOverheadCost +
+        executionCostAssessment.breakdown.missedOpportunityCost,
+    );
+  }
+
+  private readLatestCapitalLeakReport(auditEvents: unknown[]): CapitalLeakReport | null {
+    const candidate = [...(auditEvents ?? [])]
+      .filter((event) => this.readStringField(event, 'eventType') === 'capital.leak_review')
+      .sort((left, right) => {
+        const leftTime =
+          this.readDateRecordField(left, 'createdAt')?.getTime() ?? Number.NEGATIVE_INFINITY;
+        const rightTime =
+          this.readDateRecordField(right, 'createdAt')?.getTime() ?? Number.NEGATIVE_INFINITY;
+        return rightTime - leftTime;
+      })[0];
+
+    const metadata = this.readMetadata(candidate);
+    if (!metadata || typeof metadata.report !== 'object' || metadata.report == null) {
+      return null;
+    }
+
+    return metadata.report as CapitalLeakReport;
+  }
+
+  private findRegimeLeakGroup(
+    report: CapitalLeakReport | null,
+    regime: string | null,
+  ): CapitalLeakReport['byRegime'][number] | null {
+    if (!report || !Array.isArray(report.byRegime)) {
+      return null;
+    }
+
+    return (
+      report.byRegime.find((group) => group.groupKey === (regime ?? 'unknown_regime')) ?? null
+    );
+  }
+
+  private readRecentAdmissionEvents(
+    auditEvents: unknown[],
+    signalDecisions: unknown[],
+  ): RecentAdmissionEvent[] {
+    const verdictBySignalId = new Map<string, 'approved' | 'rejected' | 'unknown'>();
+    for (const decision of signalDecisions ?? []) {
+      const signalId = this.readStringField(decision, 'signalId');
+      const verdict = this.readStringField(decision, 'verdict');
+      if (!signalId) {
+        continue;
+      }
+      verdictBySignalId.set(
+        signalId,
+        verdict === 'approved' || verdict === 'rejected' ? verdict : 'unknown',
+      );
+    }
+
+    return (auditEvents ?? [])
+      .filter((event) => this.readStringField(event, 'eventType') === 'signal.execution_decision')
+      .map((event) => {
+        const metadata = this.readMetadata(event);
+        const signalId = this.readStringField(event, 'signalId');
+        const threshold = this.readNestedNumber(
+          metadata,
+          'netEdgeThreshold',
+          'minimumNetEdge',
+        );
+        const finalNetEdge = this.readNestedNumber(
+          metadata,
+          'netEdgeDecision',
+          'breakdown',
+          'finalNetEdge',
+        );
+        const opportunityClass = this.readNestedString(
+          metadata,
+          'opportunityClass',
+        );
+        return {
+          createdAt:
+            this.readDateRecordField(event, 'createdAt')?.toISOString() ??
+            new Date(0).toISOString(),
+          verdict:
+            signalId != null
+              ? (verdictBySignalId.get(signalId) ?? this.inferAuditVerdict(event, metadata))
+              : this.inferAuditVerdict(event, metadata),
+          marginAboveThreshold:
+            finalNetEdge != null && threshold != null ? finalNetEdge - threshold : null,
+          opportunityClass:
+            opportunityClass === 'strong_edge' ||
+            opportunityClass === 'tradable_edge' ||
+            opportunityClass === 'marginal_edge' ||
+            opportunityClass === 'weak_edge'
+              ? opportunityClass
+              : this.classifyOpportunityClass(finalNetEdge ?? 0, threshold ?? 0),
+          reasons: this.readReasonArray(metadata),
+        };
+      })
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  private summarizeMarginalActivity(events: RecentAdmissionEvent[]) {
+    const approved = events.filter((event) => event.verdict === 'approved');
+    const strongApprovalCount = approved.filter(
+      (event) => event.opportunityClass === 'strong_edge',
+    ).length;
+    const marginalApprovalCount = approved.filter(
+      (event) =>
+        event.opportunityClass === 'marginal_edge' ||
+        event.opportunityClass === 'tradable_edge',
+    ).length;
+    const weakRejectCount = events.filter(
+      (event) =>
+        event.verdict === 'rejected' &&
+        (event.reasons.includes('weak_net_edge') ||
+          event.reasons.includes('low_margin_opportunity') ||
+          event.reasons.includes('trade_frequency_governor_blocked')),
+    ).length;
+    const averageMarginAboveThreshold = this.average(
+      approved.map((event) => event.marginAboveThreshold).filter(this.isNumber),
+    );
+
+    return {
+      approvedCount: approved.length,
+      strongApprovalCount,
+      marginalApprovalCount,
+      weakRejectCount,
+      averageMarginAboveThreshold,
+    };
   }
 
   private readDivergenceStatus(
@@ -1683,6 +2431,103 @@ export class EvaluateTradeOpportunitiesJob {
 
     const value = (source as Record<string, unknown>)[key];
     return typeof value === 'boolean' ? value : null;
+  }
+
+  private readMetadata(source: unknown): Record<string, unknown> | null {
+    if (!source || typeof source !== 'object') {
+      return null;
+    }
+
+    const value = (source as Record<string, unknown>).metadata;
+    return value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+  }
+
+  private readNestedNumber(
+    source: Record<string, unknown> | null,
+    ...path: string[]
+  ): number | null {
+    let current: unknown = source;
+    for (const segment of path) {
+      if (!current || typeof current !== 'object') {
+        return null;
+      }
+      current = (current as Record<string, unknown>)[segment];
+    }
+    return typeof current === 'number' && Number.isFinite(current) ? current : null;
+  }
+
+  private readNestedString(
+    source: Record<string, unknown> | null,
+    ...path: string[]
+  ): string | null {
+    let current: unknown = source;
+    for (const segment of path) {
+      if (!current || typeof current !== 'object') {
+        return null;
+      }
+      current = (current as Record<string, unknown>)[segment];
+    }
+    return typeof current === 'string' && current.length > 0 ? current : null;
+  }
+
+  private readReasonArray(source: Record<string, unknown> | null): string[] {
+    const reasons = source?.reasons;
+    if (!Array.isArray(reasons)) {
+      return [];
+    }
+
+    return reasons.filter((value): value is string => typeof value === 'string');
+  }
+
+  private inferAuditVerdict(
+    event: unknown,
+    metadata: Record<string, unknown> | null,
+  ): 'approved' | 'rejected' | 'unknown' {
+    const summary = this.readStringField(event, 'message')?.toLowerCase() ?? '';
+    if (summary.includes('approved')) {
+      return 'approved';
+    }
+    if (summary.includes('rejected')) {
+      return 'rejected';
+    }
+    return this.readReasonArray(metadata).length > 0 ? 'rejected' : 'unknown';
+  }
+
+  private readDateRecordField(source: unknown, key: string): Date | null {
+    if (!source || typeof source !== 'object') {
+      return null;
+    }
+    const value = (source as Record<string, unknown>)[key];
+    if (value instanceof Date) {
+      return Number.isNaN(value.getTime()) ? null : value;
+    }
+    if (typeof value === 'string' || typeof value === 'number') {
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? null : date;
+    }
+    return null;
+  }
+
+  private readNumberRecordField(
+    source: Record<string, unknown> | null | undefined,
+    key: string,
+  ): number | null {
+    if (!source) {
+      return null;
+    }
+    const value = source[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+  }
+
+  private average(values: number[]): number | null {
+    if (values.length === 0) {
+      return null;
+    }
+    return values.reduce((sum, value) => sum + value, 0) / values.length;
+  }
+
+  private isNumber(value: number | null): value is number {
+    return typeof value === 'number' && Number.isFinite(value);
   }
 
   private topLevelDepth(

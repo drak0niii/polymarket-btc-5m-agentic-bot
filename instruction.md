@@ -1,663 +1,472 @@
 # instruction.md
 
-# Phase 11 Implementation Instructions for Codex
-## Governed Self-Improvement Layer
+# Phase 12 — Capital Growth and Trading Effectiveness
 
-Implement Phase 11 as a safety-first, evidence-driven, replayable adaptation layer for the Polymarket trading system.
+## Objective
 
-You must execute the work in strict sequence.
-Do not skip ahead.
-Do not widen scope.
-Do not drift into unrelated refactors.
+Implement Phase 12 to improve net capital growth, trading effectiveness, and capital efficiency.
 
----
+The system must become better at:
+- rejecting weak trades
+- estimating net tradable edge honestly
+- identifying capital leakage
+- ranking regimes economically
+- controlling overtrading
+- sizing by uncertainty and liquidity reality
+- promoting only economically stable variants
 
-# Primary objective
-
-Add the missing closed loop:
-
-**observe → attribute → evaluate → propose change → validate → approve/promote → deploy under guardrails → monitor → rollback if needed**
-
-The resulting system must be able to:
-- learn from realized live outcomes
-- reduce aggressiveness when evidence degrades
-- compare incumbents and challengers safely
-- promote only with explicit evidence
-- quarantine degraded slices precisely
-- adapt execution from realized venue behavior
-- reallocate capital only after validated improvement
-- preserve exact lineage and replayability for every learning-driven change
+Do not optimize for raw trade count.
+Do not optimize for gross PnL.
+Do not add complexity that does not clearly improve net expectancy or capital efficiency.
 
 ---
 
-# Mandatory constraints
-
-## Constraint 1 — no uncontrolled self-modification
-Do not add any mechanism that silently changes live trading behavior inside the signal, evaluation, or execution path.
-All learned changes must pass through:
-- stored learning state
-- learning-cycle orchestration
-- typed decision outputs
-- deployment registry
-- rollout / rollback controls
-- version lineage
-
-## Constraint 2 — no duplicate domain vocabularies
-When you create canonical files for domain types, import from them everywhere else.
-Do not redefine equivalent types in downstream modules.
-
-## Constraint 3 — no fake completion
-Do not report a step as complete if:
-- files were created but not wired
-- typecheck passes but runtime integration is missing
-- tests are mock-only and do not validate state transitions
-- outputs exist but are not persisted
-- decisions are made but not logged
-
-## Constraint 4 — safety beats aggressiveness
-When evidence is weak or conflicting, the system must prefer:
-- confidence shrinkage
-- smaller sizing
-- stricter thresholds
-- restricted rollout
-- precise quarantine
-- rollback
-
-## Constraint 5 — exact sequencing is mandatory
-You must complete Phase 11 in waves, in order.
-Do not begin Wave 2 until Wave 1 acceptance criteria are met.
-Do not begin Wave 3 until Wave 2 acceptance criteria are met.
-
----
-
-# WAVE 1 — Minimum viable self-improvement
+# WAVE 1 — Net-edge realism
 
 ## Goal
-Deliver a real daily learning cycle that persists state, attributes edge by regime/context, updates calibration from realized outcomes, emits learning events, and safely reduces aggressiveness when evidence degrades.
+Gate trades on realistic net edge, not raw forecast edge.
+This is the highest-priority wave.
 
-## Implement exactly these files first
-1. `packages/domain/src/learning-state.ts`
-2. `apps/worker/src/runtime/learning-state-store.ts`
-3. `apps/worker/src/runtime/learning-event-log.ts`
-4. `apps/worker/src/jobs/dailyReview.job.ts`
-5. `apps/worker/src/orchestration/learning-cycle-runner.ts`
-6. `packages/risk-engine/src/regime-edge-attribution.ts`
-7. `packages/risk-engine/src/edge-decay-detector.ts`
-8. `packages/signal-engine/src/live-calibration-store.ts`
-9. `packages/signal-engine/src/live-calibration-updater.ts`
-10. `packages/signal-engine/src/confidence-shrinkage-policy.ts`
+## Create
+- `packages/domain/src/net-edge.ts`
+- `packages/signal-engine/src/net-edge-estimator.ts`
+- `packages/signal-engine/src/net-edge-threshold-policy.ts`
+- `packages/signal-engine/src/no-trade-zone-policy.ts`
 
-## Requirements for Wave 1
+## Modify
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
 
-### 1. `packages/domain/src/learning-state.ts`
-Create the canonical types for all learning-related state.
-It must export at minimum:
-- `HealthLabel`
-- `LearningState`
-- `StrategyVariantState`
-- `RegimePerformanceSnapshot`
-- `CalibrationState`
-- `ExecutionLearningState`
-- `PromotionDecision`
-- `QuarantineDecision`
-- `CapitalAllocationDecision`
-- `LearningCycleSummary`
-- `LearningEvent`
+## Required behavior
 
-Do not create competing versions elsewhere.
+### `packages/domain/src/net-edge.ts`
+Define canonical types for:
+- `NetEdgeInput`
+- `CostEstimateBreakdown`
+- `UncertaintyPenalty`
+- `NetEdgeBreakdown`
+- `NetEdgeDecision`
 
-### 2. `apps/worker/src/runtime/learning-state-store.ts`
-Implement durable state persistence.
-Requirements:
-- load state
-- initialize defaults if missing
-- save atomically
-- keep backup snapshots
-- fail safely on corrupted writes
+### `packages/signal-engine/src/net-edge-estimator.ts`
+Implement a typed estimator that computes:
+- gross forecast edge
+- fee cost
+- slippage cost
+- adverse selection cost
+- uncertainty penalty
+- venue penalty if relevant
+- final net edge
 
-### 3. `apps/worker/src/runtime/learning-event-log.ts`
-Implement append-only learning event storage.
-Every material adaptive event must be durable and inspectable.
+It must produce an explicit breakdown and a final recommendation.
 
-### 4. `apps/worker/src/jobs/dailyReview.job.ts`
-Convert this into the primary learning-cycle orchestrator.
-It must:
-- load realized outcomes
-- load prior learning state
-- run attribution
-- run calibration update
-- evaluate degradation
-- generate learning summary
-- persist updated state
-- append learning events
+### `packages/signal-engine/src/net-edge-threshold-policy.ts`
+Implement threshold logic that:
+- enforces minimum net edge
+- raises threshold in degraded regimes
+- raises threshold under venue instability
+- rejects low-margin opportunities
 
-Do not let this job mutate live behavior directly.
-It may produce outputs that downstream runtime logic can consume.
+### `packages/signal-engine/src/no-trade-zone-policy.ts`
+Implement explicit no-trade conditions such as:
+- weak net edge
+- high uncertainty
+- poor calibration
+- poor regime health
+- poor execution context
+- venue instability
 
-### 5. `apps/worker/src/orchestration/learning-cycle-runner.ts`
-Create one deterministic coordinator for the learning cycle.
-Evaluation order must be explicit and stable.
-Partial failures must be visible in the summary.
+### `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+Integrate Wave 1 logic so opportunity evaluation is driven by realistic net edge and no-trade rules.
+Do not rely mainly on raw signal strength after this change.
 
-### 6. `packages/risk-engine/src/regime-edge-attribution.ts`
-Compute expected-vs-realized performance by:
-- regime
-- liquidity bucket
-- spread bucket
-- time-to-expiry bucket
-- entry timing bucket
-- execution style
-- side
+## Rules
+- keep all logic typed and explainable
+- keep all decisions compatible with replayability
+- do not bypass Phase 11 state / lineage / guardrails
+- prefer no-trade over marginal trade
+
+## Verification commands
+Run:
+
+```bash
+pnpm -r typecheck
+pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
+rg "net-edge-estimator|net-edge-threshold-policy|no-trade-zone-policy|evaluateTradeOpportunities" apps packages
+```
+
+## Wave 1 acceptance criteria
+Wave 1 is complete only if:
+- raw edge can be reduced to net edge through explicit cost adjustments
+- low-margin trades are rejectable after cost and uncertainty adjustment
+- evaluateTradeOpportunities integrates the new net-edge path
+- no-trade logic exists explicitly and is inspectable
+
+---
+
+# WAVE 2 — Capital leak attribution and trade quality
+
+## Goal
+Make the system explain where capital is leaking and how individual trades should be scored economically.
+
+## Create
+- `packages/risk-engine/src/capital-leak-attribution.ts`
+- `packages/risk-engine/src/capital-leak-report.ts`
+- `apps/worker/src/jobs/capitalLeakReview.job.ts`
+- `packages/domain/src/trade-quality.ts`
+- `packages/risk-engine/src/trade-quality-scorer.ts`
+- `packages/risk-engine/src/trade-quality-history-store.ts`
+
+## Required behavior
+
+### `capital-leak-attribution.ts`
+Attribute capital leakage to categories such as:
+- false positive forecast
+- calibration error
+- slippage
+- adverse selection
+- missed fills
+- overtrading
+- poor sizing
+- trading in degraded regimes
+- venue degradation
+
+### `capital-leak-report.ts`
+Summarize leak categories by:
 - strategy variant
-
-Do not return only global aggregates.
-
-### 7. `packages/risk-engine/src/edge-decay-detector.ts`
-Detect persistent degradation.
-Required labels:
-- `healthy`
-- `watch`
-- `degraded`
-- `quarantine_candidate`
-
-Use deterministic threshold-based logic.
-Do not escalate from a single noisy sample.
-
-### 8. `packages/signal-engine/src/live-calibration-store.ts`
-Persist calibration state by strategy/context.
-Must store:
-- sample count
-- Brier score
-- log loss
-- shrinkage factor
-- health label
-- version
-
-### 9. `packages/signal-engine/src/live-calibration-updater.ts`
-Update calibration state from realized outcomes.
-Must detect overconfidence and emit drift signals.
-Poor calibration must weaken confidence.
-
-### 10. `packages/signal-engine/src/confidence-shrinkage-policy.ts`
-Translate degraded calibration into safer behavior.
-It must return typed threshold and size multipliers plus rationale.
-
----
-
-# Wave 1 acceptance criteria
-
-Do not continue until all are true:
-- learning state persists across restart
-- learning events are append-only and readable
-- daily learning cycle produces a machine-readable summary
-- regime attribution updates bucketed performance snapshots
-- calibration updates from realized outcomes
-- degraded calibration can reduce aggressiveness through explicit shrinkage logic
-- no duplicate learning-state vocabularies were introduced
-
-## Required Wave 1 verification commands
-Run these after implementation:
-
-```bash
-pnpm -r typecheck
-pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
-rg "interface .*LearningState|type .*LearningState|interface .*CalibrationState|type .*CalibrationState|interface .*StrategyVariantState|type .*StrategyVariantState" packages apps
-rg "dailyReview|LearningCycleSummary|learning-cycle-runner|live-calibration-updater|regime-edge-attribution" apps packages
-```
-
-Adjust the worker package filter only if the actual package name differs.
-
----
-
-# WAVE 2 — Controlled strategy evolution
-
-## Goal
-Add champion–challenger evaluation, promotion discipline, quarantine, staged rollout, and rollback.
-
-## Implement only after Wave 1 passes
-11. `packages/domain/src/strategy-variant.ts`
-12. `packages/signal-engine/src/champion-challenger-manager.ts`
-13. `packages/signal-engine/src/shadow-evaluation-engine.ts`
-14. `packages/signal-engine/src/promotion-decision-engine.ts`
-15. `packages/signal-engine/src/strategy-quarantine-policy.ts`
-16. `apps/worker/src/runtime/strategy-deployment-registry.ts`
-17. `apps/worker/src/runtime/strategy-rollout-controller.ts`
-18. `apps/worker/src/runtime/rollback-controller.ts`
-
-## Requirements for Wave 2
-
-### Strategy variant types
-Create canonical lifecycle types and statuses.
-Statuses must include:
-- `incumbent`
-- `shadow`
-- `canary`
-- `quarantined`
-- `retired`
-
-### Champion–challenger manager
-Register challengers, maintain lineage, track evaluation mode, allow multiple challengers.
-Do not let this module promote directly.
-
-### Shadow evaluation engine
-Evaluate challengers without unrestricted capital.
-Produce evidence packages for the promotion engine.
-
-### Promotion decision engine
-Return only typed explicit decisions:
-- `reject`
-- `shadow_only`
-- `canary`
-- `promote`
-- `rollback`
-
-Every decision must include explicit reasons.
-Do not promote on PnL alone.
-
-### Strategy quarantine policy
-Support precise quarantine by:
-- variant
 - regime
 - market context
+- execution style
+- time window
 
-Every quarantine must include reason and severity.
+### `capitalLeakReview.job.ts`
+Run a periodic review that:
+- computes leak attribution
+- stores or emits diagnostic summaries
+- flags dominant leak categories
 
-### Deployment registry
-Persist what is live:
-- incumbent
-- challengers
-- rollout stage
-- quarantines
-- retired variants
+### `trade-quality.ts`
+Define canonical types for:
+- `TradeQualityScore`
+- `TradeQualityBreakdown`
+- `TradeQualityLabel`
 
-### Rollout controller
-Support:
-- shadow only
-- canary 1%
-- canary 5%
-- partial
-- full
+### `trade-quality-scorer.ts`
+Score trades on:
+- forecast quality
+- calibration quality
+- execution quality
+- timing quality
+- policy compliance
+- realized outcome quality
 
-Canary capital must be bounded.
+### `trade-quality-history-store.ts`
+Persist trade-quality results for later review and integration into policy decisions.
 
-### Rollback controller
-Rollback on:
-- realized EV collapse
-- calibration collapse
-- execution deterioration
-- unexplained drawdown threshold
-- quarantine escalation
+## Rules
+- trade quality must be explainable, not a black-box score only
+- capital-leak categories must be explicit and machine-readable
 
----
-
-# Wave 2 acceptance criteria
-
-Do not continue until all are true:
-- challengers can be registered and tracked
-- challengers can be evaluated in shadow form
-- promotion decisions are explicit and reasoned
-- rollout stages are bounded and inspectable
-- degraded promoted variants can roll back automatically
-- quarantine is precise and does not default to full-engine halt
-
-## Required Wave 2 verification commands
+## Verification commands
+Run:
 
 ```bash
 pnpm -r typecheck
 pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
-rg "promotion-decision-engine|strategy-quarantine-policy|strategy-rollout-controller|rollback-controller|champion-challenger-manager" apps packages
+rg "capital-leak-attribution|capital-leak-report|capitalLeakReview|trade-quality-scorer|trade-quality-history-store" apps packages
 ```
 
+## Wave 2 acceptance criteria
+Wave 2 is complete only if:
+- the system can explain major loss sources in explicit categories
+- trade quality is scored structurally and persisted
+- leak review runs as a real job, not only as a utility file
+
 ---
 
-# WAVE 3 — Execution learning
+# WAVE 3 — Regime economics and anti-overtrading
 
 ## Goal
-Make execution policy adapt from realized fill and venue behavior in a typed, replayable, versioned manner.
+Allocate less or zero capital to destructive regimes and reduce low-quality activity.
 
-## Implement only after Wave 2 passes
-19. `packages/execution-engine/src/execution-learning-store.ts`
-20. `packages/execution-engine/src/execution-policy-updater.ts`
-21. `packages/execution-engine/src/adaptive-maker-taker-policy.ts`
-22. `packages/execution-engine/src/adverse-selection-monitor.ts`
-23. `packages/execution-engine/src/execution-policy-version-store.ts`
+## Create
+- `packages/risk-engine/src/regime-profitability-ranker.ts`
+- `packages/risk-engine/src/regime-capital-policy.ts`
+- `packages/risk-engine/src/regime-disable-policy.ts`
+- `packages/risk-engine/src/trade-frequency-governor.ts`
+- `packages/risk-engine/src/marginal-edge-cooldown-policy.ts`
+- `packages/risk-engine/src/opportunity-saturation-detector.ts`
 
-## Requirements for Wave 3
+## Modify
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+- optionally `apps/worker/src/jobs/executeOrders.job.ts` if frequency gating needs downstream enforcement
 
-### Execution learning store
-Persist execution-quality metrics by context, including:
-- maker fill rate
-- taker fill rate
-- fill delay
-- slippage
-- adverse selection
-- cancel success
-- partial-fill behavior
+## Required behavior
 
-### Execution policy updater
-Update fill-probability and slippage assumptions from realized venue outcomes.
-Do not mutate live order logic directly inside this module.
-Output must be versionable.
+### `regime-profitability-ranker.ts`
+Rank regimes economically using:
+- net EV
+- realized EV retention
+- drawdown behavior
+- calibration health
+- execution quality
+- sample sufficiency
 
-### Adaptive maker-taker policy
-Choose execution style using learned context.
-Must consider:
-- fill delay
-- adverse selection
-- slippage
-- market context
+### `regime-capital-policy.ts`
+Map regime ranking into capital treatment.
+Examples:
+- strong → normal or elevated capital
+- tradable → normal capital
+- marginal → reduced capital
+- avoid → no-trade or near-zero capital
 
-### Adverse selection monitor
-Detect whether passive liquidity is being punished independently of global PnL.
+### `regime-disable-policy.ts`
+Disable persistently destructive regimes.
 
-### Execution policy version store
-Version every learned execution-policy change.
+### `trade-frequency-governor.ts`
+Control trade frequency by:
+- regime
+- opportunity class
+- recent trade quality
+- recent capital leakage
+- recent drawdown state
 
----
+### `marginal-edge-cooldown-policy.ts`
+Impose cooldown after repeated weak or marginal opportunities.
 
-# Wave 3 acceptance criteria
+### `opportunity-saturation-detector.ts`
+Detect when the system is forcing activity instead of waiting for strong edge.
 
-Do not continue until all are true:
-- execution learning persists across restart
-- execution assumptions update from realized fills
-- adaptive execution choices are typed and explainable
-- execution policy versions are durable and replayable
+## Rules
+- overtrading is a bug
+- do not let low-quality market conditions keep generating activity unchecked
+- integrate with existing Phase 11 guardrails, not around them
 
-## Required Wave 3 verification commands
+## Verification commands
+Run:
 
 ```bash
 pnpm -r typecheck
 pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
-rg "execution-learning-store|execution-policy-updater|adaptive-maker-taker-policy|adverse-selection-monitor|execution-policy-version-store" apps packages
+rg "regime-profitability-ranker|regime-capital-policy|regime-disable-policy|trade-frequency-governor|marginal-edge-cooldown-policy|opportunity-saturation-detector" apps packages
 ```
+
+## Wave 3 acceptance criteria
+Wave 3 is complete only if:
+- regimes can be ranked economically
+- bad regimes can be reduced or disabled
+- low-quality trade frequency can be suppressed explicitly
+- opportunity evaluation respects these new controls
 
 ---
 
-# WAVE 4 — Portfolio learning and capital routing
+# WAVE 4 — Execution-cost realism and uncertainty-weighted sizing
 
 ## Goal
-Move from trade-level adaptation to portfolio-level capital intelligence.
+Retain more edge after execution and size smaller when conditions are uncertain or liquidity is weak.
 
-## Implement only after Wave 3 passes
-24. `packages/risk-engine/src/portfolio-learning-state.ts`
-25. `packages/risk-engine/src/capital-allocation-engine.ts`
-26. `packages/risk-engine/src/strategy-correlation-monitor.ts`
-27. `packages/risk-engine/src/allocation-promotion-gate.ts`
+## Create
+- `packages/execution-engine/src/realized-cost-model.ts`
+- `packages/execution-engine/src/execution-cost-calibrator.ts`
+- `packages/execution-engine/src/size-vs-liquidity-policy.ts`
+- `packages/execution-engine/src/entry-timing-efficiency-scorer.ts`
+- `packages/risk-engine/src/uncertainty-weighted-sizing.ts`
+- `packages/risk-engine/src/size-penalty-engine.ts`
+- `packages/risk-engine/src/max-loss-per-opportunity-policy.ts`
 
-## Requirements for Wave 4
+## Required behavior
 
-### Portfolio learning state
-Track:
-- allocation by variant
-- allocation by regime
-- allocation by opportunity class
-- drawdown by sleeve
-- concentration and correlation signals
+### `realized-cost-model.ts`
+Model realized trading cost including:
+- fees
+- slippage
+- adverse selection
+- fill decay
+- cancel/replace overhead
+- missed opportunity cost if relevant
 
-### Capital allocation engine
-Route capital using:
-- performance quality
+### `execution-cost-calibrator.ts`
+Update cost assumptions from realized trades/fills.
+
+### `size-vs-liquidity-policy.ts`
+Limit trade size based on liquidity and execution conditions.
+
+### `entry-timing-efficiency-scorer.ts`
+Measure whether trade entry timing is efficient or consistently poor.
+
+### `uncertainty-weighted-sizing.ts`
+Size positions based on:
+- net edge
 - calibration health
 - execution health
-- drawdown
+- regime health
+- venue health
+- drawdown state
 - sample sufficiency
-- concentration penalties
 
-Every decision must include rationale.
+### `size-penalty-engine.ts`
+Apply size penalties for:
+- weak calibration
+- poor execution quality
+- poor regime health
+- venue instability
+- concentration risk
 
-### Strategy correlation monitor
-Detect hidden overlap between variants or sleeves.
+### `max-loss-per-opportunity-policy.ts`
+Prevent one opportunity from consuming too much capital budget.
 
-### Allocation promotion gate
-Block capital scaling unless:
-- calibration is healthy
-- execution is healthy
-- sample is sufficient
-- concentration is acceptable
+## Rules
+- size must fall when uncertainty rises
+- do not allow static sizing to dominate in poor conditions
+- keep outputs typed and explainable
 
----
-
-# Wave 4 acceptance criteria
-
-Do not continue until all are true:
-- portfolio-level learning state exists
-- allocation decisions are evidence-driven
-- concentration penalties can block scaling
-- degraded variants can be de-scaled without disabling the full system
-
-## Required Wave 4 verification commands
+## Verification commands
+Run:
 
 ```bash
 pnpm -r typecheck
 pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
-rg "capital-allocation-engine|strategy-correlation-monitor|allocation-promotion-gate|portfolio-learning-state" apps packages
+rg "realized-cost-model|execution-cost-calibrator|size-vs-liquidity-policy|entry-timing-efficiency-scorer|uncertainty-weighted-sizing|size-penalty-engine|max-loss-per-opportunity-policy" apps packages
 ```
+
+## Wave 4 acceptance criteria
+Wave 4 is complete only if:
+- realized execution costs are modeled explicitly
+- size can be reduced by uncertainty and liquidity conditions
+- the system has a typed path from poor conditions to smaller exposure
 
 ---
 
-# WAVE 5 — Version lineage, venue learning, inspectability, integration tests
+# WAVE 5 — Promotion economics, growth metrics, commands, and tests
 
 ## Goal
-Make the learning layer fully auditable, venue-aware, operator-inspectable, and proven by integration tests.
+Promote only economically stable behavior and make capital-growth quality inspectable and proven.
 
-## Implement only after Wave 4 passes
-28. `packages/domain/src/version-lineage.ts`
-29. `apps/worker/src/runtime/version-lineage-registry.ts`
-30. `apps/worker/src/runtime/decision-replay-context.ts`
-31. `packages/polymarket-adapter/src/venue/venue-health-learning-store.ts`
-32. `packages/polymarket-adapter/src/venue/venue-uncertainty-detector.ts`
-33. `packages/polymarket-adapter/src/venue/venue-mode-policy.ts`
-34. operator commands
-35. integration tests
+## Create
+- `packages/signal-engine/src/capital-growth-promotion-gate.ts`
+- `packages/signal-engine/src/promotion-stability-check.ts`
+- modify `packages/signal-engine/src/promotion-decision-engine.ts`
+- `packages/risk-engine/src/capital-growth-metrics.ts`
+- `packages/risk-engine/src/compounding-efficiency-score.ts`
+- `apps/worker/src/jobs/capitalGrowthReview.job.ts`
+- `apps/worker/src/commands/print-net-edge-state.command.ts`
+- `apps/worker/src/commands/print-capital-leak-report.command.ts`
+- `apps/worker/src/commands/print-regime-profitability.command.ts`
+- `apps/worker/src/commands/print-capital-growth-metrics.command.ts`
+- `apps/worker/src/tests/net-edge-gating.integration.test.ts`
+- `apps/worker/src/tests/regime-profitability.integration.test.ts`
+- `apps/worker/src/tests/uncertainty-sizing.integration.test.ts`
+- `apps/worker/src/tests/anti-overtrading.integration.test.ts`
+- `apps/worker/src/tests/capital-leak-attribution.integration.test.ts`
 
-## Operator commands to add
-- `apps/worker/src/commands/print-learning-state.command.ts`
-- `apps/worker/src/commands/print-strategy-lineage.command.ts`
-- `apps/worker/src/commands/run-learning-cycle.command.ts`
-- `apps/worker/src/commands/print-promotion-decision.command.ts`
+## Required behavior
 
-## Integration tests to add
-- `apps/worker/src/tests/learning-cycle.integration.test.ts`
-- `apps/worker/src/tests/champion-challenger.integration.test.ts`
-- `apps/worker/src/tests/execution-learning.integration.test.ts`
-- `apps/worker/src/tests/quarantine-policy.integration.test.ts`
-- `apps/worker/src/tests/version-lineage.integration.test.ts`
+### `capital-growth-promotion-gate.ts`
+Promotion must require:
+- net edge quality
+- acceptable drawdown
+- healthy calibration
+- healthy execution retention
+- acceptable capital leakage
+- stable regime profitability
 
-## Requirements for Wave 5
+### `promotion-stability-check.ts`
+Reject profitable-but-unstable challengers.
+Examples:
+- luck concentrated in one narrow context
+- poor EV consistency
+- high variance without stable retention
+- fragile regime dependence
 
-### Version lineage
-Canonical lineage must exist for:
-- strategy version
-- feature-set version
-- calibration version
-- execution-policy version
-- risk-policy version
-- allocation-policy version
+### `capital-growth-metrics.ts`
+Compute capital-growth-focused metrics such as:
+- net return
+- drawdown-adjusted growth
+- EV retention
+- cost leakage ratio
+- profit factor after costs
+- regime-adjusted expectancy
+- stability-adjusted capital growth score
 
-### Version-lineage registry
-Any live decision must be traceable to the exact version ids used.
+### `compounding-efficiency-score.ts`
+Produce a composite score answering how efficiently the system converts risk into growth.
 
-### Decision replay context
-Historical decisions must be reconstructable from:
-- market state
-- runtime state
-- learning state
-- lineage state
-- active parameter bundle
-- venue mode if relevant
+### `capitalGrowthReview.job.ts`
+Review:
+- what compounds efficiently
+- what is profitable but unstable
+- what should be scaled
+- what should be reduced
 
-### Venue health learning
-Persist venue metrics such as:
-- latency distributions
-- request failures
-- stale data intervals
-- open-order visibility lag
-- trade visibility lag
-- cancel acknowledgement lag
-
-### Venue uncertainty detector
-Map venue behavior into:
-- `healthy`
-- `degraded`
-- `unsafe`
-
-### Venue mode policy
-Map venue health into runtime modes:
-- normal
-- size-reduced
-- cancel-only
-- reconciliation-only
-
-### Operator commands
-Operators must be able to inspect current learning, lineage, and promotion state without opening raw storage manually.
+### Commands
+Provide inspectable operator outputs for:
+- net-edge state
+- capital leak report
+- regime profitability
+- capital growth metrics
 
 ### Integration tests
-Tests must prove safe self-improvement behavior, not only type safety.
+Must prove:
+- raw edge can be rejected after cost adjustment
+- destructive regimes are down-ranked
+- uncertainty reduces size
+- anti-overtrading controls trigger correctly
+- capital leak attribution distinguishes different loss sources
 
----
+## Rules
+- do not promote on recent profits alone
+- metrics must focus on capital growth quality, not vanity performance
+- tests must verify economic logic, not only existence of files
 
-# Wave 5 acceptance criteria
-
-Phase 11 is not complete unless all of the following are true:
-- every live decision can be traced to exact versions
-- decision replay context can be reconstructed
-- venue instability can force safer runtime restrictions
-- operator commands expose learning and lineage state
-- integration tests prove learning, promotion, rollback, quarantine, execution adaptation, and lineage behavior
-
-## Required Wave 5 verification commands
-
-```bash
-pnpm -r typecheck
-pnpm test
-pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
-rg "learning-state-store|learning-event-log|learning-cycle-runner|live-calibration-updater|confidence-shrinkage-policy|promotion-decision-engine|strategy-rollout-controller|rollback-controller|capital-allocation-engine|version-lineage-registry|venue-uncertainty-detector" apps packages
-```
-
----
-
-# Required final verification gate
-
-Before claiming Phase 11 complete, run all of these.
+## Verification commands
+Run:
 
 ```bash
 pnpm -r typecheck
 pnpm test
 pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
+rg "capital-growth-promotion-gate|promotion-stability-check|capital-growth-metrics|compounding-efficiency-score|capitalGrowthReview|print-net-edge-state|print-capital-leak-report|print-regime-profitability|print-capital-growth-metrics|net-edge-gating.integration|regime-profitability.integration|uncertainty-sizing.integration|anti-overtrading.integration|capital-leak-attribution.integration" apps packages
 ```
 
-Then verify required files exist.
+## Wave 5 acceptance criteria
+Wave 5 is complete only if:
+- promotions are gated by capital-growth quality
+- capital-growth metrics exist and are inspectable
+- operator commands expose economic state clearly
+- integration tests prove the economic controls work
+
+---
+
+# Final Phase 12 verification gate
+
+Run all of the following before calling Phase 12 complete:
 
 ```bash
-test -f packages/domain/src/learning-state.ts && \
-test -f apps/worker/src/runtime/learning-state-store.ts && \
-test -f apps/worker/src/runtime/learning-event-log.ts && \
-test -f apps/worker/src/jobs/dailyReview.job.ts && \
-test -f apps/worker/src/orchestration/learning-cycle-runner.ts && \
-test -f packages/risk-engine/src/regime-edge-attribution.ts && \
-test -f packages/risk-engine/src/edge-decay-detector.ts && \
-test -f packages/signal-engine/src/live-calibration-store.ts && \
-test -f packages/signal-engine/src/live-calibration-updater.ts && \
-test -f packages/signal-engine/src/confidence-shrinkage-policy.ts && \
-test -f packages/domain/src/strategy-variant.ts && \
-test -f packages/signal-engine/src/champion-challenger-manager.ts && \
-test -f packages/signal-engine/src/shadow-evaluation-engine.ts && \
-test -f packages/signal-engine/src/promotion-decision-engine.ts && \
-test -f packages/signal-engine/src/strategy-quarantine-policy.ts && \
-test -f apps/worker/src/runtime/strategy-deployment-registry.ts && \
-test -f apps/worker/src/runtime/strategy-rollout-controller.ts && \
-test -f apps/worker/src/runtime/rollback-controller.ts && \
-test -f packages/execution-engine/src/execution-learning-store.ts && \
-test -f packages/execution-engine/src/execution-policy-updater.ts && \
-test -f packages/execution-engine/src/adaptive-maker-taker-policy.ts && \
-test -f packages/execution-engine/src/adverse-selection-monitor.ts && \
-test -f packages/execution-engine/src/execution-policy-version-store.ts && \
-test -f packages/risk-engine/src/portfolio-learning-state.ts && \
-test -f packages/risk-engine/src/capital-allocation-engine.ts && \
-test -f packages/risk-engine/src/strategy-correlation-monitor.ts && \
-test -f packages/risk-engine/src/allocation-promotion-gate.ts && \
-test -f packages/domain/src/version-lineage.ts && \
-test -f apps/worker/src/runtime/version-lineage-registry.ts && \
-test -f apps/worker/src/runtime/decision-replay-context.ts && \
-test -f packages/polymarket-adapter/src/venue/venue-health-learning-store.ts && \
-test -f packages/polymarket-adapter/src/venue/venue-uncertainty-detector.ts && \
-test -f packages/polymarket-adapter/src/venue/venue-mode-policy.ts && \
-test -f apps/worker/src/commands/print-learning-state.command.ts && \
-test -f apps/worker/src/commands/print-strategy-lineage.command.ts && \
-test -f apps/worker/src/commands/run-learning-cycle.command.ts && \
-test -f apps/worker/src/commands/print-promotion-decision.command.ts && \
-test -f apps/worker/src/tests/learning-cycle.integration.test.ts && \
-test -f apps/worker/src/tests/champion-challenger.integration.test.ts && \
-test -f apps/worker/src/tests/execution-learning.integration.test.ts && \
-test -f apps/worker/src/tests/quarantine-policy.integration.test.ts && \
-test -f apps/worker/src/tests/version-lineage.integration.test.ts
+pnpm -r typecheck
+pnpm test
+pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
 ```
 
-Then verify no duplicate core vocabularies were reintroduced.
+Then verify all required Phase 12 modules exist and are referenced.
+
+Suggested search:
 
 ```bash
-rg "interface .*LearningState|type .*LearningState|interface .*StrategyVariant|type .*StrategyVariant|interface .*CalibrationState|type .*CalibrationState|interface .*PromotionDecision|type .*PromotionDecision" packages apps
+rg "net-edge-estimator|no-trade-zone-policy|capital-leak-attribution|trade-quality-scorer|regime-profitability-ranker|trade-frequency-governor|realized-cost-model|uncertainty-weighted-sizing|capital-growth-promotion-gate|capital-growth-metrics|print-net-edge-state|print-capital-growth-metrics" apps packages
 ```
 
 ---
 
-# Completion standard
+# Definition of done
 
-Phase 11 is complete only if the repository can truthfully demonstrate all of the following:
-- learning state persists across restarts
-- regime-aware attribution exists
-- edge decay is detectable
-- calibration updates from realized outcomes
-- degraded calibration reduces aggressiveness explicitly
-- challengers can be evaluated without uncontrolled promotion
-- promotions require explicit evidence
-- rollback is automatic and logged
-- execution assumptions adapt from realized fills
-- failing slices can be quarantined precisely
-- capital allocation changes are evidence-driven
-- version lineage is durable and queryable
-- decision replay context can be reconstructed
-- venue instability can force safer runtime modes
-- operator commands expose learning and lineage state
-- integration tests prove safe self-improvement behavior
+Phase 12 is complete only if the repository can demonstrate all of the following:
+- weak raw edge can be rejected after realistic cost adjustment
+- destructive regimes receive less or zero capital
+- capital leakage can be attributed explicitly
+- trade quality is scored and persisted
+- overtrading can be suppressed
+- position size falls when uncertainty rises
+- liquidity constraints reduce exposure explicitly
+- strategy promotion depends on capital-growth quality
+- economic operator commands expose the relevant state clearly
+- integration tests verify the most important economic controls
 
-If any item above is not yet true, do not claim Phase 11 complete.
-
----
-
-# Output format required from Codex after each work block
-
-Use this structure exactly:
-
-## Changed files
-- exact paths only
-
-## What was implemented
-- concise factual summary
-
-## What is now true
-- operational statements now true because of the change
-
-## Verification run
-- exact commands executed
-- pass/fail
-- notable warnings or unresolved issues
-
-## Remaining work
-- next items from the current wave only
-
----
-
-# Final instruction
-
-Implement Phase 11 as a controlled operational upgrade.
-Optimize for:
-- correctness
-- auditability
-- replayability
-- rollback safety
-- capital protection
-- real venue robustness
-
-Do not optimize for novelty.
-Do not improvise outside the wave sequence.
+If any of the above is missing, Phase 12 is not complete.

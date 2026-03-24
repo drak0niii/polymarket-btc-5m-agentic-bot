@@ -5,10 +5,11 @@ import { AppLogger } from '@worker/common/logger';
 import {
   type ExecutionStyle,
   type LearningEvent,
-  type LearningState,
   type LearningCycleSummary,
+  type LearningState,
   type LearningTradeSide,
   type PortfolioAllocationDecisionRecord,
+  type TradeQualityScore,
   buildStrategyVariantId,
 } from '@polymarket-btc-5m-agentic-bot/domain';
 import { createDefaultStrategyVariantState } from '@polymarket-btc-5m-agentic-bot/domain';
@@ -18,17 +19,23 @@ import {
   type ExecutionLearningObservation,
 } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import {
+  CapitalGrowthMetricsCalculator,
   CapitalAllocationEngine,
   PortfolioLearningStateBuilder,
+  RegimeProfitabilityRanker,
   StrategyCorrelationMonitor,
+  TradeQualityHistoryStore,
   applyPortfolioAllocationDecisions,
+  type CapitalLeakReport,
   type PortfolioLearningObservation,
 } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import {
+  CapitalGrowthPromotionGate,
   ChampionChallengerManager,
   LiveCalibrationStore,
   LiveCalibrationUpdater,
   PromotionDecisionEngine,
+  PromotionStabilityCheck,
   ShadowEvaluationEngine,
   StrategyQuarantinePolicy,
 } from '@polymarket-btc-5m-agentic-bot/signal-engine';
@@ -37,6 +44,7 @@ import {
   VenueModePolicy,
   VenueUncertaintyDetector,
 } from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
+import { CapitalLeakReviewJob } from './capitalLeakReview.job';
 import { LearningCycleRunner, type LearningCycleSample } from '@worker/orchestration/learning-cycle-runner';
 import { LearningEventLog } from '@worker/runtime/learning-event-log';
 import { LearningStateStore } from '@worker/runtime/learning-state-store';
@@ -52,6 +60,7 @@ import {
   buildRiskPolicyVersionLineage,
   buildStrategyVersionLineage,
 } from '@worker/runtime/version-lineage-registry';
+import { CapitalGrowthReviewJob } from './capitalGrowthReview.job';
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -65,14 +74,21 @@ export class DailyReviewJob {
   private readonly portfolioLearningStateBuilder = new PortfolioLearningStateBuilder();
   private readonly strategyCorrelationMonitor = new StrategyCorrelationMonitor();
   private readonly capitalAllocationEngine = new CapitalAllocationEngine();
+  private readonly tradeQualityHistoryStore: TradeQualityHistoryStore;
+  private readonly regimeProfitabilityRanker = new RegimeProfitabilityRanker();
+  private readonly capitalGrowthMetricsCalculator = new CapitalGrowthMetricsCalculator();
   private readonly championChallengerManager = new ChampionChallengerManager();
   private readonly shadowEvaluationEngine = new ShadowEvaluationEngine();
+  private readonly capitalGrowthPromotionGate = new CapitalGrowthPromotionGate();
+  private readonly promotionStabilityCheck = new PromotionStabilityCheck();
   private readonly promotionDecisionEngine = new PromotionDecisionEngine();
   private readonly quarantinePolicy = new StrategyQuarantinePolicy();
   private readonly rolloutController = new StrategyRolloutController();
   private readonly rollbackController = new RollbackController();
   private readonly versionLineageRegistry: VersionLineageRegistry;
   private readonly venueHealthLearningStore: VenueHealthLearningStore;
+  private readonly capitalLeakReviewJob: CapitalLeakReviewJob;
+  private readonly capitalGrowthReviewJob: CapitalGrowthReviewJob;
   private readonly venueUncertaintyDetector = new VenueUncertaintyDetector();
   private readonly venueModePolicy = new VenueModePolicy();
 
@@ -92,6 +108,19 @@ export class DailyReviewJob {
       versionLineageRegistry ?? new VersionLineageRegistry();
     this.venueHealthLearningStore =
       venueHealthLearningStore ?? createDefaultVenueHealthLearningStore(this.learningStateStore);
+    this.tradeQualityHistoryStore = new TradeQualityHistoryStore(
+      path.join(this.learningStateStore.getPaths().rootDir, 'trade-quality'),
+    );
+    this.capitalLeakReviewJob = new CapitalLeakReviewJob(
+      prisma,
+      this.learningStateStore,
+      this.tradeQualityHistoryStore,
+    );
+    this.capitalGrowthReviewJob = new CapitalGrowthReviewJob(
+      prisma,
+      this.learningStateStore,
+      this.tradeQualityHistoryStore,
+    );
     const calibrationStore = new LiveCalibrationStore({
       loadState: () => this.learningStateStore.load(),
       saveState: (state) => this.learningStateStore.save(state),
@@ -206,10 +235,25 @@ export class DailyReviewJob {
         from: window.from,
         to: window.to,
       });
+      const capitalLeakReview = await this.capitalLeakReviewJob.run({
+        now: completedAt,
+        from: window.from,
+        to: window.to,
+        learningState: portfolioLearning.learningState,
+      });
+      const capitalGrowthReview = await this.capitalGrowthReviewJob.run({
+        now: completedAt,
+        from: window.from,
+        to: window.to,
+        learningState: portfolioLearning.learningState,
+        capitalLeakReport: capitalLeakReview.report,
+      });
       const summary = appendWarnings(result.summary, [
         ...executionLearning.warnings,
         ...portfolioLearning.warnings,
         ...venueLearning.warnings,
+        ...capitalLeakReview.warnings,
+        ...capitalGrowthReview.warnings,
       ]);
       const finalState: LearningState = {
         ...portfolioLearning.learningState,
@@ -305,6 +349,8 @@ export class DailyReviewJob {
       },
     };
     const events: LearningEvent[] = [];
+    const recentTradeQualityScores = await this.tradeQualityHistoryStore.readLatest(5_000);
+    const latestCapitalLeakReport = await this.capitalLeakReviewJob.readLatestReport();
 
     const sync = this.championChallengerManager.sync({
       registry,
@@ -463,12 +509,21 @@ export class DailyReviewJob {
         continue;
       }
 
+      const economicControls = this.buildPromotionEconomicControls({
+        strategyVariantId: challenger.variantId,
+        learningState,
+        shadowEvidence,
+        recentTradeQualityScores,
+        capitalLeakReport: latestCapitalLeakReport,
+      });
+
       const decision = this.promotionDecisionEngine.evaluate({
         evidence: shadowEvidence,
         currentRolloutStage:
           registry.activeRollout?.challengerVariantId === challenger.variantId
             ? registry.activeRollout.stage
             : challenger.rolloutStage,
+        economicControls,
         now: input.now,
       });
       learningState.strategyVariants[challenger.variantId] = {
@@ -527,6 +582,7 @@ export class DailyReviewJob {
             parameters: {
               decision,
               shadowEvidence,
+              economicControls,
             },
           }),
           allocationPolicyVersion: null,
@@ -538,6 +594,7 @@ export class DailyReviewJob {
           },
           learningState: {
             shadowEvidence,
+            promotionEconomics: economicControls,
             lastPromotionDecision:
               learningState.strategyVariants[challenger.variantId]?.lastPromotionDecision ?? null,
           },
@@ -548,11 +605,12 @@ export class DailyReviewJob {
           activeParameterBundle: {
             decision,
             shadowEvidence,
+            economicControls,
           },
           venueMode: null,
           venueUncertainty: null,
         },
-        tags: ['wave5', 'promotion', decision.verdict],
+        tags: ['wave5', 'phase12_wave5', 'promotion', decision.verdict],
       });
 
       const rolloutMutation = this.rolloutController.applyPromotionDecision({
@@ -641,6 +699,127 @@ export class DailyReviewJob {
       learningState,
       registry,
       events,
+    };
+  }
+
+  private buildPromotionEconomicControls(input: {
+    strategyVariantId: string;
+    learningState: LearningState;
+    shadowEvidence: {
+      sampleCount: number;
+      realizedVsExpected: number | null;
+      realizedPnl: number;
+    };
+    recentTradeQualityScores: TradeQualityScore[];
+    capitalLeakReport: CapitalLeakReport | null;
+  }) {
+    const variantState =
+      input.learningState.strategyVariants[input.strategyVariantId] ??
+      createDefaultStrategyVariantState(input.strategyVariantId);
+    const persistedTradeQuality = input.recentTradeQualityScores.filter(
+      (score) => score.strategyVariantId === input.strategyVariantId,
+    );
+    const variantTradeQuality =
+      persistedTradeQuality.length > 0
+        ? persistedTradeQuality
+        : buildSyntheticPromotionTradeQualityScores(
+            input.strategyVariantId,
+            variantState,
+            input.shadowEvidence,
+          );
+    const calibrationHealth = worstHealth(
+      Object.values(input.learningState.calibration)
+        .filter((calibration) => calibration.strategyVariantId === input.strategyVariantId)
+        .map((calibration) => calibration.health),
+    );
+    const executionHealth = worstHealth(
+      Object.values(variantState.executionLearning.contexts).map((context) => context.health),
+    );
+    const drawdownState = findVariantDrawdown(
+      input.learningState,
+      input.strategyVariantId,
+    );
+    const regimeAssessments = Object.values(variantState.regimeSnapshots).map((snapshot) =>
+      this.regimeProfitabilityRanker.rank({
+        strategyVariantId: input.strategyVariantId,
+        regime: snapshot.regime,
+        regimeSnapshot: snapshot,
+        calibrationHealth,
+        executionContext:
+          Object.values(variantState.executionLearning.contexts).find(
+            (context) => context.regime === snapshot.regime,
+          ) ?? null,
+        recentTradeQualityScores: variantTradeQuality.filter(
+          (score) => score.regime === snapshot.regime,
+        ),
+        currentDrawdownPct: drawdownState?.currentDrawdown ?? null,
+        maxDrawdownPct: drawdownState?.maxDrawdown ?? null,
+        recentLeakShare:
+          input.capitalLeakReport?.byRegime.find(
+            (group) => group.groupKey === snapshot.regime,
+          )?.dominantShare ?? null,
+      }),
+    );
+    const metrics = this.capitalGrowthMetricsCalculator.evaluate({
+      strategyVariantId: input.strategyVariantId,
+      tradeQualityScores: variantTradeQuality,
+      regimeAssessments,
+      capitalLeakReportGroup:
+        input.capitalLeakReport?.byStrategyVariant.find(
+          (group) => group.groupKey === input.strategyVariantId,
+        ) ?? null,
+      calibrationHealth,
+      executionHealth,
+      currentDrawdownPct: drawdownState?.currentDrawdown ?? null,
+      maxDrawdownPct: drawdownState?.maxDrawdown ?? null,
+    });
+    const sampleCount = Math.max(
+      input.shadowEvidence.sampleCount,
+      metrics.tradeCount,
+      regimeAssessments.reduce((sum, assessment) => sum + assessment.metrics.sampleCount, 0),
+    );
+    const capitalGrowthGate = this.capitalGrowthPromotionGate.evaluate({
+      sampleCount,
+      calibrationHealth,
+      executionHealth,
+      netEdgeQuality: metrics.netEdgeQuality,
+      maxDrawdownPct: metrics.maxDrawdownPct,
+      capitalLeakageRatio: metrics.costLeakageRatio,
+      executionEvRetention: metrics.executionEvRetention,
+      regimeStabilityScore: metrics.regimeStabilityScore,
+      stabilityAdjustedCapitalGrowthScore:
+        metrics.stabilityAdjustedCapitalGrowthScore,
+    });
+    const realizedReturns = variantTradeQuality
+      .map((score) => {
+        const value = score.breakdown.realizedOutcomeQuality.evidence.realizedEv;
+        return typeof value === 'number' && Number.isFinite(value) ? value : null;
+      })
+      .filter((value): value is number => value != null);
+    if (realizedReturns.length === 0 && Number.isFinite(input.shadowEvidence.realizedPnl)) {
+      realizedReturns.push(input.shadowEvidence.realizedPnl);
+    }
+    const stabilityCheck = this.promotionStabilityCheck.evaluate({
+      sampleCount,
+      realizedVsExpected:
+        metrics.evRetention ?? input.shadowEvidence.realizedVsExpected,
+      stabilityAdjustedCapitalGrowthScore:
+        metrics.stabilityAdjustedCapitalGrowthScore,
+      contextShares: buildPromotionStabilityContextShares(variantState),
+      realizedReturns,
+    });
+
+    return {
+      capitalGrowthGate,
+      stabilityCheck,
+      netEdgeQuality: metrics.netEdgeQuality,
+      maxDrawdownPct: metrics.maxDrawdownPct,
+      capitalLeakageRatio: metrics.costLeakageRatio,
+      executionEvRetention: metrics.executionEvRetention,
+      regimeStabilityScore: metrics.regimeStabilityScore,
+      stabilityAdjustedCapitalGrowthScore:
+        metrics.stabilityAdjustedCapitalGrowthScore,
+      compoundingEfficiencyScore: metrics.compoundingEfficiency.score,
     };
   }
 
@@ -1518,6 +1697,138 @@ function findExecutionPolicyVersionForVariant(
       (version) => version.strategyVariantId === strategyVariantId,
     ) ?? null
   );
+}
+
+function buildPromotionStabilityContextShares(
+  variantState: LearningState['strategyVariants'][string],
+) {
+  return Object.entries(variantState.regimeSnapshots).map(([contextKey, snapshot]) => ({
+    contextKey,
+    realizedContribution: snapshot.realizedEvSum,
+    sampleCount: snapshot.sampleCount,
+    realizedVsExpected: snapshot.realizedVsExpected,
+  }));
+}
+
+function findVariantDrawdown(
+  learningState: LearningState,
+  strategyVariantId: string,
+) {
+  return (
+    Object.values(learningState.portfolioLearning.drawdownBySleeve).find(
+      (drawdown) =>
+        drawdown.sleeveType === 'variant' && drawdown.sleeveValue === strategyVariantId,
+    ) ?? null
+  );
+}
+
+function worstHealth(
+  values: Array<'healthy' | 'watch' | 'degraded' | 'quarantine_candidate'>,
+) {
+  const priority = {
+    healthy: 0,
+    watch: 1,
+    degraded: 2,
+    quarantine_candidate: 3,
+  };
+
+  return values.reduce<'healthy' | 'watch' | 'degraded' | 'quarantine_candidate'>(
+    (worst, value) => (priority[value] > priority[worst] ? value : worst),
+    'healthy',
+  );
+}
+
+function buildSyntheticPromotionTradeQualityScores(
+  strategyVariantId: string,
+  variantState: LearningState['strategyVariants'][string],
+  shadowEvidence: {
+    realizedVsExpected: number | null;
+    realizedPnl: number;
+  },
+): TradeQualityScore[] {
+  const snapshots = Object.values(variantState.regimeSnapshots);
+  if (snapshots.length === 0) {
+    return [];
+  }
+
+  return snapshots.map((snapshot, index) => {
+    const expectedEv =
+      Number.isFinite(snapshot.expectedEvSum) && snapshot.expectedEvSum !== 0
+        ? snapshot.expectedEvSum
+        : snapshot.avgExpectedEv;
+    const realizedEv =
+      Number.isFinite(snapshot.realizedEvSum) && snapshot.realizedEvSum !== 0
+        ? snapshot.realizedEvSum
+        : shadowEvidence.realizedPnl;
+    const overallScore =
+      snapshot.realizedVsExpected >= 1.1
+        ? 0.82
+        : snapshot.realizedVsExpected >= 0.95
+          ? 0.7
+          : snapshot.realizedVsExpected >= 0.8
+            ? 0.55
+            : 0.35;
+
+    return {
+      tradeId: `promotion-fallback:${strategyVariantId}:${index}`,
+      orderId: null,
+      signalId: null,
+      marketId: null,
+      strategyVariantId,
+      regime: snapshot.regime,
+      marketContext: 'promotion_shadow_evaluation',
+      executionStyle: snapshot.executionStyle,
+      evaluatedAt: snapshot.lastObservedAt ?? new Date().toISOString(),
+      label:
+        overallScore >= 0.8
+          ? 'excellent'
+          : overallScore >= 0.65
+            ? 'good'
+            : overallScore >= 0.45
+              ? 'mixed'
+              : overallScore >= 0.25
+                ? 'poor'
+                : 'destructive',
+      breakdown: {
+        forecastQuality: buildSyntheticTradeQualityComponent(overallScore),
+        calibrationQuality: buildSyntheticTradeQualityComponent(overallScore),
+        executionQuality: buildSyntheticTradeQualityComponent(overallScore),
+        timingQuality: buildSyntheticTradeQualityComponent(overallScore),
+        policyCompliance: buildSyntheticTradeQualityComponent(0.8),
+        realizedOutcomeQuality: {
+          ...buildSyntheticTradeQualityComponent(overallScore),
+          evidence: {
+            expectedEv,
+            realizedEv,
+            realizedVsExpected:
+              snapshot.realizedVsExpected ?? shadowEvidence.realizedVsExpected,
+          },
+        },
+        overallScore,
+        reasons: ['promotion_shadow_evidence_fallback'],
+      },
+    };
+  });
+}
+
+function buildSyntheticTradeQualityComponent(
+  score: number,
+): TradeQualityScore['breakdown']['forecastQuality'] {
+  return {
+    score,
+    label:
+      score >= 0.8
+        ? 'excellent'
+        : score >= 0.65
+          ? 'good'
+          : score >= 0.45
+            ? 'mixed'
+            : score >= 0.25
+              ? 'poor'
+              : 'destructive',
+    reasons: ['promotion_shadow_evidence_fallback'],
+    evidence: {},
+  };
 }
 
 function inferExecutionStyle(

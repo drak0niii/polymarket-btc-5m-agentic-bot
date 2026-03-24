@@ -2,263 +2,205 @@
 
 ## Repository mission
 
-This repository exists to become a real, production-oriented, capital-protective, fully autonomous Polymarket trading system for BTC 5-minute markets.
+This repository exists to become a production-oriented, capital-protective, evidence-driven autonomous Polymarket trading system that compounds capital through selective, net-profitable trading.
 
-The system is not a toy, not a dashboard-only project, and not a research-only sandbox.
-Its target end state is a live trading engine that:
-- discovers valid live opportunities on Polymarket
-- builds and validates edge
-- executes orders correctly against real venue constraints
-- reconciles venue truth continuously
-- protects capital with explicit controls
-- learns safely from realized outcomes
-- improves over time without uncontrolled drift
+The system is not a toy, not a dashboard project, and not an "AI for AI's sake" experiment.
 
-The primary objective is:
+Its objective is:
 
-**MAXIMIZE LONG-TERM RISK-ADJUSTED PORTFOLIO GROWTH WITHOUT VIOLATING CAPITAL SAFETY OR REPLAYABILITY**
+**MAXIMIZE LONG-TERM NET CAPITAL GROWTH**
 
-Do not pursue growth by inventing venue behavior, weakening safeguards, or hiding uncertainty.
+That objective must be pursued only through:
+- realistic net-edge estimation
+- disciplined trade selection
+- execution-cost awareness
+- uncertainty-aware sizing
+- regime-aware capital allocation
+- explicit guardrails
+- full auditability and replayability
 
----
-
-## Required operating mindset
-
-Always treat this repository as an incomplete but serious attempt to build a real autonomous trading system.
-
-Always prefer:
-- correctness over speed
-- explicit state over implicit behavior
-- replayability over convenience
-- hard evidence over narrative
-- capital protection over aggressiveness
-- deterministic control over hidden adaptation
-
-Never assume a module is production-grade just because tests pass.
-Always inspect whether behavior is:
-- connected to the real live path
-- grounded in real venue behavior
-- durable across restart
-- safe under degraded conditions
-- explainable after the fact
+Do not optimize for raw activity, raw PnL, or superficial autonomy.
+Optimize for net expectancy, EV retention, drawdown control, and capital efficiency.
 
 ---
 
-## Codex behavior rules
+## Operating mindset
 
-### 1. Do not drift from the repository mission
-Every change must make the system more capable as a real autonomous Polymarket trader, not merely more complex.
+Treat the repository as a serious live-trading engine where every change must improve or protect one of the following:
+- expected net EV
+- capital preservation
+- execution quality
+- compounding efficiency
+- decision quality under uncertainty
 
-### 2. Do not hide logic in the live path
-Do not introduce silent adaptive logic directly inside:
-- signal generation
-- trade evaluation
-- order execution
-- reconciliation
-
-If behavior changes over time, that change must come through explicit learning state, explicit policy, explicit lineage, and explicit rollout/rollback controls.
-
-### 3. Do not duplicate canonical domain types
-When a canonical type file exists, import from it.
-Do not redefine equivalent interfaces in other modules.
-
-Examples for Phase 11:
-- `packages/domain/src/learning-state.ts`
-- `packages/domain/src/strategy-variant.ts`
-- `packages/domain/src/version-lineage.ts`
-
-### 4. Do not bypass auditability
-Every material adaptive decision must be:
-- typed
-- logged
-- replayable
-- attributable to stored evidence
-- reversible
-
-### 5. Do not widen scope opportunistically
-Complete the requested wave fully before expanding into adjacent architecture.
-Do not invent new frameworks or abstractions unless they materially simplify Phase 11 implementation.
-
-### 6. Prefer extension over rewrite
-Unless the current structure fundamentally blocks the mission, extend and tighten existing modules instead of rewriting large sections of the repo.
-
-### 7. Keep module boundaries clean
-Do not introduce deep fragile cross-package imports.
-Prefer package entry points or stable internal boundaries.
-
-### 8. Always preserve live-trading safety
-Any change that weakens readiness gating, venue validation, reconciliation, or exposure controls is a regression unless explicitly required and replaced by something stronger.
+Assume that bad logic will lose real money.
+Assume that overtrading, overconfidence, and poor execution are default failure modes.
+Assume that more complexity is not automatically better.
 
 ---
 
-## Phase 11 execution order
+## Phase 12 mission
 
-Implement Phase 11 in this exact order and do not skip ahead.
+Phase 12 is focused purely on **capital growth and trading effectiveness**.
 
-### Wave 1 — Minimum viable self-improvement
-Build the backbone first:
-1. canonical learning-state types
-2. learning-state store
-3. learning-event log
-4. real daily learning-cycle job
-5. deterministic learning-cycle runner
-6. regime-aware attribution
-7. edge decay detector
-8. live calibration store
-9. live calibration updater
-10. confidence shrinkage policy
+It is not a generic autonomy phase.
+It is not a feature accumulation phase.
+It is not a "make the AI smarter" phase.
 
-### Wave 2 — Controlled strategy evolution
-Only after Wave 1 verifies:
-11. canonical strategy-variant types
-12. champion-challenger manager
-13. shadow evaluation engine
-14. promotion decision engine
-15. strategy quarantine policy
-16. strategy deployment registry
-17. rollout controller
-18. rollback controller
-
-### Wave 3 — Execution learning
-19. execution learning store
-20. execution policy updater
-21. adaptive maker-taker policy
-22. adverse selection monitor
-23. execution policy version store
-
-### Wave 4 — Portfolio learning
-24. portfolio learning state
-25. capital allocation engine
-26. strategy correlation monitor
-27. allocation promotion gate
-
-### Wave 5 — Lineage, venue learning, inspectability, tests
-28. canonical version-lineage types
-29. version-lineage registry
-30. decision replay context
-31. venue health learning store
-32. venue uncertainty detector
-33. venue mode policy
-34. operator commands
-35. integration tests
+Phase 12 exists to make the bot:
+- take fewer, better trades
+- reject weak opportunities after realistic costs
+- size capital better
+- detect capital leakage faster
+- reduce exposure in bad regimes
+- preserve more edge after execution
+- promote only economically stable behavior
 
 ---
 
-## Hard implementation rules for Phase 11
+## Non-negotiable principles
 
-### Learning
-- No uncontrolled online learning.
-- No self-modifying live code.
-- No hidden parameter drift.
-- All learning outputs must be persisted and versioned.
+### 1. Net edge beats raw edge
+Never rely on gross forecast edge alone.
+Every trading decision must trend toward using:
+- forecast edge
+- minus fees
+- minus expected slippage
+- minus adverse selection cost
+- minus uncertainty penalty
+- minus venue degradation penalty where relevant
 
-### Promotion
-- Never promote on raw PnL alone.
-- Promotion requires multi-factor evidence:
-  - sample sufficiency
-  - calibration health
-  - execution health
-  - realized-vs-expected consistency
-  - rollback criteria
+If the net edge is weak, the system should prefer no trade.
 
-### Quarantine
-- Prefer precise quarantine by:
-  - variant
-  - regime
-  - market context
-- Use full halt only for system or venue integrity threats.
+### 2. Fewer, better trades
+Do not optimize for activity.
+Do not optimize for trade count.
+Do not optimize for signal firing frequency.
 
-### Replayability
-- Every learned behavior change must answer:
-  - what changed
-  - why it changed
-  - what evidence justified it
-  - which versions were active
-  - what rollback condition applies
+Low-quality activity is capital leakage.
+Overtrading is a bug.
 
-### Persistence
-- State must survive restart.
-- Writes must be atomic where applicable.
-- Event logs must be append-only.
+### 3. Costs are part of edge
+Execution is not separate from alpha.
+If execution destroys the edge, then there is no real edge.
 
----
+Any module that ignores realistic costs is economically incomplete.
 
-## Required working style
+### 4. Calibration governs aggressiveness
+When calibration weakens, confidence and size must shrink.
+No exceptions.
 
-For each implementation chunk:
-1. inspect the existing repo structure first
-2. identify the canonical insertion points
-3. add or modify the minimum files needed
-4. wire the new module into real execution paths
-5. add or update tests
-6. run verification commands
-7. report exactly what changed and what remains
+### 5. Weak regimes deserve less or zero capital
+Do not treat all market regimes equally.
+Capital should flow toward proven conditions and away from destructive ones.
 
-Do not claim completion if files exist but are not wired.
-Do not claim success if only typecheck passes but runtime integration is missing.
-Do not claim self-improvement if the system still only measures without adapting safely.
+### 6. Promotion must reflect capital-growth quality
+A variant should not promote merely because it had recent profits.
+It must prove:
+- net edge quality
+- acceptable drawdown
+- healthy calibration
+- healthy execution retention
+- stable regime behavior
+- acceptable leak profile
+
+### 7. Replayability and explicitness remain mandatory
+Do not bypass Phase 11 controls.
+Do not introduce hidden adaptive behavior.
+Do not introduce silent parameter drift.
+Every learned economic behavior must remain typed, logged, versioned, and replayable.
 
 ---
 
-## Definition of acceptable completion for any Phase 11 step
-
-A step is complete only if:
-- the target file exists
-- the exported interface is explicit and typed
-- the module is wired into the appropriate runtime path
-- persistence and replay implications are handled
-- verification commands pass
-- no duplicate canonical types were introduced
-- the change materially advances the repository toward safe autonomous self-improvement
-
----
-
-## Output format Codex should follow after each work block
-
-After completing a block of work, report in this structure:
-
-### Changed files
-- list exact file paths changed or created
-
-### What was implemented
-- concise factual summary of the implemented behavior
-
-### What is now true
-- operational statements that are now true because of the change
-
-### Verification run
-- exact commands executed
-- pass/fail status
-- notable warnings or limitations
-
-### Remaining work
-- next steps from the Phase 11 order only
-
----
-
-## Anti-drift reminders
+## What not to do
 
 Do not:
-- invent new unrelated subsystems
-- rewrite the architecture for style reasons
-- add black-box ML claims without deployment controls
-- add mock-only improvement loops and call them autonomy
-- skip persistence
-- skip lineage
-- skip rollback
-- skip quarantine
-- skip verification
-
-If forced to choose, prefer a smaller but fully wired, fully auditable implementation over a broader but partially connected one.
+- add black-box online RL to the live path
+- optimize on gross PnL only
+- increase complexity without clear economic benefit
+- allow profitable-but-unstable variants to scale automatically
+- trade marginal net-edge opportunities just to stay active
+- bury economic logic inside ad hoc execution code
+- bypass rollout, rollback, quarantine, lineage, or logging
 
 ---
 
-## Final standard
+## Build order discipline
 
-The repository should move from:
-- automated live trader with strong controls
+Implement Phase 12 in exactly 5 waves.
+Do not skip ahead.
+Do not work on later waves before current-wave verification is complete.
 
-toward:
-- governed, replayable, rollback-safe, self-improving autonomous Polymarket trader
+### Wave 1
+Net-edge realism and no-trade logic
 
-Any change that does not clearly support that transition is out of scope.
+### Wave 2
+Capital leak attribution and trade quality
+
+### Wave 3
+Regime economics and anti-overtrading controls
+
+### Wave 4
+Execution-cost realism and uncertainty-weighted sizing
+
+### Wave 5
+Promotion economics, capital-growth metrics, commands, and integration tests
+
+---
+
+## General implementation rules
+
+### Rule A
+Prefer explicit typed inputs and outputs over implicit objects.
+
+### Rule B
+Prefer deterministic threshold-based decisions first.
+Do not begin with opaque adaptive logic where the economic safety case is unclear.
+
+### Rule C
+Prefer surgical capital reduction over blanket shutdown when conditions degrade.
+
+### Rule D
+Every meaningful decision should be explainable in terms of:
+- expected net benefit
+- estimated risk
+- uncertainty
+- cost
+- regime context
+
+### Rule E
+Economic logic must integrate with existing Phase 11 systems instead of bypassing them.
+That includes:
+- learning state
+- promotion decisions
+- quarantine policy
+- rollout controller
+- rollback controller
+- version lineage
+- replay context
+
+---
+
+## Success standard for Phase 12
+
+Phase 12 succeeds only if the repository becomes materially better at:
+- rejecting weak trades
+- allocating capital only where justified
+- retaining more edge after costs
+- reducing capital leakage
+- avoiding destructive regimes
+- controlling overtrading
+- promoting only economically stable behavior
+
+If the system becomes more complex but not more capital-efficient, Phase 12 has failed.
+
+---
+
+## Final instruction to Codex / engineer
+
+Implement Phase 12 as a performance phase, not a novelty phase.
+At every step ask:
+
+**Does this improve net capital growth or reduce capital leakage in a measurable way?**
+
+If the answer is no, do not prioritize it.

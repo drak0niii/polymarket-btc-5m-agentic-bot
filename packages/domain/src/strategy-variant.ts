@@ -84,6 +84,15 @@ export interface StrategyPromotionDecision {
     realizedVsExpected: number | null;
     realizedPnl: number;
     improvementVsIncumbent: number | null;
+    netEdgeQuality?: number | null;
+    maxDrawdownPct?: number | null;
+    capitalLeakageRatio?: number | null;
+    executionEvRetention?: number | null;
+    regimeStabilityScore?: number | null;
+    stabilityAdjustedCapitalGrowthScore?: number | null;
+    compoundingEfficiencyScore?: number | null;
+    promotionGate?: Record<string, unknown>;
+    stabilityCheck?: Record<string, unknown>;
   };
   rollbackCriteria: StrategyRollbackTriggerCode[];
   decidedAt: string;

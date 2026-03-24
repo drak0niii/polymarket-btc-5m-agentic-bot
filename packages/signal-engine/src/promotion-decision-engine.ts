@@ -3,11 +3,24 @@ import type {
   StrategyPromotionDecision,
   StrategyRolloutStage,
 } from '@polymarket-btc-5m-agentic-bot/domain';
+import type { CapitalGrowthPromotionGateDecision } from './capital-growth-promotion-gate';
+import type { PromotionStabilityCheckDecision } from './promotion-stability-check';
 
 export class PromotionDecisionEngine {
   evaluate(input: {
     evidence: ShadowEvaluationEvidence;
     currentRolloutStage: StrategyRolloutStage;
+    economicControls?: {
+      capitalGrowthGate: CapitalGrowthPromotionGateDecision;
+      stabilityCheck: PromotionStabilityCheckDecision;
+      netEdgeQuality: number | null;
+      maxDrawdownPct: number | null;
+      capitalLeakageRatio: number | null;
+      executionEvRetention: number | null;
+      regimeStabilityScore: number | null;
+      stabilityAdjustedCapitalGrowthScore: number | null;
+      compoundingEfficiencyScore: number | null;
+    };
     now?: Date;
   }): StrategyPromotionDecision {
     const now = input.now ?? new Date();
@@ -48,9 +61,50 @@ export class PromotionDecisionEngine {
       return buildDecision('shadow_only', 'shadow_only', reasons, input.evidence, now);
     }
 
+    if (input.economicControls && !input.economicControls.stabilityCheck.stable) {
+      reasons.push(...input.economicControls.stabilityCheck.reasons);
+      if (input.currentRolloutStage !== 'shadow_only') {
+        return buildDecision(
+          'rollback',
+          'shadow_only',
+          reasons,
+          input.evidence,
+          now,
+          input.economicControls,
+        );
+      }
+      return buildDecision(
+        'reject',
+        'shadow_only',
+        reasons,
+        input.evidence,
+        now,
+        input.economicControls,
+      );
+    }
+
+    if (input.economicControls && !input.economicControls.capitalGrowthGate.passed) {
+      reasons.push(...input.economicControls.capitalGrowthGate.reasons);
+      return buildDecision(
+        'shadow_only',
+        'shadow_only',
+        reasons,
+        input.evidence,
+        now,
+        input.economicControls,
+      );
+    }
+
     if (degradedHealth) {
       reasons.push('degraded_health_limits_rollout');
-      return buildDecision('canary', 'canary_1pct', reasons, input.evidence, now);
+      return buildDecision(
+        'canary',
+        'canary_1pct',
+        reasons,
+        input.evidence,
+        now,
+        input.economicControls,
+      );
     }
 
     if (
@@ -61,7 +115,14 @@ export class PromotionDecisionEngine {
       (input.evidence.realizedVsExpected ?? 0) >= 1.05
     ) {
       reasons.push('multi_factor_promotion_evidence_satisfied');
-      return buildDecision('promote', 'full', reasons, input.evidence, now);
+      return buildDecision(
+        'promote',
+        'full',
+        reasons,
+        input.evidence,
+        now,
+        input.economicControls,
+      );
     }
 
     reasons.push('candidate_enters_bounded_canary');
@@ -71,6 +132,7 @@ export class PromotionDecisionEngine {
       reasons,
       input.evidence,
       now,
+      input.economicControls,
     );
   }
 }
@@ -81,6 +143,17 @@ function buildDecision(
   reasons: string[],
   evidence: ShadowEvaluationEvidence,
   now: Date,
+  economicControls?: {
+    capitalGrowthGate: CapitalGrowthPromotionGateDecision;
+    stabilityCheck: PromotionStabilityCheckDecision;
+    netEdgeQuality: number | null;
+    maxDrawdownPct: number | null;
+    capitalLeakageRatio: number | null;
+    executionEvRetention: number | null;
+    regimeStabilityScore: number | null;
+    stabilityAdjustedCapitalGrowthScore: number | null;
+    compoundingEfficiencyScore: number | null;
+  },
 ): StrategyPromotionDecision {
   return {
     verdict,
@@ -95,6 +168,16 @@ function buildDecision(
       realizedVsExpected: evidence.realizedVsExpected,
       realizedPnl: evidence.realizedPnl,
       improvementVsIncumbent: evidence.improvementVsIncumbent,
+      netEdgeQuality: economicControls?.netEdgeQuality ?? null,
+      maxDrawdownPct: economicControls?.maxDrawdownPct ?? null,
+      capitalLeakageRatio: economicControls?.capitalLeakageRatio ?? null,
+      executionEvRetention: economicControls?.executionEvRetention ?? null,
+      regimeStabilityScore: economicControls?.regimeStabilityScore ?? null,
+      stabilityAdjustedCapitalGrowthScore:
+        economicControls?.stabilityAdjustedCapitalGrowthScore ?? null,
+      compoundingEfficiencyScore: economicControls?.compoundingEfficiencyScore ?? null,
+      promotionGate: economicControls?.capitalGrowthGate.evidence,
+      stabilityCheck: economicControls?.stabilityCheck.evidence,
     },
     rollbackCriteria: [
       'realized_ev_collapse',
