@@ -4,6 +4,11 @@ import type { PrismaClient } from '@prisma/client';
 import { AppLogger } from '@worker/common/logger';
 import { DecisionLogService } from '@worker/runtime/decision-log.service';
 import { LearningStateStore } from '@worker/runtime/learning-state-store';
+import type { BaselineComparisonReport } from '@worker/validation/baseline-comparison';
+import type { LiveProofScorecard } from '@worker/validation/live-proof-scorecard';
+import type { RegimePerformanceReport } from '@worker/validation/regime-performance-report';
+import type { RollingBenchmarkScorecard } from '@worker/validation/rolling-benchmark-scorecard';
+import type { RetentionReport } from '@worker/validation/retention-report';
 import type { LearningState, TradeQualityScore } from '@polymarket-btc-5m-agentic-bot/domain';
 import {
   CapitalGrowthMetricsCalculator,
@@ -43,6 +48,11 @@ export interface CapitalGrowthReviewReport {
   profitableButUnstable: string[];
   shouldScale: string[];
   shouldReduce: string[];
+  baselineComparison: BaselineComparisonReport | null;
+  rollingBenchmarkScorecard: RollingBenchmarkScorecard | null;
+  retentionReport: RetentionReport | null;
+  regimePerformanceReport: RegimePerformanceReport | null;
+  liveProofScorecard: LiveProofScorecard | null;
 }
 
 export interface CapitalGrowthReviewResult {
@@ -88,6 +98,11 @@ export class CapitalGrowthReviewJob {
     now?: Date;
     learningState?: LearningState;
     capitalLeakReport?: CapitalLeakReport | null;
+    baselineComparison?: BaselineComparisonReport | null;
+    rollingBenchmarkScorecard?: RollingBenchmarkScorecard | null;
+    retentionReport?: RetentionReport | null;
+    regimePerformanceReport?: RegimePerformanceReport | null;
+    liveProofScorecard?: LiveProofScorecard | null;
   }): Promise<CapitalGrowthReviewResult> {
     const now = input.now ?? new Date();
     const learningState = input.learningState ?? (await this.learningStateStore.load());
@@ -100,6 +115,7 @@ export class CapitalGrowthReviewJob {
       (await readLatestCapitalLeakReport(
         path.join(this.learningStateStore.getPaths().rootDir, 'capital-leak'),
       ));
+    const latestValidationProof = await readLatestValidationProofBundle();
     const variants = Object.keys(learningState.strategyVariants)
       .sort()
       .map((strategyVariantId) =>
@@ -130,10 +146,32 @@ export class CapitalGrowthReviewJob {
       shouldReduce: variants
         .filter((variant) => variant.recommendation === 'reduce')
         .map((variant) => variant.strategyVariantId),
+      baselineComparison:
+        input.baselineComparison ?? latestValidationProof.baselineComparison,
+      rollingBenchmarkScorecard:
+        input.rollingBenchmarkScorecard ?? latestValidationProof.rollingBenchmarkScorecard,
+      retentionReport:
+        input.retentionReport ?? latestValidationProof.retentionReport,
+      regimePerformanceReport:
+        input.regimePerformanceReport ?? latestValidationProof.regimePerformanceReport,
+      liveProofScorecard:
+        input.liveProofScorecard ?? latestValidationProof.liveProofScorecard,
     };
     const warnings = [
       ...report.profitableButUnstable.map((variantId) => `profitable_but_unstable:${variantId}`),
       ...report.shouldReduce.map((variantId) => `reduce_capital:${variantId}`),
+      ...(report.baselineComparison?.underperformedBenchmarkIds ?? []).map(
+        (benchmarkId) => `underperforming_baseline:${benchmarkId}`,
+      ),
+      ...(report.rollingBenchmarkScorecard?.windows
+        .filter((window) => window.benchmarkComparisonState === 'underperforming')
+        .map((window) => `rolling_benchmark_underperformance:${window.windowKey}`) ?? []),
+      ...((report.liveProofScorecard?.blockers ?? []).map(
+        (blocker) => `live_proof_blocker:${blocker}`,
+      )),
+      ...((report.regimePerformanceReport?.weakestRegimes ?? []).map(
+        (regime) => `weak_regime_proof:${regime}`,
+      )),
     ];
 
     await this.persistReport(report);
@@ -147,6 +185,50 @@ export class CapitalGrowthReviewJob {
       },
       createdAt: now.toISOString(),
     });
+    if (report.liveProofScorecard) {
+      await this.decisionLogService.record({
+        category: 'promotion',
+        eventType: 'validation.live_proof_scorecard',
+        summary: report.liveProofScorecard.summary,
+        payload: {
+          liveProofScorecard: report.liveProofScorecard,
+        },
+        createdAt: now.toISOString(),
+      });
+    }
+    if (report.retentionReport) {
+      await this.decisionLogService.record({
+        category: 'promotion',
+        eventType: 'validation.retention_report',
+        summary: `Retention report generated across ${report.retentionReport.perRegime.length} regimes.`,
+        payload: {
+          retentionReport: report.retentionReport,
+        },
+        createdAt: now.toISOString(),
+      });
+    }
+    if (report.regimePerformanceReport) {
+      await this.decisionLogService.record({
+        category: 'promotion',
+        eventType: 'validation.regime_performance_report',
+        summary: `Regime performance report generated across ${report.regimePerformanceReport.perRegime.length} regimes.`,
+        payload: {
+          regimePerformanceReport: report.regimePerformanceReport,
+        },
+        createdAt: now.toISOString(),
+      });
+    }
+    if (report.rollingBenchmarkScorecard) {
+      await this.decisionLogService.record({
+        category: 'promotion',
+        eventType: 'validation.rolling_benchmark_scorecard',
+        summary: `Rolling benchmark scorecard generated across ${report.rollingBenchmarkScorecard.windows.length} windows.`,
+        payload: {
+          rollingBenchmarkScorecard: report.rollingBenchmarkScorecard,
+        },
+        createdAt: now.toISOString(),
+      });
+    }
 
     if (warnings.length > 0) {
       this.logger.warn('Capital growth review found unstable or reducible variants.', {
@@ -298,6 +380,57 @@ export async function readLatestCapitalGrowthReport(
   } catch (error) {
     if (isNotFound(error)) {
       return null;
+    }
+    throw error;
+  }
+}
+
+export async function readLatestBaselineComparison(
+  validationArtifactPath = path.resolve(
+    __dirname,
+    '../../../../artifacts/p23-validation/latest.json',
+  ),
+): Promise<BaselineComparisonReport | null> {
+  return (await readLatestValidationProofBundle(validationArtifactPath)).baselineComparison;
+}
+
+export async function readLatestValidationProofBundle(
+  validationArtifactPath = path.resolve(
+    __dirname,
+    '../../../../artifacts/p23-validation/latest.json',
+  ),
+): Promise<{
+  baselineComparison: BaselineComparisonReport | null;
+  rollingBenchmarkScorecard: RollingBenchmarkScorecard | null;
+  retentionReport: RetentionReport | null;
+  regimePerformanceReport: RegimePerformanceReport | null;
+  liveProofScorecard: LiveProofScorecard | null;
+}> {
+  try {
+    const content = await fs.readFile(validationArtifactPath, 'utf8');
+    const parsed = JSON.parse(content) as {
+      baselineComparison?: BaselineComparisonReport | null;
+      rollingBenchmarkScorecard?: RollingBenchmarkScorecard | null;
+      retentionReport?: RetentionReport | null;
+      regimePerformanceReport?: RegimePerformanceReport | null;
+      liveProofScorecard?: LiveProofScorecard | null;
+    };
+    return {
+      baselineComparison: parsed.baselineComparison ?? null,
+      rollingBenchmarkScorecard: parsed.rollingBenchmarkScorecard ?? null,
+      retentionReport: parsed.retentionReport ?? null,
+      regimePerformanceReport: parsed.regimePerformanceReport ?? null,
+      liveProofScorecard: parsed.liveProofScorecard ?? null,
+    };
+  } catch (error) {
+    if (isNotFound(error)) {
+      return {
+        baselineComparison: null,
+        rollingBenchmarkScorecard: null,
+        retentionReport: null,
+        regimePerformanceReport: null,
+        liveProofScorecard: null,
+      };
     }
     throw error;
   }

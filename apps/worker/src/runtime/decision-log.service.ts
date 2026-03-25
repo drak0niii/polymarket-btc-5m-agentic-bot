@@ -35,6 +35,7 @@ export class DecisionLogService {
       'signal.admission_decision',
       'signal.execution_decision',
       'trade.post_trade_attribution',
+      'trade.loss_attribution_classified',
       'runtime.readiness_dashboard',
     ];
 
@@ -53,6 +54,38 @@ export class DecisionLogService {
     return {
       coverage,
       healthy: coverage >= 0.6,
+    };
+  }
+
+  summarizeProofCoverage(events: unknown[]): {
+    coverage: number;
+    healthy: boolean;
+    presentFamilies: string[];
+  } {
+    const requiredFamilies = [
+      'validation.live_proof_scorecard',
+      'validation.retention_report',
+      'validation.regime_performance_report',
+      'learning.live_proof_review',
+    ];
+
+    const seen = new Set(
+      (events ?? [])
+        .map((event) =>
+          event && typeof event === 'object' && 'eventType' in (event as Record<string, unknown>)
+            ? String((event as Record<string, unknown>).eventType)
+            : '',
+        )
+        .filter((value) => value.length > 0),
+    );
+
+    const presentFamilies = requiredFamilies.filter((family) => seen.has(family));
+    const coverage =
+      requiredFamilies.length > 0 ? presentFamilies.length / requiredFamilies.length : 0;
+    return {
+      coverage,
+      healthy: coverage >= 0.75,
+      presentFamilies,
     };
   }
 }

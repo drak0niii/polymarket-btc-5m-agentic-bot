@@ -253,6 +253,7 @@ export interface LearningCycleSummary {
   degradedContexts: string[];
   warnings: string[];
   errors: string[];
+  reviewOutputs?: Record<string, unknown> | null;
 }
 
 export interface LearningEvent {

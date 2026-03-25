@@ -176,6 +176,18 @@ export class VersionLineageRegistry {
     return resolveIndexRecords(state, state.byStrategyVariantId[strategyVariantId], limit);
   }
 
+  async getLatestByTag(tag: string, limit = 20): Promise<VersionLineageDecisionRecord[]> {
+    const normalizedTag = tag.trim();
+    if (normalizedTag.length === 0) {
+      return [];
+    }
+    const state = await this.load();
+    return Object.values(state.decisions)
+      .filter((record) => record.tags.includes(normalizedTag))
+      .sort((left, right) => right.recordedAt.localeCompare(left.recordedAt))
+      .slice(0, limit);
+  }
+
   async getLatestDecisions(limit = 50): Promise<VersionLineageDecisionRecord[]> {
     const state = await this.load();
     return Object.values(state.decisions)
@@ -376,6 +388,48 @@ export function buildAllocationPolicyVersionLineage(input: {
     allocationDecisionKey: input.allocationDecisionKey ?? null,
     parameterHash,
   };
+}
+
+export function buildValidationProofTags(input: {
+  mode: 'empirical' | 'synthetic_smoke';
+  promotableEvidence: boolean;
+  underperformedBenchmarkIds?: string[];
+  blockers?: string[];
+}): string[] {
+  return Array.from(
+    new Set(
+      [
+        'phase6',
+        'validation_proof',
+        input.mode === 'empirical' ? 'empirical_evidence' : 'synthetic_smoke_evidence',
+        input.promotableEvidence ? 'promotable_evidence' : 'non_promotable_evidence',
+        ...((input.underperformedBenchmarkIds ?? []).map(
+          (benchmarkId) => `underperformed:${sanitizeKey(benchmarkId)}`,
+        )),
+        ...((input.blockers ?? []).map((blocker) => `blocker:${sanitizeKey(blocker)}`)),
+      ].filter((value) => value.length > 0),
+    ),
+  ).sort();
+}
+
+export function buildLossAttributionTags(input: {
+  lossCategory: string;
+  primaryLeakageDriver: string;
+  secondaryLeakageDrivers?: string[];
+}): string[] {
+  return Array.from(
+    new Set(
+      [
+        'item1',
+        'loss_attribution',
+        `loss_category:${sanitizeKey(input.lossCategory)}`,
+        `primary_leakage:${sanitizeKey(input.primaryLeakageDriver)}`,
+        ...((input.secondaryLeakageDrivers ?? []).map(
+          (driver) => `secondary_leakage:${sanitizeKey(driver)}`,
+        )),
+      ].filter((value) => value.length > 0),
+    ),
+  ).sort();
 }
 
 export function hashStructuredValue(value: unknown): string {

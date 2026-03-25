@@ -8,6 +8,7 @@ import { BtcReferenceSnapshot } from './syncBtcReference.job';
 import {
   FeatureBuilder,
   SignalFeatures,
+  type ToxicityTrendPoint,
 } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { BtcFiveMinuteTradeableUniverse } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { MarketEligibilityService } from '@polymarket-btc-5m-agentic-bot/signal-engine';
@@ -35,6 +36,8 @@ import { EdgeHalfLifePolicy } from '@polymarket-btc-5m-agentic-bot/signal-engine
 import { ResearchGovernancePolicy } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { RobustnessSuite } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { MultiObjectivePromotionScore } from '@polymarket-btc-5m-agentic-bot/signal-engine';
+import { ToxicityPolicy } from '@polymarket-btc-5m-agentic-bot/signal-engine';
+import { createAlphaAttribution } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import {
   buildStrategyVariantId,
   type LearningState,
@@ -105,6 +108,7 @@ export class BuildSignalsJob {
   private readonly researchGovernancePolicy = new ResearchGovernancePolicy();
   private readonly robustnessSuite = new RobustnessSuite();
   private readonly promotionScore = new MultiObjectivePromotionScore();
+  private readonly toxicityPolicy = new ToxicityPolicy();
   private readonly walkForwardValidator = new WalkForwardValidator();
   private readonly tradeAdmissionGate = new TradeAdmissionGate();
   private readonly bookFreshnessFilter = new BookFreshnessFilter();
@@ -200,6 +204,13 @@ export class BuildSignalsJob {
       orderBy: { updatedAt: 'desc' },
       take: 100,
     });
+    const prismaAny = this.prisma as any;
+    const recentAuditEvents = prismaAny.auditEvent?.findMany
+      ? ((await prismaAny.auditEvent.findMany({
+          orderBy: { createdAt: 'desc' },
+          take: 120,
+        })) as unknown[])
+      : [];
 
     let created = 0;
     const now = new Date();
@@ -286,6 +297,13 @@ export class BuildSignalsJob {
         continue;
       }
       const regime = this.regimeClassifier.classify(features);
+      const toxicity = this.toxicityPolicy.evaluate({
+        features,
+        regimeLabel: regime.label,
+        structuralToxicityBias: regime.toxicityBias,
+        signalAgeMs: 0,
+        recentHistory: this.selectRecentToxicityHistory(recentAuditEvents, market.id),
+      });
 
       const expiryCheck = this.noTradeNearExpiryFilter.evaluate({
         timeToExpirySeconds: features.timeToExpirySeconds,
@@ -382,6 +400,7 @@ export class BuildSignalsJob {
         priorProbability: prior.probabilityUp,
         features,
         regime,
+        toxicityPenalty: toxicity.posteriorPenalty,
       });
       const marketImpliedProb = this.marketImpliedProbability(orderbook);
       const microstructure = this.microstructureModel.derive({
@@ -441,6 +460,54 @@ export class BuildSignalsJob {
         features,
         halfLifeMultiplier: halfLife.decayMultiplier,
         freshnessHealthy: freshnessCheck.passed,
+        threshold:
+          edgeDefinition.admissionThresholdPolicy.minimumNetEdge * toxicity.thresholdMultiplier,
+      });
+      const signalDirectionSign = edge.edge < 0 ? -1 : 1;
+      const phaseTwoContext = {
+        flowImbalanceProxy: features.flowImbalanceProxy,
+        flowIntensity: features.flowIntensity,
+        bookUpdateStress: features.bookUpdateStress,
+        btcMoveTransmission: features.btcMoveTransmission,
+        btcLinkageConfidence: features.btcLinkageConfidence,
+        laggedBtcMoveTransmission: features.laggedBtcMoveTransmission,
+        nonlinearBtcMoveSensitivity: features.nonlinearBtcMoveSensitivity,
+        btcPathDivergence: features.btcPathDivergence,
+        transmissionConsistency: features.transmissionConsistency,
+        imbalancePersistence: features.imbalancePersistence,
+        imbalanceReversalProbability: features.imbalanceReversalProbability,
+        quoteInstabilityBeforeMove: features.quoteInstabilityBeforeMove,
+        depthDepletionAsymmetry: features.depthDepletionAsymmetry,
+        signalDecayPressure: features.signalDecayPressure,
+        marketStateTransition: features.marketStateTransition,
+        marketStateTransitionStrength: features.marketStateTransitionStrength,
+        marketArchetype: features.marketArchetype,
+        marketArchetypeConfidence: features.marketArchetypeConfidence,
+        prior,
+        posterior,
+        regimeReasonCodes: regime.reasonCodes,
+      };
+      const alphaAttribution = createAlphaAttribution({
+        rawForecastProbability: posterior.posteriorProbability,
+        marketImpliedProbability: marketImpliedProb,
+        confidenceAdjustedEdge: edge.edge,
+        paperEdge: signalDirectionSign * halfLife.effectiveEdge,
+        expectedExecutionCost: {
+          feeCost: executableEv.expectedFee,
+          slippageCost: Math.max(0, features.spread) + executableEv.expectedSlippage,
+          adverseSelectionCost:
+            executableEv.expectedAdverseSelectionCost +
+            this.expectedImpact(features) * 0.5,
+          fillDecayCost: executableEv.expectedMissedFillCost,
+          cancelReplaceOverheadCost: executableEv.expectedCancellationCost,
+          missedOpportunityCost: 0,
+          venuePenalty: 0,
+        },
+        expectedNetEdge:
+          executableEdge.finalNetEdge != null
+            ? signalDirectionSign * executableEdge.finalNetEdge
+            : null,
+        capturedAt: now.toISOString(),
       });
       const noTradeZone = this.noTradeZonePolicy.evaluate({
         timeToExpirySeconds: features.timeToExpirySeconds,
@@ -488,13 +555,13 @@ export class BuildSignalsJob {
           promotion.promoted,
         riskHealthy:
           expiryCheck.passed && lateWindowCheck.passed && volatilityCheck.passed,
-        regimeAllowed: regime.tradingAllowed,
+        regimeAllowed: regime.tradingAllowed && !toxicity.temporarilyBlockRegime,
         noTradeZoneBlocked: noTradeZone.blocked,
         halfLifeExpired: halfLife.expired,
         paperEdgeDetected:
           (executableEdge.rawModelEdge ?? 0) > executableEdge.threshold &&
           (executableEdge.finalNetEdge ?? 0) <= executableEdge.threshold,
-        admissionThreshold: edgeDefinition.admissionThresholdPolicy.minimumNetEdge,
+        admissionThreshold: executableEdge.threshold,
         executableEdge,
         minimumConfidence: edgeDefinition.admissionThresholdPolicy.minimumConfidence,
       });
@@ -512,6 +579,9 @@ export class BuildSignalsJob {
         marketId: market.id,
         payload: {
           edgeDefinition,
+          phaseTwoContext,
+          toxicity,
+          alphaAttribution,
           regime,
           strategyFamily,
           microstructure,
@@ -542,7 +612,16 @@ export class BuildSignalsJob {
             `family=${strategyFamily.family}`,
             `noTrade=${noTradeZone.reasons.join('|') || 'none'}`,
           ].join(','),
+          marketArchetype: features.marketArchetype,
+          marketStateTransition: features.marketStateTransition,
+          toxicityState: toxicity.toxicityState,
+          expectedRetainedEdge: alphaAttribution.expectedNetEdge,
         });
+        const phaseSevenEvidenceTags = [
+          `archetype:${features.marketArchetype}`,
+          `toxicity:${toxicity.toxicityState}`,
+          `transition:${features.marketStateTransition}`,
+        ];
         await this.versionLineageRegistry.recordDecision({
           decisionId: noTradeDecision.signalDecisionId ?? noTradeDecision.signalId,
           decisionType: 'signal_build',
@@ -586,6 +665,7 @@ export class BuildSignalsJob {
                 edgeDefinitionVersion: edgeDefinition.version,
                 admission,
                 noTradeWindowSeconds: appEnv.NO_TRADE_WINDOW_SECONDS,
+                toxicity,
               },
             }),
             allocationPolicyVersion: null,
@@ -616,6 +696,9 @@ export class BuildSignalsJob {
             },
             activeParameterBundle: {
               edgeDefinition,
+              phaseTwoContext,
+              toxicity,
+              alphaAttribution,
               admission,
               researchGovernance,
               robustness,
@@ -625,7 +708,7 @@ export class BuildSignalsJob {
             venueMode: null,
             venueUncertainty: null,
           },
-          tags: ['wave5', 'signal-build', 'rejected'],
+          tags: ['wave5', 'signal-build', 'rejected', ...phaseSevenEvidenceTags],
         });
         await this.decisionLogService.record({
           category: 'admission',
@@ -636,6 +719,9 @@ export class BuildSignalsJob {
             admitted: false,
             reasonCode: admission.reasonCode,
             reasonMessage: admission.reasonMessage,
+            phaseTwoContext,
+            toxicity,
+            alphaAttribution,
             executableEdge: admission.executableEdge,
             strategyFamily,
             noTradeZone,
@@ -657,6 +743,11 @@ export class BuildSignalsJob {
       }
 
       const signalId = randomUUID();
+      const phaseSevenEvidenceTags = [
+        `archetype:${features.marketArchetype}`,
+        `toxicity:${toxicity.toxicityState}`,
+        `transition:${features.marketStateTransition}`,
+      ];
       await (this.prisma as any).signal.create({
         data: {
           id: signalId,
@@ -713,12 +804,13 @@ export class BuildSignalsJob {
           executionPolicyVersion: null,
           riskPolicyVersion: buildRiskPolicyVersionLineage({
             policyId: 'signal-admission',
-            parameters: {
-              edgeDefinitionVersion: edgeDefinition.version,
-              executableEdge: admission.executableEdge,
-              noTradeWindowSeconds: appEnv.NO_TRADE_WINDOW_SECONDS,
-            },
-          }),
+              parameters: {
+                edgeDefinitionVersion: edgeDefinition.version,
+                executableEdge: admission.executableEdge,
+                noTradeWindowSeconds: appEnv.NO_TRADE_WINDOW_SECONDS,
+                toxicity,
+              },
+            }),
           allocationPolicyVersion: null,
         },
         replay: {
@@ -746,8 +838,11 @@ export class BuildSignalsJob {
             activeRollout: deploymentRegistry.activeRollout,
           },
           activeParameterBundle: {
-            edgeDefinition,
-            admission,
+              edgeDefinition,
+              phaseTwoContext,
+              toxicity,
+              alphaAttribution,
+              admission,
             researchGovernance,
             robustness,
             promotion,
@@ -756,7 +851,7 @@ export class BuildSignalsJob {
           venueMode: null,
           venueUncertainty: null,
         },
-        tags: ['wave5', 'signal-build', 'admitted'],
+        tags: ['wave5', 'signal-build', 'admitted', ...phaseSevenEvidenceTags],
       });
       await this.decisionLogService.record({
         category: 'admission',
@@ -766,6 +861,9 @@ export class BuildSignalsJob {
         signalId,
         payload: {
           admitted: true,
+          phaseTwoContext,
+          toxicity,
+          alphaAttribution,
           executableEdge: admission.executableEdge,
           strategyFamily,
           noTradeZone,
@@ -836,11 +934,19 @@ export class BuildSignalsJob {
         expiresAt: params.expiresAt,
       });
       const regime = this.regimeClassifier.classify(features);
+      const toxicity = this.toxicityPolicy.evaluate({
+        features,
+        regimeLabel: regime.label,
+        structuralToxicityBias: regime.toxicityBias,
+        signalAgeMs: 0,
+        recentHistory: [],
+      });
       const prior = this.priorModel.evaluate(features, regime);
       const posterior = this.posteriorUpdate.apply({
         priorProbability: prior.probabilityUp,
         features,
         regime,
+        toxicityPenalty: toxicity.posteriorPenalty,
       });
       const edge = this.regimeConditionedEdgeModel.evaluate({
         priorProbability: prior.probabilityUp,
@@ -915,6 +1021,10 @@ export class BuildSignalsJob {
     observedAt: Date;
     reasonCode: string;
     reasonMessage: string;
+    marketArchetype: SignalFeatures['marketArchetype'];
+    marketStateTransition: SignalFeatures['marketStateTransition'];
+    toxicityState: ReturnType<ToxicityPolicy['evaluate']>['toxicityState'];
+    expectedRetainedEdge: number | null;
   }): Promise<{ signalId: string; signalDecisionId: string | null }> {
     const signalId = randomUUID();
     let signalDecisionId: string | null = null;
@@ -961,7 +1071,17 @@ export class BuildSignalsJob {
           signalId,
           verdict: 'rejected',
           reasonCode: input.reasonCode,
-          reasonMessage: input.reasonMessage,
+          reasonMessage: [
+            input.reasonMessage,
+            `archetype=${input.marketArchetype}`,
+            `transition=${input.marketStateTransition}`,
+            `toxicity=${input.toxicityState}`,
+            `expectedRetainedEdge=${
+              input.expectedRetainedEdge != null
+                ? input.expectedRetainedEdge.toFixed(6)
+                : 'unknown'
+            }`,
+          ].join(','),
           expectedEv: input.expectedEv,
           positionSize: null,
           decisionAt: input.observedAt,
@@ -1082,6 +1202,7 @@ export class BuildSignalsJob {
     features: SignalFeatures;
     halfLifeMultiplier: number;
     freshnessHealthy: boolean;
+    threshold: number;
   }): ExecutableEdgeEstimate {
     const spreadAdjustedEdge = input.rawEdge - Math.max(0, input.features.spread);
     const slippageAdjustedEdge =
@@ -1109,7 +1230,7 @@ export class BuildSignalsJob {
       staleSignalAdjustedEdge,
       inventoryAdjustedEdge,
       finalNetEdge: inventoryAdjustedEdge,
-      threshold: this.edgeDefinitionService.getDefinition().admissionThresholdPolicy.minimumNetEdge,
+      threshold: input.threshold,
       missingInputs: Number.isFinite(input.executableEv.expectedEv) ? [] : ['expected_ev'],
       staleInputs: input.freshnessHealthy ? [] : ['orderbook'],
       paperEdgeBlocked:
@@ -1141,6 +1262,73 @@ export class BuildSignalsJob {
       return 'europe';
     }
     return 'us';
+  }
+
+  private selectRecentToxicityHistory(
+    auditEvents: unknown[],
+    marketId: string,
+  ): ToxicityTrendPoint[] {
+    const entries = (auditEvents ?? [])
+      .map((event) => this.extractToxicityHistoryEntry(event))
+      .filter(
+        (
+          entry,
+        ): entry is ToxicityTrendPoint & {
+          marketId: string | null;
+        } => entry != null,
+      );
+    const byMarket = entries.filter((entry) => entry.marketId === marketId);
+    const selected = byMarket.length >= 3 ? byMarket : entries;
+    return selected
+      .slice(0, 8)
+      .map((entry) => ({
+        toxicityScore: entry.toxicityScore,
+        toxicityState: entry.toxicityState,
+        recommendedAction: entry.recommendedAction,
+        capturedAt: entry.capturedAt,
+      }));
+  }
+
+  private extractToxicityHistoryEntry(
+    event: unknown,
+  ): (ToxicityTrendPoint & { marketId: string | null }) | null {
+    if (!event || typeof event !== 'object') {
+      return null;
+    }
+
+    const record = event as Record<string, unknown>;
+    const metadata =
+      record.metadata && typeof record.metadata === 'object'
+        ? (record.metadata as Record<string, unknown>)
+        : null;
+    const toxicity =
+      metadata?.toxicity && typeof metadata.toxicity === 'object'
+        ? (metadata.toxicity as Record<string, unknown>)
+        : null;
+    const toxicityScore =
+      toxicity && typeof toxicity.toxicityScore === 'number' ? toxicity.toxicityScore : null;
+    if (toxicityScore == null) {
+      return null;
+    }
+
+    return {
+      toxicityScore,
+      toxicityState:
+        toxicity && typeof toxicity.toxicityState === 'string'
+          ? toxicity.toxicityState
+          : null,
+      recommendedAction:
+        toxicity && typeof toxicity.recommendedAction === 'string'
+          ? toxicity.recommendedAction
+          : null,
+      capturedAt:
+        record.createdAt instanceof Date
+          ? record.createdAt.toISOString()
+          : typeof record.createdAt === 'string'
+            ? record.createdAt
+            : null,
+      marketId: typeof record.marketId === 'string' ? record.marketId : null,
+    };
   }
 
   private normalizeOrderbook(orderbook: {

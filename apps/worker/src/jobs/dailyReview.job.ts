@@ -19,9 +19,12 @@ import {
   type ExecutionLearningObservation,
 } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import {
+  BenchmarkRelativeSizing,
   CapitalGrowthMetricsCalculator,
   CapitalAllocationEngine,
+  LiveSizingFeedbackPolicy,
   PortfolioLearningStateBuilder,
+  buildRegimeLocalSizingSummary,
   RegimeProfitabilityRanker,
   StrategyCorrelationMonitor,
   TradeQualityHistoryStore,
@@ -38,6 +41,8 @@ import {
   PromotionStabilityCheck,
   ShadowEvaluationEngine,
   StrategyQuarantinePolicy,
+  ToxicityTrend,
+  createAlphaAttribution,
 } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import {
   VenueHealthLearningStore,
@@ -59,8 +64,11 @@ import {
   buildFeatureSetVersionLineage,
   buildRiskPolicyVersionLineage,
   buildStrategyVersionLineage,
+  buildValidationProofTags,
 } from '@worker/runtime/version-lineage-registry';
 import { CapitalGrowthReviewJob } from './capitalGrowthReview.job';
+import { buildRetentionContextReport } from '../validation/retention-context-report';
+import { buildCalibrationDriftAlerts } from '../validation/calibration-drift-alerts';
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -91,6 +99,9 @@ export class DailyReviewJob {
   private readonly capitalGrowthReviewJob: CapitalGrowthReviewJob;
   private readonly venueUncertaintyDetector = new VenueUncertaintyDetector();
   private readonly venueModePolicy = new VenueModePolicy();
+  private readonly liveSizingFeedbackPolicy = new LiveSizingFeedbackPolicy();
+  private readonly benchmarkRelativeSizing = new BenchmarkRelativeSizing();
+  private readonly toxicityTrend = new ToxicityTrend();
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -248,13 +259,98 @@ export class DailyReviewJob {
         learningState: portfolioLearning.learningState,
         capitalLeakReport: capitalLeakReview.report,
       });
-      const summary = appendWarnings(result.summary, [
-        ...executionLearning.warnings,
-        ...portfolioLearning.warnings,
-        ...venueLearning.warnings,
-        ...capitalLeakReview.warnings,
-        ...capitalGrowthReview.warnings,
-      ]);
+      const baselineBenchmarkReview = await this.runPhaseFiveBaselineBenchmarkReview({
+        now: completedAt,
+        baselineComparison: capitalGrowthReview.report.baselineComparison,
+      });
+      const benchmarkRelativeSizingReview = await this.runItemSevenBenchmarkRelativeSizingReview({
+        now: completedAt,
+        baselineComparison: capitalGrowthReview.report.baselineComparison,
+      });
+      const rollingBenchmarkScorecardReview =
+        await this.runItemEightRollingBenchmarkScorecardReview({
+          now: completedAt,
+          rollingBenchmarkScorecard: capitalGrowthReview.report.rollingBenchmarkScorecard,
+        });
+      const validationProofReview = await this.runPhaseSixValidationProofReview({
+        cycleId,
+        now: completedAt,
+        learningState: portfolioLearning.learningState,
+        registry: governed.registry,
+        capitalGrowthReport: capitalGrowthReview.report,
+      });
+      const alphaAttributionReview = await this.runPhaseOneAlphaAttributionReview({
+        now: completedAt,
+        from: window.from,
+        to: window.to,
+      });
+      const retentionContextReview = await this.runItemTwoRetentionContextReview({
+        now: completedAt,
+        from: window.from,
+        to: window.to,
+      });
+      const calibrationDriftAlertReview =
+        await this.runItemTwelveCalibrationDriftAlertReview({
+          now: completedAt,
+          from: window.from,
+          to: window.to,
+        });
+      const regimeLocalSizingReview = await this.runItemSixRegimeLocalSizingReview({
+        now: completedAt,
+        retentionContextSummary: retentionContextReview.summary,
+      });
+      const lossAttributionReview = await this.runItemOneLossAttributionReview({
+        now: completedAt,
+        from: window.from,
+        to: window.to,
+      });
+      const toxicityReview = await this.runPhaseThreeToxicityReview({
+        now: completedAt,
+        from: window.from,
+        to: window.to,
+      });
+      const liveSizingFeedbackReview = await this.runPhaseFourLiveSizingFeedbackReview({
+        now: completedAt,
+        from: window.from,
+        to: window.to,
+        learningState: portfolioLearning.learningState,
+        capitalGrowthReport: capitalGrowthReview.report,
+      });
+      const summary = attachReviewOutputs(
+        appendWarnings(result.summary, [
+          ...executionLearning.warnings,
+          ...portfolioLearning.warnings,
+          ...venueLearning.warnings,
+          ...capitalLeakReview.warnings,
+          ...capitalGrowthReview.warnings,
+          ...baselineBenchmarkReview.warnings,
+          ...benchmarkRelativeSizingReview.warnings,
+          ...rollingBenchmarkScorecardReview.warnings,
+          ...validationProofReview.warnings,
+          ...alphaAttributionReview.warnings,
+          ...retentionContextReview.warnings,
+          ...calibrationDriftAlertReview.warnings,
+          ...regimeLocalSizingReview.warnings,
+          ...lossAttributionReview.warnings,
+          ...toxicityReview.warnings,
+          ...liveSizingFeedbackReview.warnings,
+        ]),
+        {
+          alphaAttribution: alphaAttributionReview.summary,
+          retentionContext: retentionContextReview.summary,
+          calibrationDriftAlerts: calibrationDriftAlertReview.summary,
+          regimeLocalSizing: regimeLocalSizingReview.summary,
+          lossAttribution: lossAttributionReview.summary,
+          toxicity: toxicityReview.summary,
+          baselineBenchmarks: capitalGrowthReview.report.baselineComparison,
+          benchmarkRelativeSizing: benchmarkRelativeSizingReview.summary,
+          rollingBenchmarkScorecard: rollingBenchmarkScorecardReview.summary,
+          retentionReport: capitalGrowthReview.report.retentionReport,
+          regimePerformanceReport: capitalGrowthReview.report.regimePerformanceReport,
+          liveProofScorecard: capitalGrowthReview.report.liveProofScorecard,
+          liveSizingFeedback: liveSizingFeedbackReview.summary,
+        },
+      );
       const finalState: LearningState = {
         ...portfolioLearning.learningState,
         lastCycleSummary: summary,
@@ -1598,6 +1694,1317 @@ export class DailyReviewJob {
       .filter((observation): observation is PortfolioLearningObservation => observation != null)
       .sort((left, right) => left.observedAt.localeCompare(right.observedAt));
   }
+
+  private async runPhaseOneAlphaAttributionReview(input: {
+    now: Date;
+    from: Date;
+    to: Date;
+  }): Promise<{ warnings: string[]; summary: Record<string, unknown> }> {
+    const prismaAny = this.prisma as any;
+    if (!prismaAny.executionDiagnostic?.findMany) {
+      return { warnings: [], summary: {} };
+    }
+
+    const diagnostics = ((await prismaAny.executionDiagnostic.findMany({
+      where: {
+        capturedAt: {
+          gte: input.from,
+          lte: input.to,
+        },
+      },
+      orderBy: {
+        capturedAt: 'asc',
+      },
+    })) as Array<Record<string, unknown>>)
+      .filter((diagnostic) => readString(diagnostic.orderId) != null);
+    if (diagnostics.length === 0) {
+      return { warnings: [], summary: {} };
+    }
+
+    const orderIds = diagnostics
+      .map((diagnostic) => readString(diagnostic.orderId))
+      .filter((value): value is string => value != null);
+    const orders = prismaAny.order?.findMany
+      ? ((await prismaAny.order.findMany({
+          where: {
+            id: {
+              in: orderIds,
+            },
+          },
+          include: {
+            signal: true,
+          },
+        })) as Array<Record<string, unknown>>)
+      : [];
+    const orderById = new Map(
+      orders.map((order) => [readString(order.id) ?? '', order]),
+    );
+
+    const attributions = diagnostics
+      .map((diagnostic) => {
+        const orderId = readString(diagnostic.orderId);
+        if (!orderId) {
+          return null;
+        }
+
+        const order = orderById.get(orderId) ?? null;
+        const signal =
+          order?.signal && typeof order.signal === 'object'
+            ? (order.signal as Record<string, unknown>)
+            : null;
+        const signalDirectionSign =
+          (readNumber(signal?.edge, null) ?? 0) < 0 ||
+          readString(signal?.outcome) === 'NO'
+            ? -1
+            : 1;
+
+        return {
+          orderId,
+          strategyVersionId:
+            readString(diagnostic.strategyVersionId) ??
+            readString(order?.strategyVersionId) ??
+            readString(signal?.strategyVersionId),
+          regime: readString(diagnostic.regime) ?? readString(signal?.regime),
+          attribution: createAlphaAttribution({
+            rawForecastProbability: readNumber(signal?.posteriorProbability, 0.5) ?? 0.5,
+            marketImpliedProbability: readNumber(signal?.marketImpliedProb, 0.5) ?? 0.5,
+            confidenceAdjustedEdge:
+              readNumber(signal?.edge, null) ??
+              readNumber(diagnostic.edgeAtSignal, null),
+            paperEdge:
+              readNumber(signal?.expectedEv, null) != null
+                ? signalDirectionSign * Math.abs(readNumber(signal?.expectedEv, 0) ?? 0)
+                : readNumber(signal?.edge, null),
+            expectedExecutionCost: {
+              feeCost: readNumber(diagnostic.expectedFee, 0) ?? 0,
+              slippageCost: readNumber(diagnostic.expectedSlippage, 0) ?? 0,
+              adverseSelectionCost: Math.max(
+                0,
+                (readNumber(diagnostic.edgeAtSignal, null) ?? 0) -
+                  (readNumber(diagnostic.edgeAtFill, null) ?? readNumber(diagnostic.edgeAtSignal, 0) ?? 0),
+              ),
+              fillDecayCost: 0,
+              cancelReplaceOverheadCost: 0,
+              missedOpportunityCost: 0,
+              venuePenalty: 0,
+            },
+            expectedNetEdge: readNumber(diagnostic.expectedEv, null),
+            realizedExecutionCost: {
+              feeCost: readNumber(diagnostic.realizedFee, 0) ?? 0,
+              slippageCost: readNumber(diagnostic.realizedSlippage, 0) ?? 0,
+              adverseSelectionCost: Math.max(
+                0,
+                (readNumber(diagnostic.edgeAtSignal, null) ?? 0) -
+                  (readNumber(diagnostic.edgeAtFill, null) ?? readNumber(diagnostic.edgeAtSignal, 0) ?? 0),
+              ),
+              fillDecayCost: 0,
+              cancelReplaceOverheadCost: 0,
+              missedOpportunityCost: 0,
+              venuePenalty: 0,
+            },
+            realizedNetEdge: readNumber(diagnostic.realizedEv, null),
+            capturedAt: readDateString(diagnostic.capturedAt) ?? input.now.toISOString(),
+          }),
+        };
+      })
+      .filter(
+        (
+          entry,
+        ): entry is {
+          orderId: string;
+          strategyVersionId: string | null;
+          regime: string | null;
+          attribution: ReturnType<typeof createAlphaAttribution>;
+        } => entry != null,
+      );
+    if (attributions.length === 0) {
+      return { warnings: [], summary: {} };
+    }
+
+    const averageExpectedNetEdge = averageNullable(
+      attributions.map((entry) => entry.attribution.expectedNetEdge),
+    );
+    const averageRealizedNetEdge = averageNullable(
+      attributions.map((entry) => entry.attribution.realizedNetEdge),
+    );
+    const averageRetentionRatio = averageNullable(
+      attributions.map((entry) => entry.attribution.retentionRatio),
+    );
+    const degradedRetentionCount = attributions.filter(
+      (entry) =>
+        entry.attribution.retentionRatio != null && entry.attribution.retentionRatio < 0.5,
+    ).length;
+
+    if (prismaAny.auditEvent?.create) {
+      await prismaAny.auditEvent.create({
+        data: {
+          eventType: 'learning.alpha_attribution_review',
+          message: 'Daily alpha attribution review completed.',
+          metadata: {
+            window: {
+              from: input.from.toISOString(),
+              to: input.to.toISOString(),
+            },
+            sampleCount: attributions.length,
+            averageExpectedNetEdge,
+            averageRealizedNetEdge,
+            averageRetentionRatio,
+            degradedRetentionCount,
+            recentAlphaAttributions: attributions.slice(-5),
+          } as object,
+        },
+      });
+    }
+
+    const warnings: string[] = [];
+    if (averageRetentionRatio != null && averageRetentionRatio < 0.5) {
+      warnings.push('alpha_retention_degraded');
+    }
+    if (
+      averageExpectedNetEdge != null &&
+      averageRealizedNetEdge != null &&
+      averageRealizedNetEdge < averageExpectedNetEdge * 0.5
+    ) {
+      warnings.push('alpha_expected_vs_realized_gap');
+    }
+
+    return {
+      warnings,
+      summary: {
+        sampleCount: attributions.length,
+        averageExpectedNetEdge,
+        averageRealizedNetEdge,
+        averageRetentionRatio,
+        degradedRetentionCount,
+        recentAlphaAttributions: attributions.slice(-5),
+      },
+    };
+  }
+
+  private async runItemTwoRetentionContextReview(input: {
+    now: Date;
+    from: Date;
+    to: Date;
+  }): Promise<{ warnings: string[]; summary: Record<string, unknown> }> {
+    const prismaAny = this.prisma as any;
+    if (!prismaAny.executionDiagnostic?.findMany) {
+      return { warnings: [], summary: {} };
+    }
+
+    const diagnostics = ((await prismaAny.executionDiagnostic.findMany({
+      where: {
+        capturedAt: {
+          gte: input.from,
+          lte: input.to,
+        },
+      },
+      orderBy: {
+        capturedAt: 'asc',
+      },
+    })) as Array<Record<string, unknown>>)
+      .filter((diagnostic) => readString(diagnostic.orderId) != null);
+    if (diagnostics.length === 0) {
+      return { warnings: [], summary: {} };
+    }
+
+    const orderIds = diagnostics
+      .map((diagnostic) => readString(diagnostic.orderId))
+      .filter((value): value is string => value != null);
+    const orders = prismaAny.order?.findMany
+      ? ((await prismaAny.order.findMany({
+          where: {
+            id: {
+              in: orderIds,
+            },
+          },
+          include: {
+            signal: true,
+          },
+        })) as Array<Record<string, unknown>>)
+      : [];
+    const orderById = new Map(
+      orders.map((order) => [readString(order.id) ?? '', order]),
+    );
+    const submissionEvents = prismaAny.auditEvent?.findMany
+      ? ((await prismaAny.auditEvent.findMany({
+          where: {
+            orderId: {
+              in: orderIds,
+            },
+            eventType: {
+              in: ['order.submitted', 'order.rejected_on_submit'],
+            },
+          },
+          orderBy: {
+            createdAt: 'asc',
+          },
+        })) as Array<Record<string, unknown>>)
+      : [];
+    const submissionEventByOrderId = new Map<string, Record<string, unknown>>();
+    for (const event of submissionEvents) {
+      const orderId = readString(event.orderId);
+      if (!orderId) {
+        continue;
+      }
+      submissionEventByOrderId.set(orderId, event);
+    }
+
+    const report = buildRetentionContextReport({
+      observations: diagnostics.map((diagnostic) => {
+        const orderId = readString(diagnostic.orderId);
+        const order = orderId ? (orderById.get(orderId) ?? null) : null;
+        const signal =
+          order?.signal && typeof order.signal === 'object'
+            ? (order.signal as Record<string, unknown>)
+            : null;
+        const submissionEvent = orderId
+          ? (submissionEventByOrderId.get(orderId) ?? null)
+          : null;
+        const metadata = submissionEvent ? readMetadata(submissionEvent) : {};
+        const retained =
+          metadata.retainedEdgeExpectation &&
+          typeof metadata.retainedEdgeExpectation === 'object'
+            ? (metadata.retainedEdgeExpectation as Record<string, unknown>)
+            : null;
+        const upstream =
+          metadata.upstreamEvaluationEvidence &&
+          typeof metadata.upstreamEvaluationEvidence === 'object'
+            ? (metadata.upstreamEvaluationEvidence as Record<string, unknown>)
+            : null;
+
+        return {
+          regime:
+            readString(diagnostic.regime) ??
+            readString(signal?.regime) ??
+            'unknown',
+          archetype:
+            readString(retained?.marketArchetype) ??
+            readString(upstream?.marketArchetype) ??
+            'unknown',
+          toxicityState:
+            readString(retained?.toxicityState) ??
+            readString(upstream?.toxicityState) ??
+            'unknown',
+          expectedNetEdge:
+            readNumber(diagnostic.expectedEv, null) ??
+            readNumber(metadata.executionAdjustedEdge, null),
+          realizedNetEdge: readNumber(diagnostic.realizedEv, null),
+        };
+      }),
+      now: input.now,
+    });
+
+    if (report.sampleCount === 0) {
+      return { warnings: [], summary: {} };
+    }
+
+    if (prismaAny.auditEvent?.create) {
+      await prismaAny.auditEvent.create({
+        data: {
+          eventType: 'learning.retention_context_review',
+          message: 'Daily retention context review completed.',
+          metadata: {
+            window: {
+              from: input.from.toISOString(),
+              to: input.to.toISOString(),
+            },
+            ...report,
+          } as object,
+        },
+      });
+    }
+
+    const warnings = report.topDegradingContexts
+      .filter(
+        (entry) =>
+          (entry.retentionRatio != null && entry.retentionRatio < 0.5) ||
+          entry.realizedVsExpectedGap < 0,
+      )
+      .slice(0, 2)
+      .map(
+        (entry) =>
+          `retention_context_degraded:${entry.contextType}:${sanitizeReviewLabel(entry.contextValue)}`,
+      );
+
+    return {
+      warnings,
+      summary: report as unknown as Record<string, unknown>,
+    };
+  }
+
+  private async runItemTwelveCalibrationDriftAlertReview(input: {
+    now: Date;
+    from: Date;
+    to: Date;
+  }): Promise<{ warnings: string[]; summary: Record<string, unknown> }> {
+    const prismaAny = this.prisma as any;
+    if (!prismaAny.executionDiagnostic?.findMany) {
+      return { warnings: [], summary: {} };
+    }
+
+    const diagnostics = ((await prismaAny.executionDiagnostic.findMany({
+      where: {
+        capturedAt: {
+          gte: input.from,
+          lte: input.to,
+        },
+      },
+      orderBy: {
+        capturedAt: 'asc',
+      },
+    })) as Array<Record<string, unknown>>)
+      .filter((diagnostic) => readString(diagnostic.orderId) != null);
+    if (diagnostics.length === 0) {
+      return { warnings: [], summary: {} };
+    }
+
+    const orderIds = diagnostics
+      .map((diagnostic) => readString(diagnostic.orderId))
+      .filter((value): value is string => value != null);
+    const orders = prismaAny.order?.findMany
+      ? ((await prismaAny.order.findMany({
+          where: {
+            id: {
+              in: orderIds,
+            },
+          },
+          include: {
+            signal: true,
+          },
+        })) as Array<Record<string, unknown>>)
+      : [];
+    const orderById = new Map(
+      orders.map((order) => [readString(order.id) ?? '', order]),
+    );
+    const submissionEvents = prismaAny.auditEvent?.findMany
+      ? ((await prismaAny.auditEvent.findMany({
+          where: {
+            orderId: {
+              in: orderIds,
+            },
+            eventType: {
+              in: ['order.submitted', 'order.rejected_on_submit'],
+            },
+          },
+          orderBy: {
+            createdAt: 'asc',
+          },
+        })) as Array<Record<string, unknown>>)
+      : [];
+    const submissionEventByOrderId = new Map<string, Record<string, unknown>>();
+    for (const event of submissionEvents) {
+      const orderId = readString(event.orderId);
+      if (!orderId) {
+        continue;
+      }
+      submissionEventByOrderId.set(orderId, event);
+    }
+
+    const report = buildCalibrationDriftAlerts({
+      observations: diagnostics.map((diagnostic) => {
+        const orderId = readString(diagnostic.orderId);
+        const order = orderId ? (orderById.get(orderId) ?? null) : null;
+        const signal =
+          order?.signal && typeof order.signal === 'object'
+            ? (order.signal as Record<string, unknown>)
+            : null;
+        const submissionEvent = orderId
+          ? (submissionEventByOrderId.get(orderId) ?? null)
+          : null;
+        const metadata = submissionEvent ? readMetadata(submissionEvent) : {};
+        const retained =
+          metadata.retainedEdgeExpectation &&
+          typeof metadata.retainedEdgeExpectation === 'object'
+            ? (metadata.retainedEdgeExpectation as Record<string, unknown>)
+            : null;
+        const upstream =
+          metadata.upstreamEvaluationEvidence &&
+          typeof metadata.upstreamEvaluationEvidence === 'object'
+            ? (metadata.upstreamEvaluationEvidence as Record<string, unknown>)
+            : null;
+
+        return {
+          regime:
+            readString(diagnostic.regime) ??
+            readString(signal?.regime) ??
+            'unknown',
+          archetype:
+            readString(retained?.marketArchetype) ??
+            readString(upstream?.marketArchetype) ??
+            readString(signal?.marketArchetype) ??
+            'unknown',
+          predictedProbability: readNumber(signal?.posteriorProbability, null),
+          realizedOutcome:
+            (readNumber(diagnostic.realizedEv, null) ?? 0) > 0 ? 1 : 0,
+        };
+      }),
+      now: input.now,
+    });
+
+    if (report.sampleCount === 0) {
+      return { warnings: [], summary: {} };
+    }
+
+    if (prismaAny.auditEvent?.create) {
+      await prismaAny.auditEvent.create({
+        data: {
+          eventType: 'learning.calibration_drift_alert_review',
+          message: 'Daily calibration drift alert review completed.',
+          metadata: {
+            window: {
+              from: input.from.toISOString(),
+              to: input.to.toISOString(),
+            },
+            ...report,
+          } as object,
+        },
+      });
+    }
+
+    const warnings = [
+      ...report.regimeCalibrationAlert
+        .filter((entry) => entry.calibrationDriftState === 'alert')
+        .slice(0, 2)
+        .map(
+          (entry) =>
+            `calibration_drift_alert:regime:${sanitizeReviewLabel(entry.contextValue)}`,
+        ),
+      ...report.archetypeCalibrationAlert
+        .filter((entry) => entry.calibrationDriftState === 'alert')
+        .slice(0, 2)
+        .map(
+          (entry) =>
+            `calibration_drift_alert:archetype:${sanitizeReviewLabel(entry.contextValue)}`,
+        ),
+    ];
+
+    return {
+      warnings,
+      summary: report as unknown as Record<string, unknown>,
+    };
+  }
+
+  private async runItemSixRegimeLocalSizingReview(input: {
+    now: Date;
+    retentionContextSummary: Record<string, unknown>;
+  }): Promise<{ warnings: string[]; summary: Record<string, unknown> }> {
+    const retentionByRegime = readRetentionSizingEntries(
+      input.retentionContextSummary.retentionByRegime,
+      'regime',
+    );
+    const retentionByArchetype = readRetentionSizingEntries(
+      input.retentionContextSummary.retentionByArchetype,
+      'archetype',
+    );
+    if (retentionByRegime.length === 0 && retentionByArchetype.length === 0) {
+      return { warnings: [], summary: {} };
+    }
+
+    const summary = buildRegimeLocalSizingSummary({
+      now: input.now,
+      retentionByRegime,
+      retentionByArchetype,
+    });
+    const warnings = summary.mostConstrainedContexts
+      .filter((entry) => entry.recommendedSizeMultiplier < 0.8)
+      .slice(0, 3)
+      .map(
+        (entry) =>
+          `regime_local_sizing_reduced:${entry.contextType}:${sanitizeReviewLabel(entry.contextValue)}`,
+      );
+
+    const prismaAny = this.prisma as any;
+    if (prismaAny.auditEvent?.create) {
+      await prismaAny.auditEvent.create({
+        data: {
+          eventType: 'learning.regime_local_sizing_review',
+          message: 'Daily regime-local sizing review completed.',
+          metadata: summary as object,
+        },
+      });
+    }
+
+    return {
+      warnings,
+      summary: summary as unknown as Record<string, unknown>,
+    };
+  }
+
+  private async runItemOneLossAttributionReview(input: {
+    now: Date;
+    from: Date;
+    to: Date;
+  }): Promise<{ warnings: string[]; summary: Record<string, unknown> }> {
+    const prismaAny = this.prisma as any;
+    if (!prismaAny.auditEvent?.findMany) {
+      return { warnings: [], summary: {} };
+    }
+
+    const events = ((await prismaAny.auditEvent.findMany({
+      where: {
+        createdAt: {
+          gte: input.from,
+          lte: input.to,
+        },
+        eventType: 'trade.loss_attribution_classified',
+      },
+      orderBy: {
+        createdAt: 'asc',
+      },
+    })) as Array<Record<string, unknown>>)
+      .map((event) => {
+        const metadata = readMetadata(event);
+        const lossAttribution =
+          metadata.lossAttribution && typeof metadata.lossAttribution === 'object'
+            ? (metadata.lossAttribution as Record<string, unknown>)
+            : null;
+        if (!lossAttribution) {
+          return null;
+        }
+
+        return {
+          orderId: readString(event.orderId),
+          signalId: readString(event.signalId),
+          createdAt: readDateString(event.createdAt) ?? input.now.toISOString(),
+          lossCategory: readString(lossAttribution.lossCategory) ?? 'mixed',
+          primaryLeakageDriver:
+            readString(lossAttribution.primaryLeakageDriver) ?? 'mixed',
+          forecastQualityAssessment:
+            readString(lossAttribution.forecastQualityAssessment) ?? 'watch',
+          executionQualityAssessment:
+            readString(lossAttribution.executionQualityAssessment) ?? 'watch',
+          secondaryLeakageDrivers: Array.isArray(lossAttribution.secondaryLeakageDrivers)
+            ? lossAttribution.secondaryLeakageDrivers
+                .filter((driver): driver is string => typeof driver === 'string')
+                .sort()
+            : [],
+          lossReasonCodes: Array.isArray(lossAttribution.lossReasonCodes)
+            ? lossAttribution.lossReasonCodes
+                .filter((code): code is string => typeof code === 'string')
+                .sort()
+            : [],
+        };
+      })
+      .filter(
+        (
+          event,
+        ): event is {
+          orderId: string | null;
+          signalId: string | null;
+          createdAt: string;
+          lossCategory: string;
+          primaryLeakageDriver: string;
+          forecastQualityAssessment: string;
+          executionQualityAssessment: string;
+          secondaryLeakageDrivers: string[];
+          lossReasonCodes: string[];
+        } => event != null,
+      );
+
+    if (events.length === 0) {
+      return { warnings: [], summary: {} };
+    }
+
+    const categoryCounts = countBy(events.map((event) => event.lossCategory));
+    const primaryLeakageDriverCounts = countBy(
+      events.map((event) => event.primaryLeakageDriver),
+    );
+    const forecastQualityAssessmentCounts = countBy(
+      events.map((event) => event.forecastQualityAssessment),
+    );
+    const executionQualityAssessmentCounts = countBy(
+      events.map((event) => event.executionQualityAssessment),
+    );
+    const reasonCodeCounts = countBy(
+      events.flatMap((event) => event.lossReasonCodes),
+    );
+    const dominantLossCategory = dominantKey(categoryCounts);
+    const dominantPrimaryLeakageDriver = dominantKey(primaryLeakageDriverCounts);
+
+    const summary = {
+      sampleCount: events.length,
+      categoryCounts,
+      primaryLeakageDriverCounts,
+      forecastQualityAssessmentCounts,
+      executionQualityAssessmentCounts,
+      reasonCodeCounts,
+      dominantLossCategory,
+      dominantPrimaryLeakageDriver,
+      recentClassifications: events.slice(-5),
+    };
+
+    if (prismaAny.auditEvent?.create) {
+      await prismaAny.auditEvent.create({
+        data: {
+          eventType: 'learning.loss_attribution_review',
+          message: 'Daily loss attribution review completed.',
+          metadata: {
+            window: {
+              from: input.from.toISOString(),
+              to: input.to.toISOString(),
+            },
+            ...summary,
+          } as object,
+        },
+      });
+    }
+
+    const warnings: string[] = [];
+    if (
+      dominantLossCategory &&
+      (categoryCounts[dominantLossCategory] ?? 0) / events.length >= 0.5
+    ) {
+      warnings.push(`loss_attribution_dominant:${dominantLossCategory}`);
+    }
+    if (
+      dominantPrimaryLeakageDriver &&
+      (primaryLeakageDriverCounts[dominantPrimaryLeakageDriver] ?? 0) / events.length >= 0.5
+    ) {
+      warnings.push(`primary_leakage_dominant:${dominantPrimaryLeakageDriver}`);
+    }
+
+    return {
+      warnings,
+      summary,
+    };
+  }
+
+  private async runPhaseThreeToxicityReview(input: {
+    now: Date;
+    from: Date;
+    to: Date;
+  }): Promise<{ warnings: string[]; summary: Record<string, unknown> }> {
+    const prismaAny = this.prisma as any;
+    if (!prismaAny.auditEvent?.findMany) {
+      return { warnings: [], summary: {} };
+    }
+
+    const events = ((await prismaAny.auditEvent.findMany({
+      where: {
+        createdAt: {
+          gte: input.from,
+          lte: input.to,
+        },
+      },
+      orderBy: {
+        createdAt: 'asc',
+      },
+    })) as Array<Record<string, unknown>>)
+      .map((event) => {
+        const metadata = readMetadata(event);
+        const toxicity =
+          metadata.toxicity && typeof metadata.toxicity === 'object'
+            ? (metadata.toxicity as Record<string, unknown>)
+            : null;
+
+        if (!toxicity) {
+          return null;
+        }
+
+        return {
+          eventType: readString(event.eventType) ?? 'unknown',
+          toxicityScore: readNumber(toxicity.toxicityScore, null),
+          toxicityState: readString(toxicity.toxicityState) ?? 'unknown',
+          recommendedAction: readString(toxicity.recommendedAction) ?? 'unknown',
+          toxicityMomentum: readNumber(toxicity.toxicityMomentum, null),
+          toxicityShock: readNumber(toxicity.toxicityShock, null),
+          toxicityPersistence: readNumber(toxicity.toxicityPersistence, null),
+        };
+      })
+      .filter(
+        (
+          entry,
+        ): entry is {
+          eventType: string;
+          toxicityScore: number | null;
+          toxicityState: string;
+          recommendedAction: string;
+          toxicityMomentum: number | null;
+          toxicityShock: number | null;
+          toxicityPersistence: number | null;
+        } => entry != null,
+      );
+
+    if (events.length === 0) {
+      return { warnings: [], summary: {} };
+    }
+
+    const averageToxicityScore = averageNullable(events.map((event) => event.toxicityScore));
+    const averageToxicityMomentum = averageNullable(
+      events.map((event) => event.toxicityMomentum),
+    );
+    const averageToxicityShock = averageNullable(events.map((event) => event.toxicityShock));
+    const averageToxicityPersistence = averageNullable(
+      events.map((event) => event.toxicityPersistence),
+    );
+    const blockedCount = events.filter(
+      (event) => event.recommendedAction === 'temporarily_block_regime',
+    ).length;
+    const aggressiveExecutionDisabledCount = events.filter(
+      (event) => event.recommendedAction === 'disable_aggressive_execution',
+    ).length;
+    const actionCounts = events.reduce<Record<string, number>>((counts, event) => {
+      counts[event.recommendedAction] = (counts[event.recommendedAction] ?? 0) + 1;
+      return counts;
+    }, {});
+    const recomputedTrend = this.toxicityTrend.evaluate({
+      currentToxicityScore: events[events.length - 1]?.toxicityScore ?? 0,
+      recentHistory: events
+        .map((event) =>
+          event.toxicityScore == null
+            ? null
+            : {
+                toxicityScore: event.toxicityScore,
+                toxicityState: event.toxicityState,
+                recommendedAction: event.recommendedAction,
+              },
+        )
+        .filter((event): event is { toxicityScore: number; toxicityState: string; recommendedAction: string } => event != null),
+    });
+    const summary = {
+      window: {
+        from: input.from.toISOString(),
+        to: input.to.toISOString(),
+      },
+      sampleCount: events.length,
+      averageToxicityScore,
+      averageToxicityMomentum,
+      averageToxicityShock,
+      averageToxicityPersistence,
+      blockedCount,
+      aggressiveExecutionDisabledCount,
+      actionCounts,
+      recentToxicityEvents: events.slice(-10),
+      recomputedTrend,
+    };
+
+    if (prismaAny.auditEvent?.create) {
+      await prismaAny.auditEvent.create({
+        data: {
+          eventType: 'learning.toxicity_review',
+          message: 'Daily toxicity review completed.',
+          metadata: summary as object,
+        },
+      });
+    }
+
+    const warnings: string[] = [];
+    if ((averageToxicityScore ?? 0) >= 0.68) {
+      warnings.push('toxicity_pressure_elevated');
+    }
+    if (blockedCount > 0) {
+      warnings.push('toxicity_temporarily_blocked_regime');
+    }
+    if ((averageToxicityPersistence ?? recomputedTrend.toxicityPersistence) >= 0.55) {
+      warnings.push('toxicity_persistence_elevated');
+    }
+    if ((averageToxicityShock ?? recomputedTrend.toxicityShock) >= 0.55) {
+      warnings.push('toxicity_shock_detected');
+    }
+
+    return { warnings, summary };
+  }
+
+  private async runPhaseFourLiveSizingFeedbackReview(input: {
+    now: Date;
+    from: Date;
+    to: Date;
+    learningState: LearningState;
+    capitalGrowthReport: Awaited<ReturnType<CapitalGrowthReviewJob['run']>>['report'];
+  }): Promise<{ warnings: string[]; summary: Record<string, unknown> }> {
+    const prismaAny = this.prisma as any;
+    const [diagnostics, auditEvents, venueMetrics] = await Promise.all([
+      prismaAny.executionDiagnostic?.findMany
+        ? prismaAny.executionDiagnostic.findMany({
+            where: {
+              capturedAt: {
+                gte: input.from,
+                lte: input.to,
+              },
+            },
+            orderBy: {
+              capturedAt: 'asc',
+            },
+          })
+        : Promise.resolve([]),
+      prismaAny.auditEvent?.findMany
+        ? prismaAny.auditEvent.findMany({
+            where: {
+              createdAt: {
+                gte: input.from,
+                lte: input.to,
+              },
+            },
+            orderBy: {
+              createdAt: 'asc',
+            },
+          })
+        : Promise.resolve([]),
+      this.venueHealthLearningStore.getCurrentMetrics(),
+    ]);
+
+    const latestAlphaReview = [...((auditEvents ?? []) as Array<Record<string, unknown>>)]
+      .filter((event) => readString(event.eventType) === 'learning.alpha_attribution_review')
+      .sort(
+        (left, right) =>
+          (readDate(right.createdAt)?.getTime() ?? Number.NEGATIVE_INFINITY) -
+          (readDate(left.createdAt)?.getTime() ?? Number.NEGATIVE_INFINITY),
+      )[0];
+    const latestAlphaMetadata = latestAlphaReview ? readMetadata(latestAlphaReview) : {};
+    const averageExpectedNetEdge = readNumber(latestAlphaMetadata.averageExpectedNetEdge, null);
+    const averageRealizedNetEdge = readNumber(latestAlphaMetadata.averageRealizedNetEdge, null);
+    const retentionRatio =
+      input.capitalGrowthReport.retentionReport?.aggregateRetentionRatio ??
+      readNumber(latestAlphaMetadata.averageRetentionRatio, null);
+
+    const toxicityEvents = ((auditEvents ?? []) as Array<Record<string, unknown>>)
+      .map((event) => {
+        const metadata = readMetadata(event);
+        const toxicity =
+          metadata.toxicity && typeof metadata.toxicity === 'object'
+            ? (metadata.toxicity as Record<string, unknown>)
+            : null;
+        if (!toxicity) {
+          return null;
+        }
+
+        return {
+          toxicityScore: readNumber(toxicity.toxicityScore, null),
+          recommendedAction: readString(toxicity.recommendedAction),
+        };
+      })
+      .filter(
+        (
+          value,
+        ): value is {
+          toxicityScore: number | null;
+          recommendedAction: string | null;
+        } => value != null,
+      );
+    const averageToxicityScore = averageNullable(
+      toxicityEvents.map((event) => event.toxicityScore),
+    );
+    const toxicityState =
+      toxicityEvents.some((event) => event.recommendedAction === 'temporarily_block_regime')
+        ? 'blocked'
+        : toxicityEvents.some(
+              (event) => event.recommendedAction === 'disable_aggressive_execution',
+            ) || (averageToxicityScore ?? 0) >= 0.68
+          ? 'high'
+          : toxicityEvents.some((event) => event.recommendedAction === 'reduce_size') ||
+              toxicityEvents.some((event) => event.recommendedAction === 'widen_threshold') ||
+              (averageToxicityScore ?? 0) >= 0.4
+            ? 'elevated'
+            : 'normal';
+
+    const calibrationHealth = worstNullableHealth(
+      Object.values(input.learningState.calibration).map((calibration) => calibration.health),
+    );
+    let regimeDegradation = worstNullableHealth(
+      Object.values(input.learningState.strategyVariants).flatMap((variant) => [
+        variant.health,
+        ...Object.values(variant.regimeSnapshots).map((snapshot) => snapshot.health),
+      ]),
+    );
+    if (
+      input.capitalGrowthReport.baselineComparison &&
+      input.capitalGrowthReport.baselineComparison.underperformedBenchmarkIds.length >
+        input.capitalGrowthReport.baselineComparison.outperformedBenchmarkIds.length
+    ) {
+      regimeDegradation =
+        regimeDegradation == null || regimeDegradation === 'healthy'
+          ? 'watch'
+          : regimeDegradation;
+    }
+    const realizedVsExpected = minimumNullable(
+      Object.values(input.learningState.strategyVariants).flatMap((variant) =>
+        Object.values(variant.regimeSnapshots).map((snapshot) => snapshot.realizedVsExpected),
+      ),
+    );
+    const executionDrift = averageNullable(
+      ((diagnostics ?? []) as Array<Record<string, unknown>>).map((diagnostic) =>
+        readNumber(diagnostic.evDrift, null),
+      ),
+    );
+    const venueAssessment = this.venueUncertaintyDetector.evaluate(venueMetrics);
+    const liveSizingFeedback = this.liveSizingFeedbackPolicy.evaluate({
+      retentionRatio,
+      calibrationHealth,
+      executionDrift,
+      regimeDegradation,
+      toxicityState,
+      venueUncertainty: venueAssessment.label,
+      realizedVsExpected:
+        input.capitalGrowthReport.liveProofScorecard?.proofScore != null
+          ? minimumNullable([
+              averageExpectedNetEdge != null && Math.abs(averageExpectedNetEdge) > 1e-9
+                ? (averageRealizedNetEdge ?? 0) / averageExpectedNetEdge
+                : realizedVsExpected,
+              input.capitalGrowthReport.liveProofScorecard.proofScore,
+            ])
+          : averageExpectedNetEdge != null && Math.abs(averageExpectedNetEdge) > 1e-9
+          ? (averageRealizedNetEdge ?? 0) / averageExpectedNetEdge
+          : realizedVsExpected,
+    });
+    const liveSizingRecoveryProbationState =
+      typeof liveSizingFeedback.recoveryProbationState === 'string'
+        ? liveSizingFeedback.recoveryProbationState
+        : 'none';
+    const liveSizingUpshiftEligibility =
+      typeof liveSizingFeedback.upshiftEligibility === 'string'
+        ? liveSizingFeedback.upshiftEligibility
+        : 'eligible';
+
+    if (prismaAny.auditEvent?.create) {
+      await prismaAny.auditEvent.create({
+        data: {
+          eventType: 'learning.live_sizing_feedback_review',
+          message: 'Daily live sizing feedback review completed.',
+          metadata: {
+            window: {
+              from: input.from.toISOString(),
+              to: input.to.toISOString(),
+            },
+            sampleCount: (diagnostics ?? []).length,
+            venueAssessment,
+            inputs: liveSizingFeedback.evidence,
+            decision: liveSizingFeedback,
+          } as object,
+        },
+      });
+    }
+
+    const warnings: string[] = [];
+    if (liveSizingFeedback.sizeMultiplier < 0.85) {
+      warnings.push('live_sizing_feedback_size_reduced');
+    }
+    if (liveSizingRecoveryProbationState !== 'none') {
+      warnings.push(
+        `live_sizing_feedback_recovery_probation_${liveSizingRecoveryProbationState}`,
+      );
+    }
+    if (liveSizingUpshiftEligibility !== 'eligible') {
+      warnings.push(
+        `live_sizing_feedback_upshift_${liveSizingUpshiftEligibility}`,
+      );
+    }
+    if (liveSizingFeedback.aggressionCap === 'passive_only') {
+      warnings.push('live_sizing_feedback_passive_only');
+    }
+    if (liveSizingFeedback.regimePermissionOverride === 'reduce_only') {
+      warnings.push('live_sizing_feedback_reduce_only');
+    }
+    if (liveSizingFeedback.regimePermissionOverride === 'block_new_entries') {
+      warnings.push('live_sizing_feedback_blocks_new_entries');
+    }
+
+    return {
+      warnings,
+      summary: {
+        averageExpectedNetEdge,
+        averageRealizedNetEdge,
+        retentionRatio,
+        benchmarkUnderperformanceCount:
+          input.capitalGrowthReport.baselineComparison?.underperformedBenchmarkIds.length ?? 0,
+        benchmarkOutperformanceCount:
+          input.capitalGrowthReport.baselineComparison?.outperformedBenchmarkIds.length ?? 0,
+        proofScore: input.capitalGrowthReport.liveProofScorecard?.proofScore ?? null,
+        decision: liveSizingFeedback,
+      },
+    };
+  }
+
+  private async runPhaseFiveBaselineBenchmarkReview(input: {
+    now: Date;
+    baselineComparison: Awaited<ReturnType<CapitalGrowthReviewJob['run']>>['report']['baselineComparison'];
+  }): Promise<{ warnings: string[] }> {
+    if (!input.baselineComparison) {
+      return { warnings: [] };
+    }
+
+    const prismaAny = this.prisma as any;
+    if (prismaAny.auditEvent?.create) {
+      await prismaAny.auditEvent.create({
+        data: {
+          eventType: 'learning.baseline_benchmark_review',
+          message: 'Daily baseline benchmark review completed.',
+          metadata: {
+            generatedAt: input.baselineComparison.generatedAt,
+            outperformedBenchmarkIds: input.baselineComparison.outperformedBenchmarkIds,
+            underperformedBenchmarkIds: input.baselineComparison.underperformedBenchmarkIds,
+            comparisons: input.baselineComparison.comparisons,
+          } as object,
+        },
+      });
+    }
+
+    return {
+      warnings: input.baselineComparison.underperformedBenchmarkIds.map(
+        (benchmarkId) => `baseline_underperformance:${benchmarkId}`,
+      ),
+    };
+  }
+
+  private async runItemSevenBenchmarkRelativeSizingReview(input: {
+    now: Date;
+    baselineComparison: Awaited<ReturnType<CapitalGrowthReviewJob['run']>>['report']['baselineComparison'];
+  }): Promise<{ warnings: string[]; summary: Record<string, unknown> }> {
+    if (!input.baselineComparison) {
+      return { warnings: [], summary: {} };
+    }
+
+    const regimePenalties = input.baselineComparison.strategy.regimeBreakdown
+      .map((context) => {
+        const decision = this.benchmarkRelativeSizing.evaluate({
+          regime: context.regime,
+          overallUnderperformedBenchmarkIds:
+            input.baselineComparison?.underperformedBenchmarkIds ?? [],
+          overallOutperformedBenchmarkIds:
+            input.baselineComparison?.outperformedBenchmarkIds ?? [],
+          strategyRegimeBreakdown: input.baselineComparison?.strategy.regimeBreakdown ?? [],
+          benchmarks:
+            input.baselineComparison?.benchmarks.map((benchmark) => ({
+              benchmarkId: benchmark.benchmarkId,
+              benchmarkName: benchmark.benchmarkName,
+              regimeBreakdown: benchmark.regimeBreakdown,
+            })) ?? [],
+        });
+        return {
+          regime: context.regime,
+          baselinePenaltyMultiplier: decision.baselinePenaltyMultiplier,
+          benchmarkComparisonState: decision.benchmarkComparisonState,
+          regimeBenchmarkGateState: decision.regimeBenchmarkGateState,
+          promotionBlockedByBenchmark: decision.promotionBlockedByBenchmark,
+          regimeBenchmarkReasonCodes: decision.regimeBenchmarkReasonCodes,
+          benchmarkPenaltyReasonCodes: decision.benchmarkPenaltyReasonCodes,
+          sampleCount: context.sampleCount,
+          tradeCount: context.tradeCount,
+        };
+      })
+      .sort(
+        (left, right) => left.baselinePenaltyMultiplier - right.baselinePenaltyMultiplier,
+      )
+      .slice(0, 12);
+    const warnings = regimePenalties
+      .filter((entry) => entry.baselinePenaltyMultiplier < 1)
+      .slice(0, 3)
+      .map(
+        (entry) =>
+          `benchmark_relative_sizing:${sanitizeReviewLabel(entry.regime)}:${entry.benchmarkComparisonState}`,
+      );
+    warnings.push(
+      ...regimePenalties
+        .filter((entry) => entry.promotionBlockedByBenchmark)
+        .slice(0, 3)
+        .map(
+          (entry) =>
+            `regime_benchmark_gate:${sanitizeReviewLabel(entry.regime)}:${entry.regimeBenchmarkGateState}`,
+        ),
+    );
+    const summary = {
+      generatedAt: input.now.toISOString(),
+      underperformedBenchmarkIds: input.baselineComparison.underperformedBenchmarkIds,
+      outperformedBenchmarkIds: input.baselineComparison.outperformedBenchmarkIds,
+      promotionBlockedRegimes: regimePenalties
+        .filter((entry) => entry.promotionBlockedByBenchmark)
+        .map((entry) => entry.regime),
+      regimePenalties,
+    };
+
+    const prismaAny = this.prisma as any;
+    if (prismaAny.auditEvent?.create) {
+      await prismaAny.auditEvent.create({
+        data: {
+          eventType: 'learning.benchmark_relative_sizing_review',
+          message: 'Daily benchmark-relative sizing review completed.',
+          metadata: summary as object,
+        },
+      });
+    }
+
+    return {
+      warnings,
+      summary,
+    };
+  }
+
+  private async runItemEightRollingBenchmarkScorecardReview(input: {
+    now: Date;
+    rollingBenchmarkScorecard: Awaited<
+      ReturnType<CapitalGrowthReviewJob['run']>
+    >['report']['rollingBenchmarkScorecard'];
+  }): Promise<{ warnings: string[]; summary: Record<string, unknown> }> {
+    if (!input.rollingBenchmarkScorecard) {
+      return { warnings: [], summary: {} };
+    }
+
+    const windows = input.rollingBenchmarkScorecard.windows.map((window) => ({
+      windowKey: window.windowKey,
+      requestedDays: window.requestedDays,
+      effectiveDays: window.effectiveDays,
+      exactWindowAvailable: window.exactWindowAvailable,
+      sampleCount: window.sampleCount,
+      tradeCount: window.tradeCount,
+      benchmarkComparisonState: window.benchmarkComparisonState,
+      outperformedBenchmarkIds: window.outperformedBenchmarkIds,
+      underperformedBenchmarkIds: window.underperformedBenchmarkIds,
+      strategyRealizedEv: window.strategyRealizedEv,
+      strategyRetainedEdge: window.strategyRetainedEdge,
+    }));
+    const warnings = windows
+      .filter((window) => window.benchmarkComparisonState === 'underperforming')
+      .map((window) => `rolling_benchmark_underperformance:${window.windowKey}`);
+    const summary = {
+      generatedAt: input.now.toISOString(),
+      anchoredAt: input.rollingBenchmarkScorecard.anchoredAt,
+      observationRange: input.rollingBenchmarkScorecard.observationRange,
+      windows,
+      stabilityOfOutperformance:
+        input.rollingBenchmarkScorecard.stabilityOfOutperformance,
+    };
+
+    const prismaAny = this.prisma as any;
+    if (prismaAny.auditEvent?.create) {
+      await prismaAny.auditEvent.create({
+        data: {
+          eventType: 'learning.rolling_benchmark_scorecard_review',
+          message: 'Daily rolling benchmark scorecard review completed.',
+          metadata: summary as object,
+        },
+      });
+    }
+
+    return {
+      warnings,
+      summary,
+    };
+  }
+
+  private async runPhaseSixValidationProofReview(input: {
+    cycleId: string;
+    now: Date;
+    learningState: LearningState;
+    registry: Awaited<ReturnType<StrategyDeploymentRegistry['load']>>;
+    capitalGrowthReport: Awaited<ReturnType<CapitalGrowthReviewJob['run']>>['report'];
+  }): Promise<{ warnings: string[] }> {
+    const liveProofScorecard = input.capitalGrowthReport.liveProofScorecard;
+    const regimePerformanceReport = input.capitalGrowthReport.regimePerformanceReport;
+    const retentionReport = input.capitalGrowthReport.retentionReport;
+    if (!liveProofScorecard || !regimePerformanceReport || !retentionReport) {
+      return { warnings: [] };
+    }
+
+    const prismaAny = this.prisma as any;
+    if (prismaAny.auditEvent?.create) {
+      await prismaAny.auditEvent.create({
+        data: {
+          eventType: 'learning.live_proof_review',
+          message: liveProofScorecard.summary,
+          metadata: {
+            liveProofScorecard,
+            benchmarkComparisonSummary: regimePerformanceReport.benchmarkComparisonSummary,
+            weakestRegimes: regimePerformanceReport.weakestRegimes,
+            strongestRegimes: regimePerformanceReport.strongestRegimes,
+            toxicityConditionedResults: regimePerformanceReport.toxicityConditionedResults,
+            aggregateRetentionRatio: retentionReport.aggregateRetentionRatio,
+          } as object,
+        },
+      });
+    }
+
+    await this.versionLineageRegistry.recordDecision({
+      decisionId: `${input.cycleId}:live-proof-review`,
+      decisionType: 'learning_cycle',
+      recordedAt: input.now.toISOString(),
+      summary: liveProofScorecard.summary,
+      strategyVariantId: input.registry.incumbentVariantId,
+      cycleId: input.cycleId,
+      lineage: {
+        strategyVersion: buildStrategyVersionLineage({
+          strategyVersionId:
+            input.registry.incumbentVariantId != null
+              ? input.registry.variants[input.registry.incumbentVariantId]?.strategyVersionId ?? null
+              : null,
+          strategyVariantId: input.registry.incumbentVariantId,
+        }),
+        featureSetVersion: buildFeatureSetVersionLineage({
+          featureSetId: 'phase6-live-proof-scorecard',
+          parentStrategyVersionId:
+            input.registry.incumbentVariantId != null
+              ? input.registry.variants[input.registry.incumbentVariantId]?.strategyVersionId ?? null
+              : null,
+          parameters: {
+            evidenceClass: liveProofScorecard.evidenceClass,
+            proofScore: liveProofScorecard.proofScore,
+            recommendation: liveProofScorecard.recommendation,
+          },
+        }),
+        calibrationVersion: buildCalibrationVersionLineage(
+          input.registry.incumbentVariantId != null
+            ? findCalibrationForVariantState(input.learningState, input.registry.incumbentVariantId)
+            : null,
+        ),
+        executionPolicyVersion: buildExecutionPolicyVersionLineage(
+          input.registry.incumbentVariantId != null
+            ? findExecutionPolicyVersionForVariant(
+                input.learningState,
+                input.registry.incumbentVariantId,
+              )
+            : null,
+        ),
+        riskPolicyVersion: buildRiskPolicyVersionLineage({
+          policyId: 'phase6-live-proof-scorecard',
+          parameters: {
+            liveProofScorecard,
+            weakestRegimes: regimePerformanceReport.weakestRegimes,
+            benchmarkComparisonSummary: regimePerformanceReport.benchmarkComparisonSummary,
+          },
+        }),
+        allocationPolicyVersion: null,
+      },
+      replay: {
+        marketState: null,
+        runtimeState: {
+          cycleId: input.cycleId,
+        },
+        learningState: {
+          liveProofScorecard,
+          retentionReport,
+          regimePerformanceReport,
+        },
+        lineageState: {
+          incumbentVariantId: input.registry.incumbentVariantId,
+          activeRollout: input.registry.activeRollout,
+        },
+        activeParameterBundle: {
+          benchmarkComparisonSummary: regimePerformanceReport.benchmarkComparisonSummary,
+          weakestRegimes: regimePerformanceReport.weakestRegimes,
+          strongestRegimes: regimePerformanceReport.strongestRegimes,
+        },
+        venueMode: null,
+        venueUncertainty: null,
+      },
+      tags: buildValidationProofTags({
+        mode:
+          liveProofScorecard.evidenceClass === 'synthetic_smoke_only'
+            ? 'synthetic_smoke'
+            : 'empirical',
+        promotableEvidence: liveProofScorecard.promotableEvidence,
+        underperformedBenchmarkIds:
+          regimePerformanceReport.benchmarkComparisonSummary.underperformedBenchmarkIds,
+        blockers: liveProofScorecard.blockers,
+      }),
+    });
+
+    return {
+      warnings: [
+        ...liveProofScorecard.blockers.map((blocker) => `live_proof_blocker:${blocker}`),
+        ...regimePerformanceReport.weakestRegimes.map(
+          (regime) => `live_proof_weak_regime:${regime}`,
+        ),
+      ],
+    };
+  }
 }
 
 export function isLearningCycleDue(
@@ -1641,6 +3048,56 @@ function appendWarnings(
     ...summary,
     warnings: [...summary.warnings, ...warnings],
   };
+}
+
+function attachReviewOutputs(
+  summary: LearningCycleSummary,
+  reviewOutputs: Record<string, unknown>,
+): LearningCycleSummary {
+  return {
+    ...summary,
+    reviewOutputs,
+  };
+}
+
+function averageNullable(values: Array<number | null | undefined>): number | null {
+  const filtered = values.filter((value): value is number => Number.isFinite(value ?? Number.NaN));
+  if (filtered.length === 0) {
+    return null;
+  }
+
+  return filtered.reduce((sum, value) => sum + value, 0) / filtered.length;
+}
+
+function minimumNullable(values: Array<number | null | undefined>): number | null {
+  const filtered = values.filter((value): value is number => Number.isFinite(value ?? Number.NaN));
+  if (filtered.length === 0) {
+    return null;
+  }
+
+  return Math.min(...filtered);
+}
+
+function countBy(values: string[]): Record<string, number> {
+  return values.reduce<Record<string, number>>((accumulator, value) => {
+    if (value.length === 0) {
+      return accumulator;
+    }
+    accumulator[value] = (accumulator[value] ?? 0) + 1;
+    return accumulator;
+  }, {});
+}
+
+function dominantKey(counts: Record<string, number>): string | null {
+  let dominant: string | null = null;
+  let bestCount = -1;
+  for (const [key, count] of Object.entries(counts)) {
+    if (count > bestCount) {
+      dominant = key;
+      bestCount = count;
+    }
+  }
+  return dominant;
 }
 
 function buildCapitalAllocationEvent(
@@ -1736,6 +3193,19 @@ function worstHealth(
     (worst, value) => (priority[value] > priority[worst] ? value : worst),
     'healthy',
   );
+}
+
+function worstNullableHealth(
+  values: Array<'healthy' | 'watch' | 'degraded' | 'quarantine_candidate' | null | undefined>,
+) {
+  const filtered = values.filter(
+    (value): value is 'healthy' | 'watch' | 'degraded' | 'quarantine_candidate' => value != null,
+  );
+  if (filtered.length === 0) {
+    return null;
+  }
+
+  return worstHealth(filtered);
 }
 
 function buildSyntheticPromotionTradeQualityScores(
@@ -1954,6 +3424,33 @@ function readBoolean(value: unknown): boolean | null {
   return typeof value === 'boolean' ? value : null;
 }
 
+function readRetentionSizingEntries(
+  raw: unknown,
+  contextType: 'regime' | 'archetype',
+): Array<{
+  contextType: 'regime' | 'archetype';
+  contextValue: string;
+  sampleCount: number;
+  retentionRatio: number | null;
+  realizedVsExpectedGap: number | null;
+  rankScore: number | null;
+}> {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  return raw
+    .filter((entry): entry is Record<string, unknown> => entry != null && typeof entry === 'object')
+    .map((entry) => ({
+      contextType,
+      contextValue: readString(entry.contextValue) ?? 'unknown',
+      sampleCount: readNumber(entry.sampleCount, 0) ?? 0,
+      retentionRatio: readNumber(entry.retentionRatio, null),
+      realizedVsExpectedGap: readNumber(entry.realizedVsExpectedGap, null),
+      rankScore: readNumber(entry.rankScore, null),
+    }));
+}
+
 function readString(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
@@ -1967,6 +3464,10 @@ function readMetadata(value: unknown): Record<string, unknown> {
   return metadata && typeof metadata === 'object'
     ? (metadata as Record<string, unknown>)
     : {};
+}
+
+function sanitizeReviewLabel(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_:-]+/g, '-');
 }
 
 function readOpportunityClass(value: unknown): string | null {

@@ -10,6 +10,9 @@ export type RegimeLabel =
 export interface RegimeClassification {
   label: RegimeLabel;
   confidence: number;
+  reasonCodes: string[];
+  toxicityBias: number;
+  bookInstabilityBias: number;
   tradingAllowed: boolean;
   rejectionReasonCode: string;
   edgeMultiplier: number;
@@ -26,14 +29,34 @@ export interface RegimeClassification {
 export class RegimeClassifier {
   classify(features: SignalFeatures): RegimeClassification {
     const now = new Date().toISOString();
+    const toxicityBias = clamp01(
+      features.bookUpdateStress * 0.45 +
+        features.signalDecayPressure * 0.3 +
+        features.orderbookNoiseScore * 0.25,
+    );
+    const bookInstabilityBias = clamp01(
+      features.bookUpdateStress * 0.55 +
+        features.orderbookNoiseScore * 0.2 +
+        clamp01(features.spread / 0.05) * 0.15 +
+        clamp01((18 - Math.max(0, features.topLevelDepth)) / 18) * 0.1,
+    );
 
     if (
-      features.timeToExpirySeconds !== null &&
-      features.timeToExpirySeconds <= 45
+      (features.timeToExpirySeconds !== null &&
+        features.timeToExpirySeconds <= 45) ||
+      (features.marketArchetype === 'expiry_pressure' &&
+        features.signalDecayPressure >= 0.8)
     ) {
       return {
         label: 'near_resolution_microstructure_chaos',
         confidence: 0.95,
+        reasonCodes: [
+          'phase2_expiry_pressure',
+          'phase2_signal_decay_pressure',
+          'phase3_regime_toxicity_extreme',
+        ],
+        toxicityBias,
+        bookInstabilityBias,
         tradingAllowed: false,
         rejectionReasonCode: 'near_resolution_microstructure_chaos',
         edgeMultiplier: 0.3,
@@ -51,11 +74,20 @@ export class RegimeClassifier {
     if (
       features.spread > 0.03 ||
       features.orderbookNoiseScore > 0.65 ||
-      features.topLevelDepth < 16
+      features.topLevelDepth < 16 ||
+      features.bookUpdateStress > 0.72 ||
+      features.marketArchetype === 'stressed_microstructure'
     ) {
       return {
         label: 'illiquid_noisy_book',
         confidence: 0.88,
+        reasonCodes: [
+          'phase2_book_update_stress',
+          'phase2_stressed_microstructure',
+          'phase3_book_instability_elevated',
+        ],
+        toxicityBias,
+        bookInstabilityBias,
         tradingAllowed: false,
         rejectionReasonCode: 'illiquid_noisy_book',
         edgeMultiplier: 0.45,
@@ -71,13 +103,21 @@ export class RegimeClassifier {
     }
 
     if (
-      Math.abs(features.lastReturnPct) > 0.003 &&
-      Math.sign(features.lastReturnPct || 0) !==
-        Math.sign(features.rollingReturnPct || 0)
+      features.marketStateTransition === 'mean_reversion' ||
+      features.marketArchetype === 'mean_reversion_trap' ||
+      (Math.abs(features.lastReturnPct) > 0.003 &&
+        Math.sign(features.lastReturnPct || 0) !==
+          Math.sign(features.rollingReturnPct || 0))
     ) {
       return {
         label: 'spike_and_revert',
-        confidence: 0.76,
+        confidence: clamp01(0.7 + features.marketArchetypeConfidence * 0.15),
+        reasonCodes: [
+          'phase2_mean_reversion_context',
+          ...(toxicityBias >= 0.5 ? ['phase3_flow_toxicity_watch'] : []),
+        ],
+        toxicityBias,
+        bookInstabilityBias,
         tradingAllowed: true,
         rejectionReasonCode: 'passed',
         edgeMultiplier: 0.88,
@@ -93,14 +133,29 @@ export class RegimeClassifier {
     }
 
     if (
+      (features.marketStateTransition === 'trend_acceleration' ||
+        features.marketArchetype === 'trend_follow_through') &&
       Math.abs(features.rollingReturnPct) > 0.002 &&
       Math.sign(features.lastReturnPct || 0) ===
         Math.sign(features.rollingReturnPct || 0) &&
-      features.realizedVolatility > 0.001
+      features.realizedVolatility > 0.001 &&
+      features.signalDecayPressure < 0.65 &&
+      features.btcMoveTransmission > -0.15
     ) {
       return {
         label: 'momentum_continuation',
-        confidence: 0.81,
+        confidence: clamp01(
+          0.72 +
+            features.marketStateTransitionStrength * 0.1 +
+            features.marketArchetypeConfidence * 0.08,
+        ),
+        reasonCodes: [
+          'phase2_trend_follow_through',
+          'phase2_btc_linkage_supportive',
+          ...(toxicityBias >= 0.45 ? ['phase3_toxicity_headwind_present'] : []),
+        ],
+        toxicityBias,
+        bookInstabilityBias,
         tradingAllowed: true,
         rejectionReasonCode: 'passed',
         edgeMultiplier: 1.08,
@@ -117,7 +172,17 @@ export class RegimeClassifier {
 
     return {
       label: 'low_volatility_drift',
-      confidence: 0.72,
+      confidence: clamp01(
+        0.65 +
+          (features.marketArchetype === 'balanced_rotation' ? 0.08 : 0) -
+          features.signalDecayPressure * 0.12,
+      ),
+      reasonCodes: [
+        'phase2_balanced_rotation_or_drift',
+        ...(bookInstabilityBias >= 0.55 ? ['phase3_book_instability_watch'] : []),
+      ],
+      toxicityBias,
+      bookInstabilityBias,
       tradingAllowed: true,
       rejectionReasonCode: 'passed',
       edgeMultiplier: 0.9,
@@ -131,4 +196,12 @@ export class RegimeClassifier {
       capturedAt: now,
     };
   }
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(1, value));
 }

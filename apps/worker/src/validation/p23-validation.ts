@@ -1,5 +1,19 @@
 import fs from 'fs';
 import path from 'path';
+import type { BaselineComparisonReport } from './baseline-comparison';
+import { buildBaselineComparison } from './baseline-comparison';
+import type { LiveProofScorecard } from './live-proof-scorecard';
+import { buildLiveProofScorecard } from './live-proof-scorecard';
+import type { CalibrationDriftAlertsReport } from './calibration-drift-alerts';
+import { buildCalibrationDriftAlerts } from './calibration-drift-alerts';
+import type { RegimePerformanceReport } from './regime-performance-report';
+import { buildRegimePerformanceReport } from './regime-performance-report';
+import type { RollingBenchmarkScorecard } from './rolling-benchmark-scorecard';
+import { buildRollingBenchmarkScorecard } from './rolling-benchmark-scorecard';
+import type { RetentionContextReport } from './retention-context-report';
+import { buildRetentionContextReport } from './retention-context-report';
+import type { RetentionReport } from './retention-report';
+import { buildRetentionReport } from './retention-report';
 import {
   buildDatasetQualityReport,
   DatasetQualityReport,
@@ -24,6 +38,11 @@ import { ExecutableEvModel } from '@polymarket-btc-5m-agentic-bot/signal-engine'
 import {
   EventMicrostructureFeatures,
   EventMicrostructureModel,
+} from '@polymarket-btc-5m-agentic-bot/signal-engine';
+import {
+  ToxicityPolicy,
+  type ToxicityRecommendedAction,
+  type ToxicityState,
 } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 
 const DEFAULT_DATASET_PATH = path.resolve(
@@ -111,6 +130,8 @@ export interface HistoricalExecutableCase {
   slug: string;
   observedAt: string;
   strategySide: 'UP' | 'DOWN';
+  marketImpliedProbabilityUp: number;
+  realizedOutcomeUp: number;
   marketImpliedProbability: number;
   predictedProbability: number;
   realizedOutcome: number;
@@ -126,6 +147,7 @@ export interface HistoricalExecutableCase {
   timeoutCancelCost: number;
   replayKey: string;
   regime: string;
+  marketArchetype: string;
   liquidityBucket: string;
   timeBucket: string;
   marketStructureBucket: string;
@@ -135,12 +157,31 @@ export interface HistoricalExecutableCase {
     | 'lastReturnPct'
     | 'realizedVolatility'
     | 'spread'
+    | 'spreadToDepthRatio'
     | 'topLevelDepth'
     | 'combinedDepth'
     | 'orderbookNoiseScore'
+    | 'flowImbalanceProxy'
+    | 'flowIntensity'
+    | 'micropriceBias'
+    | 'bookUpdateStress'
+    | 'btcMoveTransmission'
+    | 'signalDecayPressure'
+    | 'marketArchetype'
+    | 'marketArchetypeConfidence'
+    | 'marketStateTransition'
     | 'timeToExpirySeconds'
   >;
   microstructure: EventMicrostructureFeatures;
+  toxicity: {
+    toxicityScore: number;
+    bookInstabilityScore: number;
+    adverseSelectionRisk: number;
+    toxicityState: ToxicityState;
+    recommendedAction: ToxicityRecommendedAction;
+    reasons: string[];
+    capturedAt: string;
+  };
 }
 
 export interface RegimeHoldoutResult {
@@ -200,6 +241,13 @@ export interface P23ValidationPayload {
     averageRealizedReturn: number;
     scenarios: ExecutableEdgeStressScenario[];
   };
+  baselineComparison: BaselineComparisonReport;
+  rollingBenchmarkScorecard: RollingBenchmarkScorecard;
+  retentionReport: RetentionReport;
+  retentionContextReport: RetentionContextReport;
+  calibrationDriftAlerts: CalibrationDriftAlertsReport;
+  regimePerformanceReport: RegimePerformanceReport;
+  liveProofScorecard: LiveProofScorecard;
   regimeHoldouts: RegimeHoldoutResult[];
   calibrationAudit: CalibrationAudit;
   evidence: {
@@ -259,7 +307,7 @@ export function loadHistoricalValidationDataset(
     throw new Error('historical_validation_dataset_missing_replay_frames');
   }
 
-  return raw;
+  return normalizeHistoricalValidationDataset(raw);
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -288,6 +336,153 @@ function liquidityBucketForReplay(replay: HistoricalReplayFrame): string {
   return 'deep';
 }
 
+function normalizeHistoricalValidationDataset(
+  dataset: HistoricalValidationDataset,
+): HistoricalValidationDataset {
+  const replayBySlug = groupReplayFramesBySlug(dataset.replayFrames);
+  const replayFrames = dataset.observations.map((observation) => {
+    const matchedReplay = replayBySlug.get(observation.slug)?.shift() ?? null;
+    return matchedReplay ?? deriveReplayFrameFromObservation(observation);
+  });
+
+  return {
+    ...dataset,
+    replayFrames,
+  };
+}
+
+function groupReplayFramesBySlug(
+  replayFrames: HistoricalReplayFrame[],
+): Map<string, HistoricalReplayFrame[]> {
+  const grouped = new Map<string, HistoricalReplayFrame[]>();
+  for (const replay of replayFrames) {
+    const bucket = grouped.get(replay.slug) ?? [];
+    bucket.push(replay);
+    grouped.set(replay.slug, bucket);
+  }
+  return grouped;
+}
+
+function deriveReplayFrameFromObservation(
+  observation: HistoricalObservation,
+): HistoricalReplayFrame {
+  const impliedProbability = clamp(observation.marketImpliedProbabilityUp, 0.01, 0.99);
+  const quotedSpread = clamp(
+    observation.venueSnapshot.quotedSpreadProxy || 0.01,
+    0.001,
+    0.08,
+  );
+  const bestBid = clamp(
+    observation.venueSnapshot.bestBid ?? impliedProbability - quotedSpread / 2,
+    0.001,
+    0.999,
+  );
+  const bestAsk = clamp(
+    observation.venueSnapshot.bestAsk ?? impliedProbability + quotedSpread / 2,
+    Math.max(bestBid + 0.001, 0.002),
+    1,
+  );
+  const recentVolumes = observation.candleWindow.slice(-3).map((candle) => candle.volume);
+  const recentVolume =
+    recentVolumes.length > 0
+      ? recentVolumes.reduce((sum, value) => sum + value, 0) / recentVolumes.length
+      : 0;
+  const quoteSignal = Math.max(1, observation.quoteHistoryContext.length);
+  const topLevelDepth = clamp(
+    8 + (recentVolume * 0.35 + quoteSignal * 6) / (1 + quotedSpread * 25),
+    8,
+    140,
+  );
+  const combinedDepth = clamp(topLevelDepth * (2.2 + quoteSignal * 0.05), 18, 420);
+  const topLevelImbalance = clamp(
+    observation.quoteHistoryContext.length >= 2
+      ? (observation.quoteHistoryContext[observation.quoteHistoryContext.length - 1]!.probabilityUp -
+          observation.quoteHistoryContext[0]!.probabilityUp) /
+          Math.max(quotedSpread, 0.01)
+      : 0,
+    -1,
+    1,
+  );
+  const bidTopSize = roundDepthShare(topLevelDepth * (0.5 + topLevelImbalance * 0.15));
+  const askTopSize = roundDepthShare(Math.max(1, topLevelDepth - bidTopSize));
+  const bidLevels = buildSyntheticDepthLevels({
+    startPrice: bestBid,
+    direction: -1,
+    tickSize: determineTickSize(bestBid, bestAsk),
+    topSize: bidTopSize,
+    combinedDepth,
+  });
+  const askLevels = buildSyntheticDepthLevels({
+    startPrice: bestAsk,
+    direction: 1,
+    tickSize: determineTickSize(bestBid, bestAsk),
+    topSize: askTopSize,
+    combinedDepth,
+  });
+
+  return {
+    replayKey: `${observation.observationId}:derived_empirical_replay`,
+    slug: observation.slug,
+    tokenId: observation.upTokenId,
+    outcomeLabel: observation.outcomeLabels[0] ?? 'Up',
+    observedAt: observation.observedAt,
+    bestBid,
+    bestAsk,
+    spread: Math.max(0.001, bestAsk - bestBid),
+    bidLevels,
+    askLevels,
+    topLevelDepth: roundDepthShare(bidLevels[0]!.size + askLevels[0]!.size),
+    combinedDepth: roundDepthShare(
+      bidLevels.reduce((sum, level) => sum + level.size, 0) +
+        askLevels.reduce((sum, level) => sum + level.size, 0),
+    ),
+    makerFeeRate: observation.venueSnapshot.makerFeeRate,
+    takerFeeRate: observation.venueSnapshot.takerFeeRate,
+    orderMinSize: observation.venueSnapshot.orderMinSize,
+    tradeSize: observation.venueSnapshot.orderMinSize,
+    fetchLatencyMs: Math.round(clamp(55 + quotedSpread * 900 + quoteSignal * 5, 45, 220)),
+    timeoutCancelRisk: clamp(0.04 + quotedSpread * 3.5 + 14 / combinedDepth, 0.03, 0.22),
+    empiricalSlippage: clamp(quotedSpread * 0.12 + 6 / combinedDepth, 0, 0.015),
+  };
+}
+
+function buildSyntheticDepthLevels(input: {
+  startPrice: number;
+  direction: 1 | -1;
+  tickSize: number;
+  topSize: number;
+  combinedDepth: number;
+}): Array<{ price: number; size: number }> {
+  const levelShares = [1, 0.78, 0.56, 0.38, 0.24];
+  const totalShare = levelShares.reduce((sum, value) => sum + value, 0);
+  const sideDepth = Math.max(input.topSize, input.combinedDepth / 2);
+  const scale = sideDepth / totalShare;
+
+  return levelShares.map((share, index) => ({
+    price: clamp(
+      input.startPrice + input.direction * input.tickSize * index,
+      0.001,
+      0.999,
+    ),
+    size: roundDepthShare(Math.max(1, input.topSize * share, scale * share)),
+  }));
+}
+
+function determineTickSize(bestBid: number, bestAsk: number): number {
+  const spread = Math.max(0.001, bestAsk - bestBid);
+  if (spread <= 0.002) {
+    return 0.001;
+  }
+  if (spread <= 0.02) {
+    return 0.005;
+  }
+  return 0.01;
+}
+
+function roundDepthShare(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
 export function buildEmpiricalWalkForwardSamples(dataset: HistoricalValidationDataset): {
   samples: WalkForwardSample[];
   executableCases: HistoricalExecutableCase[];
@@ -299,6 +494,7 @@ export function buildEmpiricalWalkForwardSamples(dataset: HistoricalValidationDa
   const edgeModel = new RegimeConditionedEdgeModel();
   const executableEvModel = new ExecutableEvModel();
   const microstructureModel = new EventMicrostructureModel();
+  const toxicityPolicy = new ToxicityPolicy();
 
   const executableCases: HistoricalExecutableCase[] = [];
   const samples: WalkForwardSample[] = [];
@@ -363,6 +559,28 @@ export function buildEmpiricalWalkForwardSamples(dataset: HistoricalValidationDa
       posteriorProbability: posterior.posteriorProbability,
       marketImpliedProbability: observation.marketImpliedProbabilityUp,
     });
+    const toxicity = toxicityPolicy.evaluate({
+      features: {
+        flowImbalanceProxy: features.flowImbalanceProxy,
+        flowIntensity: features.flowIntensity,
+        micropriceBias: features.micropriceBias,
+        btcMoveTransmission: features.btcMoveTransmission,
+        signalDecayPressure: features.signalDecayPressure,
+        bookUpdateStress: features.bookUpdateStress,
+        orderbookNoiseScore: features.orderbookNoiseScore,
+        spread: features.spread,
+        spreadToDepthRatio: features.spreadToDepthRatio,
+        topLevelDepth: features.topLevelDepth,
+        timeToExpirySeconds: features.timeToExpirySeconds,
+        lastReturnPct: features.lastReturnPct,
+        rollingReturnPct: features.rollingReturnPct,
+        marketStateTransition: features.marketStateTransition,
+      },
+      regimeLabel: regime.label,
+      structuralToxicityBias: regime.toxicityBias,
+      signalAgeMs:
+        features.timeToExpirySeconds != null ? Math.max(0, 300 - features.timeToExpirySeconds) * 1_000 : null,
+    });
 
     const tradeUp = posterior.posteriorProbability >= 0.5;
     const predictedProbability = tradeUp
@@ -422,6 +640,8 @@ export function buildEmpiricalWalkForwardSamples(dataset: HistoricalValidationDa
       slug: observation.slug,
       observedAt: observation.observedAt,
       strategySide: tradeUp ? 'UP' : 'DOWN',
+      marketImpliedProbabilityUp: observation.marketImpliedProbabilityUp,
+      realizedOutcomeUp: observation.realizedOutcomeUp,
       marketImpliedProbability,
       predictedProbability,
       realizedOutcome,
@@ -437,6 +657,7 @@ export function buildEmpiricalWalkForwardSamples(dataset: HistoricalValidationDa
       timeoutCancelCost,
       replayKey: replay.replayKey,
       regime: regime.label,
+      marketArchetype: features.marketArchetype,
       liquidityBucket: liquidityBucketForReplay(replay),
       timeBucket: observation.timeBucket,
       marketStructureBucket: microstructure.structureBucket,
@@ -445,12 +666,31 @@ export function buildEmpiricalWalkForwardSamples(dataset: HistoricalValidationDa
         lastReturnPct: features.lastReturnPct,
         realizedVolatility: features.realizedVolatility,
         spread: features.spread,
+        spreadToDepthRatio: features.spreadToDepthRatio,
         topLevelDepth: features.topLevelDepth,
         combinedDepth: features.combinedDepth,
         orderbookNoiseScore: features.orderbookNoiseScore,
+        flowImbalanceProxy: features.flowImbalanceProxy,
+        flowIntensity: features.flowIntensity,
+        micropriceBias: features.micropriceBias,
+        bookUpdateStress: features.bookUpdateStress,
+        btcMoveTransmission: features.btcMoveTransmission,
+        signalDecayPressure: features.signalDecayPressure,
+        marketArchetype: features.marketArchetype,
+        marketArchetypeConfidence: features.marketArchetypeConfidence,
+        marketStateTransition: features.marketStateTransition,
         timeToExpirySeconds: features.timeToExpirySeconds,
       },
       microstructure,
+      toxicity: {
+        toxicityScore: toxicity.toxicityScore,
+        bookInstabilityScore: toxicity.bookInstabilityScore,
+        adverseSelectionRisk: toxicity.adverseSelectionRisk,
+        toxicityState: toxicity.toxicityState,
+        recommendedAction: toxicity.recommendedAction,
+        reasons: [...toxicity.reasons],
+        capturedAt: toxicity.capturedAt,
+      },
     };
     executableCases.push(executableCase);
 
@@ -791,8 +1031,58 @@ export async function runP23Validation(options?: {
     auditCoverage: mode === 'empirical' ? 1 : 0,
   });
   const executableEdge = evaluateExecutableEdgeOnHistoricalCases(executableCases);
+  const baselineComparison = buildBaselineComparison(executableCases);
+  const rollingBenchmarkScorecard = buildRollingBenchmarkScorecard({
+    executableCases,
+    now: options?.now,
+  });
+  const retentionReport = buildRetentionReport({
+    executableCases,
+    now: options?.now,
+  });
+  const retentionContextReport = buildRetentionContextReport({
+    observations: executableCases.map((entry) => ({
+      regime: entry.regime,
+      archetype: entry.marketArchetype,
+      toxicityState: entry.toxicity.toxicityState,
+      expectedNetEdge: entry.costAdjustedEv,
+      realizedNetEdge: entry.realizedReturn,
+    })),
+    now: options?.now,
+  });
+  const calibrationDriftAlerts = buildCalibrationDriftAlerts({
+    observations: executableCases.map((entry) => ({
+      regime: entry.regime,
+      archetype: entry.marketArchetype,
+      predictedProbability: entry.predictedProbability,
+      realizedOutcome: entry.realizedOutcome,
+    })),
+    now: options?.now,
+  });
+  const regimePerformanceReport = buildRegimePerformanceReport({
+    executableCases,
+    baselineComparison,
+    retentionReport,
+    now: options?.now,
+  });
   const regimeHoldouts = evaluateRegimeHoldouts(executableCases);
   const calibrationAudit = buildCalibrationAudit(validation);
+  const liveProofScorecard = buildLiveProofScorecard({
+    mode,
+    datasetType: datasetSummary.datasetType,
+    datasetQuality,
+    evidence: {
+      empiricalEvidenceUsed: mode === 'empirical',
+      syntheticAllowed: options?.allowSyntheticSmoke === true,
+    },
+    governance,
+    robustness,
+    promotion,
+    baselineComparison,
+    retentionReport,
+    regimePerformanceReport,
+    now: options?.now,
+  });
 
   const provisionalPayload: P23ValidationPayload = {
     mode,
@@ -803,6 +1093,13 @@ export async function runP23Validation(options?: {
     robustness,
     promotion,
     executableEdge,
+    baselineComparison,
+    rollingBenchmarkScorecard,
+    retentionReport,
+    retentionContextReport,
+    calibrationDriftAlerts,
+    regimePerformanceReport,
+    liveProofScorecard,
     regimeHoldouts,
     calibrationAudit,
     evidence: {

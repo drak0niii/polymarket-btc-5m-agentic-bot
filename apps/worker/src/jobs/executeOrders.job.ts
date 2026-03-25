@@ -18,6 +18,7 @@ import { buildStrategyVariantId } from '@polymarket-btc-5m-agentic-bot/domain';
 import { SignerHealth } from '@polymarket-btc-5m-agentic-bot/signing-engine';
 import {
   LiveTradeGuard,
+  LiveSizingFeedbackPolicy,
   MaxLossPerOpportunityPolicy,
 } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import { PreTradeFundingValidator } from '@polymarket-btc-5m-agentic-bot/risk-engine';
@@ -40,6 +41,7 @@ import {
   PolymarketNormalizedVenueError,
 } from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
 import { RuntimeControlRepository } from '@worker/runtime/runtime-control.repository';
+import { DecisionLogService } from '@worker/runtime/decision-log.service';
 import { LearningStateStore } from '@worker/runtime/learning-state-store';
 import { AccountStateService } from '@worker/portfolio/account-state.service';
 import {
@@ -51,7 +53,13 @@ import {
   ExternalPortfolioSnapshot,
 } from '@worker/portfolio/external-portfolio.service';
 import { permissionsForRuntimeState } from '@worker/runtime/runtime-state-machine';
-import { MarketEligibilityService } from '@polymarket-btc-5m-agentic-bot/signal-engine';
+import {
+  MarketEligibilityService,
+  LossAttributionClassifier,
+  ToxicityPolicy,
+  type ToxicityTrendPoint,
+  createAlphaAttribution,
+} from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { VenueOperationalPolicyService } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import {
   VenueHealthLearningStore,
@@ -60,6 +68,7 @@ import {
 } from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
 import {
   VersionLineageRegistry,
+  buildLossAttributionTags,
   buildCalibrationVersionLineage,
   buildExecutionPolicyVersionLineage,
   buildFeatureSetVersionLineage,
@@ -97,6 +106,7 @@ export class ExecuteOrdersJob {
   private readonly venueOrderValidator = new VenueOrderValidator();
   private readonly executionDiagnostics = new ExecutionDiagnostics();
   private readonly marketEligibility = new MarketEligibilityService();
+  private readonly toxicityPolicy = new ToxicityPolicy();
   private readonly orderIntentService = new OrderIntentService();
   private readonly operationalPolicy = new VenueOperationalPolicyService();
   private readonly adaptiveMakerTakerPolicy = new AdaptiveMakerTakerPolicy();
@@ -105,6 +115,8 @@ export class ExecuteOrdersJob {
   private readonly sizeVsLiquidityPolicy = new SizeVsLiquidityPolicy();
   private readonly entryTimingEfficiencyScorer = new EntryTimingEfficiencyScorer();
   private readonly maxLossPerOpportunityPolicy = new MaxLossPerOpportunityPolicy();
+  private readonly liveSizingFeedbackPolicy = new LiveSizingFeedbackPolicy();
+  private readonly lossAttributionClassifier = new LossAttributionClassifier();
   private readonly versionLineageRegistry: VersionLineageRegistry;
   private readonly venueHealthLearningStore: VenueHealthLearningStore;
   private readonly venueUncertaintyDetector = new VenueUncertaintyDetector();
@@ -127,6 +139,7 @@ export class ExecuteOrdersJob {
   private readonly executionPolicyVersionStore: ExecutionPolicyVersionStore | null;
   private readonly externalPortfolioService: ExternalPortfolioService;
   private readonly accountStateService: Pick<AccountStateService, 'capture'>;
+  private readonly decisionLogService: DecisionLogService;
   private readonly orderIntentRepository: Pick<
     OrderIntentRepository,
     'record' | 'loadLatest'
@@ -163,6 +176,7 @@ export class ExecuteOrdersJob {
       versionLineageRegistry ?? new VersionLineageRegistry();
     this.venueHealthLearningStore =
       venueHealthLearningStore ?? createDefaultVenueHealthLearningStore(this.learningStateStore);
+    this.decisionLogService = new DecisionLogService(this.prisma);
     this.externalPortfolioService = new ExternalPortfolioService(
       this.prisma,
       this.tradingClient,
@@ -244,15 +258,23 @@ export class ExecuteOrdersJob {
       take: 20,
     });
     const prismaAny = this.prisma as any;
-    const [recentExecutionDiagnostics, learningState] = await Promise.all([
+    const [recentExecutionDiagnostics, recentAuditEvents, learningState] = await Promise.all([
       prismaAny.executionDiagnostic?.findMany
         ? prismaAny.executionDiagnostic.findMany({
             orderBy: { capturedAt: 'desc' },
             take: 80,
           })
         : Promise.resolve([]),
+      prismaAny.auditEvent?.findMany
+        ? prismaAny.auditEvent.findMany({
+            orderBy: { createdAt: 'desc' },
+            take: 80,
+          })
+        : Promise.resolve([]),
       this.learningStateStore ? this.learningStateStore.load() : Promise.resolve(null),
     ]);
+    const latestAlphaAttributionReview =
+      this.readLatestAlphaAttributionReview(recentAuditEvents);
 
     let submitted = 0;
     let rejected = 0;
@@ -285,6 +307,10 @@ export class ExecuteOrdersJob {
         rejected += 1;
         continue;
       }
+      const upstreamEvaluationDecision =
+        await this.versionLineageRegistry.getLatestForSignalDecision(decision.id);
+      const upstreamEvaluationEvidence =
+        this.readUpstreamEvaluationEvidence(upstreamEvaluationDecision);
 
       if (!signal.strategyVersionId) {
         await this.rejectSignal(signal.id, 'strategy_version_missing');
@@ -503,7 +529,71 @@ export class ExecuteOrdersJob {
         activeExecutionPolicy?.contextKey && learningState
           ? learningState.executionLearning.contexts[activeExecutionPolicy.contextKey] ?? null
           : null;
-      const adaptiveExecution = this.adaptiveMakerTakerPolicy.decide({
+      const calibration =
+        signal.strategyVersionId && learningState
+          ? this.resolveCalibrationForSignal(
+              learningState,
+              strategyVariantId,
+              signal.regime ?? null,
+            )
+          : null;
+      const regimeSnapshot =
+        signal.strategyVersionId && learningState
+          ? this.resolveRegimeSnapshot(learningState, strategyVariantId, signal.regime ?? null)
+          : null;
+      const regimeHealth = regimeSnapshot?.health ?? null;
+      const toxicity = this.buildExecutionToxicity({
+        signalAgeMs,
+        signal,
+        orderbook,
+        expiryAt,
+        recentToxicityHistory: this.selectRecentToxicityHistory(
+          recentAuditEvents,
+          signal.marketId,
+        ),
+      });
+      const executionCostCalibration = this.executionCostCalibrator.calibrate({
+        activePolicyVersion: activeExecutionPolicy,
+        executionContext,
+        recentObservations: this.selectRecentExecutionCostObservations(
+          recentExecutionDiagnostics,
+          signal.strategyVersionId,
+          signal.regime ?? null,
+        ),
+        cancelFailureRate: 0,
+        venueUncertaintyLabel: venueAssessment.label,
+      });
+      const executionDrift = this.averageExecutionDrift(
+        recentExecutionDiagnostics,
+        signal.strategyVersionId,
+        signal.regime ?? null,
+      );
+      const liveSizingFeedback = this.liveSizingFeedbackPolicy.evaluate({
+        retentionRatio: latestAlphaAttributionReview?.averageRetentionRatio ?? null,
+        calibrationHealth: calibration?.health ?? null,
+        executionDrift,
+        regimeDegradation: regimeHealth,
+        toxicityState: toxicity.toxicityState,
+        venueUncertainty: venueAssessment.label,
+        realizedVsExpected:
+          regimeSnapshot?.realizedVsExpected ??
+          latestAlphaAttributionReview?.realizedVsExpected ??
+          null,
+      });
+      const liveSizingRecoveryProbationState =
+        typeof liveSizingFeedback.recoveryProbationState === 'string'
+          ? liveSizingFeedback.recoveryProbationState
+          : 'none';
+      const liveSizingUpshiftEligibility =
+        typeof liveSizingFeedback.upshiftEligibility === 'string'
+          ? liveSizingFeedback.upshiftEligibility
+          : 'eligible';
+      const liveSizingReasonCodes = Array.isArray(liveSizingFeedback.sizingReasonCodes)
+        ? liveSizingFeedback.sizingReasonCodes
+        : Array.isArray(liveSizingFeedback.reasonCodes)
+          ? liveSizingFeedback.reasonCodes
+          : [];
+      let adaptiveExecution = this.adaptiveMakerTakerPolicy.decide({
         activePolicyVersion: activeExecutionPolicy,
         marketContext: {
           strategyVariantId,
@@ -519,24 +609,84 @@ export class ExecuteOrdersJob {
       });
       if (
         isNewExposure &&
-        !activeSafetyState.allowAggressiveEntries &&
+        toxicity.passiveOnly &&
         adaptiveExecution.executionStyle === 'cross'
       ) {
-        await this.rejectSignal(signal.id, 'safety_state_passive_only');
+        adaptiveExecution = {
+          ...adaptiveExecution,
+          mode: activeExecutionPolicy?.mode ?? adaptiveExecution.mode,
+          route: 'maker',
+          executionStyle: 'rest',
+          preferResting: true,
+          rationale: [...adaptiveExecution.rationale, ...toxicity.aggressionReasonCodes],
+        };
+      }
+      if (
+        isNewExposure &&
+        liveSizingFeedback.aggressionCap === 'passive_only' &&
+        adaptiveExecution.executionStyle === 'cross'
+      ) {
+        adaptiveExecution = {
+          ...adaptiveExecution,
+          mode: activeExecutionPolicy?.mode ?? adaptiveExecution.mode,
+          route: 'maker',
+          executionStyle: 'rest',
+          preferResting: true,
+          rationale: [...adaptiveExecution.rationale, 'live_sizing_feedback_passive_only'],
+        };
+      }
+      if (
+        isNewExposure &&
+        liveSizingRecoveryProbationState !== 'none'
+      ) {
+        adaptiveExecution = {
+          ...adaptiveExecution,
+          rationale: Array.from(
+            new Set([
+              ...adaptiveExecution.rationale,
+              `live_sizing_feedback_recovery_probation_${liveSizingRecoveryProbationState}`,
+              `live_sizing_feedback_upshift_${liveSizingUpshiftEligibility}`,
+              ...liveSizingReasonCodes,
+            ]),
+          ),
+        };
+      }
+      if (isNewExposure && toxicity.temporarilyBlockRegime) {
+        await this.rejectSignal(signal.id, 'toxicity_temporarily_blocks_regime');
         rejected += 1;
         continue;
       }
-      const executionCostCalibration = this.executionCostCalibrator.calibrate({
-        activePolicyVersion: activeExecutionPolicy,
-        executionContext,
-        recentObservations: this.selectRecentExecutionCostObservations(
-          recentExecutionDiagnostics,
-          signal.strategyVersionId,
-          signal.regime ?? null,
-        ),
-        cancelFailureRate: 0,
-        venueUncertaintyLabel: venueAssessment.label,
-      });
+      if (
+        isNewExposure &&
+        liveSizingFeedback.regimePermissionOverride === 'block_new_entries'
+      ) {
+        await this.rejectSignal(signal.id, 'live_sizing_feedback_blocks_new_entries');
+        rejected += 1;
+        continue;
+      }
+      if (
+        isNewExposure &&
+        liveSizingFeedback.regimePermissionOverride === 'reduce_only'
+      ) {
+        await this.rejectSignal(signal.id, 'live_sizing_feedback_reduce_only');
+        rejected += 1;
+        continue;
+      }
+      if (
+        isNewExposure &&
+        (toxicity.executionAggressionLock === 'passive_only' ||
+          !activeSafetyState.allowAggressiveEntries) &&
+        adaptiveExecution.executionStyle === 'cross'
+      ) {
+        await this.rejectSignal(
+          signal.id,
+          toxicity.executionAggressionLock === 'passive_only'
+            ? 'toxicity_passive_only_lock'
+            : 'safety_state_passive_only',
+        );
+        rejected += 1;
+        continue;
+      }
       const entryTiming = this.entryTimingEfficiencyScorer.score({
         signalAgeMs,
         timeToExpirySeconds: Math.max(
@@ -583,7 +733,10 @@ export class ExecuteOrdersJob {
       const capitalAwareDecisionSize =
         decision.positionSize *
         (isNewExposure
-          ? activeSafetyState.sizeMultiplier * venueMode.sizeMultiplier
+          ? activeSafetyState.sizeMultiplier *
+            venueMode.sizeMultiplier *
+            toxicity.sizeMultiplier *
+            liveSizingFeedback.sizeMultiplier
           : 1);
       const initialSize = Math.max(0, capitalAwareDecisionSize / price);
       const liquidityDecision = this.sizeVsLiquidityPolicy.evaluate({
@@ -717,10 +870,16 @@ export class ExecuteOrdersJob {
 
       if (
         isNewExposure &&
-        !activeSafetyState.allowAggressiveEntries &&
+        (toxicity.executionAggressionLock === 'passive_only' ||
+          !activeSafetyState.allowAggressiveEntries) &&
         orderPlan.executionStyle === 'cross'
       ) {
-        await this.rejectSignal(signal.id, 'safety_state_passive_only');
+        await this.rejectSignal(
+          signal.id,
+          toxicity.executionAggressionLock === 'passive_only'
+            ? 'toxicity_passive_only_lock'
+            : 'safety_state_passive_only',
+        );
         rejected += 1;
         continue;
       }
@@ -769,6 +928,29 @@ export class ExecuteOrdersJob {
       const executionAdjustedEdge =
         signal.expectedEv -
         Math.max(0, executionCostAssessment.breakdown.totalCost - executionCostCalibration.feeCost);
+      const retainedEdgeExpectation = this.buildRetentionDiagnostics({
+        upstreamExpectedNetEdge:
+          upstreamEvaluationEvidence.alphaAttribution?.expectedNetEdge ?? null,
+        executionAdjustedEdge,
+        marketArchetype: upstreamEvaluationEvidence.marketArchetype,
+        toxicityState:
+          upstreamEvaluationEvidence.toxicityState ?? toxicity.toxicityState,
+      });
+      if (
+        liveSizingFeedback.thresholdAdjustment > 0 &&
+        executionAdjustedEdge <= liveSizingFeedback.thresholdAdjustment
+      ) {
+        await this.rejectSignal(signal.id, 'live_sizing_feedback_threshold_not_met');
+        rejected += 1;
+        continue;
+      }
+      if (
+        retainedEdgeExpectation.reasonCodes.includes('retained_edge_expectation_not_met')
+      ) {
+        await this.rejectSignal(signal.id, 'retained_edge_expectation_not_met');
+        rejected += 1;
+        continue;
+      }
       if (executionAdjustedEdge <= 0) {
         await this.rejectSignal(signal.id, 'execution_cost_adjusted_edge_non_positive');
         rejected += 1;
@@ -1159,6 +1341,75 @@ export class ExecuteOrdersJob {
         },
       });
 
+      const signalDirectionSign = (signal.edge ?? 0) < 0 ? -1 : 1;
+      const alphaAttribution = createAlphaAttribution({
+        rawForecastProbability: signal.posteriorProbability,
+        marketImpliedProbability: signal.marketImpliedProb,
+        confidenceAdjustedEdge: signal.edge,
+        paperEdge:
+          upstreamEvaluationEvidence.alphaAttribution?.paperEdge ??
+          (signal.expectedEv != null
+            ? signalDirectionSign * Math.abs(signal.expectedEv)
+            : signal.edge),
+        expectedExecutionCost: {
+          ...executionCostAssessment.breakdown,
+          venuePenalty: venueAssessment.label === 'unsafe' ? 0.004 : 0,
+        },
+        expectedNetEdge: signalDirectionSign * executionAdjustedEdge,
+        realizedExecutionCost:
+          postedStatus === 'filled'
+            ? {
+                feeCost: feeModel.expectedFee,
+                slippageCost: slippage.expectedSlippage,
+                adverseSelectionCost: 0,
+                fillDecayCost: 0,
+                cancelReplaceOverheadCost: 0,
+                missedOpportunityCost: 0,
+                venuePenalty: venueAssessment.label === 'unsafe' ? 0.004 : 0,
+              }
+            : null,
+        realizedNetEdge:
+          postedStatus === 'filled'
+            ? signalDirectionSign *
+              (signal.expectedEv - feeModel.expectedFee - slippage.expectedSlippage)
+            : null,
+        capturedAt: new Date().toISOString(),
+      });
+      const realizedRetentionDiagnostics = this.buildRetentionDiagnostics({
+        upstreamExpectedNetEdge:
+          upstreamEvaluationEvidence.alphaAttribution?.expectedNetEdge ?? null,
+        executionAdjustedEdge,
+        realizedNetEdge: alphaAttribution.realizedNetEdge,
+        marketArchetype: upstreamEvaluationEvidence.marketArchetype,
+        toxicityState:
+          upstreamEvaluationEvidence.toxicityState ?? toxicity.toxicityState,
+      });
+      const realizedFillRate =
+        postedStatus === 'filled'
+          ? 1
+          : postedStatus === 'partially_filled'
+            ? 0.5
+            : 0;
+      const expectedFillRate = this.estimateExpectedFillRate({
+        route: orderPlan.route,
+        executionStyle: orderPlan.executionStyle,
+        orderType: orderPlan.orderType,
+        partialFillTolerance: orderPlan.partialFillTolerance,
+      });
+      const lossAttribution = this.lossAttributionClassifier.classify({
+        alphaAttribution,
+        signalAgeMs,
+        fillRate: realizedFillRate,
+        expectedFillRate,
+        toxicityState: toxicity.toxicityState,
+        regimeHealth,
+        sizeToDepthRatio: topLevelDepth > 0 ? size / topLevelDepth : null,
+        liquidityReductionRatio:
+          initialSize > 0 ? Math.max(0, 1 - size / initialSize) : null,
+        entryTimingLabel: entryTiming.label,
+        retainedEdgeReasonCodes: realizedRetentionDiagnostics.reasonCodes,
+      });
+
       if (prismaAny.executionDiagnostic?.create) {
         const snapshot = this.executionDiagnostics.create({
           orderId: localOrderId,
@@ -1247,6 +1498,12 @@ export class ExecuteOrdersJob {
             feeModel,
             executionCostCalibration,
             executionCostAssessment,
+            toxicity,
+            liveSizingFeedback,
+            alphaAttribution,
+            lossAttribution,
+            retainedEdgeExpectation: realizedRetentionDiagnostics,
+            upstreamEvaluationEvidence,
             liquidityDecision,
             entryTiming,
             lossCapDecision,
@@ -1272,19 +1529,6 @@ export class ExecuteOrdersJob {
           } as object,
         },
       });
-      const calibration = signal.strategyVersionId && learningState
-        ? Object.values(learningState.calibration).find(
-            (candidate) =>
-              candidate.strategyVariantId === buildStrategyVariantId(signal.strategyVersionId!) &&
-              candidate.regime === (signal.regime ?? null),
-          ) ??
-          Object.values(learningState.calibration).find(
-            (candidate) =>
-              candidate.strategyVariantId === buildStrategyVariantId(signal.strategyVersionId!) &&
-              candidate.regime == null,
-          ) ??
-          null
-        : null;
       await this.versionLineageRegistry.recordDecision({
         decisionId: auditEventId,
         decisionType: 'order_execution',
@@ -1322,6 +1566,12 @@ export class ExecuteOrdersJob {
               guard,
               executionCostCalibration,
               executionCostAssessment,
+              toxicity,
+              liveSizingFeedback,
+              alphaAttribution,
+              lossAttribution,
+              retainedEdgeExpectation: realizedRetentionDiagnostics,
+              upstreamEvaluationEvidence,
               liquidityDecision,
               entryTiming,
               lossCapDecision,
@@ -1355,10 +1605,16 @@ export class ExecuteOrdersJob {
             feeModel,
             executionCostCalibration,
             executionCostAssessment,
+            alphaAttribution,
+            lossAttribution,
+            toxicity,
+            liveSizingFeedback,
             liquidityDecision,
             entryTiming,
             lossCapDecision,
             executionAdjustedEdge,
+            retainedEdgeExpectation: realizedRetentionDiagnostics,
+            upstreamEvaluationEvidence,
             makerQuality,
             slippage,
             duplicateExposureVerdict,
@@ -1366,7 +1622,31 @@ export class ExecuteOrdersJob {
           venueMode: venueMode.mode,
           venueUncertainty: venueAssessment.label,
         },
-        tags: ['wave5', 'order-execution', submitSucceeded ? 'submitted' : 'rejected'],
+        tags: [
+          'wave5',
+          'phase12_wave4',
+          'order-execution',
+          `archetype:${realizedRetentionDiagnostics.marketArchetype ?? 'unknown'}`,
+          `toxicity:${realizedRetentionDiagnostics.toxicityState ?? 'unknown'}`,
+          ...buildLossAttributionTags(lossAttribution),
+          submitSucceeded ? 'submitted' : 'rejected',
+        ],
+      });
+      await this.decisionLogService.record({
+        createdAt: new Date().toISOString(),
+        category: 'post_trade',
+        eventType: 'trade.loss_attribution_classified',
+        summary: `Loss attribution classified for order ${localOrderId}.`,
+        marketId: market.id,
+        signalId: signal.id,
+        orderId: localOrderId,
+        payload: {
+          lossAttribution,
+          alphaAttribution,
+          retainedEdgeExpectation: realizedRetentionDiagnostics,
+          toxicity,
+          liveSizingFeedback,
+        },
       });
 
       if (submitSucceeded) {
@@ -1517,6 +1797,289 @@ export class ExecuteOrdersJob {
       }));
   }
 
+  private averageExecutionDrift(
+    diagnostics: unknown[],
+    strategyVersionId: string | null,
+    regime: string | null,
+  ): number | null {
+    const values = (diagnostics ?? [])
+      .filter(
+        (diagnostic) =>
+          (strategyVersionId == null ||
+            this.readStringField(diagnostic, 'strategyVersionId') === strategyVersionId) &&
+          (regime == null || this.readStringField(diagnostic, 'regime') === regime),
+      )
+      .map((diagnostic) => this.readNumberField(diagnostic, 'evDrift'))
+      .filter((value): value is number => value != null && Number.isFinite(value));
+
+    if (values.length === 0) {
+      return null;
+    }
+
+    return values.reduce((sum, value) => sum + value, 0) / values.length;
+  }
+
+  private readLatestAlphaAttributionReview(auditEvents: unknown[]): {
+    averageRetentionRatio: number | null;
+    realizedVsExpected: number | null;
+  } | null {
+    const candidate = [...(auditEvents ?? [])]
+      .filter((event) => this.readStringField(event, 'eventType') === 'learning.alpha_attribution_review')
+      .sort((left, right) => {
+        const leftTime = this.readDateField(left, 'createdAt')?.getTime() ?? Number.NEGATIVE_INFINITY;
+        const rightTime =
+          this.readDateField(right, 'createdAt')?.getTime() ?? Number.NEGATIVE_INFINITY;
+        return rightTime - leftTime;
+      })[0];
+
+    if (!candidate || typeof candidate !== 'object') {
+      return null;
+    }
+
+    const metadata =
+      'metadata' in candidate && candidate.metadata && typeof candidate.metadata === 'object'
+        ? (candidate.metadata as Record<string, unknown>)
+        : {};
+    const averageExpectedNetEdge =
+      typeof metadata.averageExpectedNetEdge === 'number' &&
+      Number.isFinite(metadata.averageExpectedNetEdge)
+        ? metadata.averageExpectedNetEdge
+        : null;
+    const averageRealizedNetEdge =
+      typeof metadata.averageRealizedNetEdge === 'number' &&
+      Number.isFinite(metadata.averageRealizedNetEdge)
+        ? metadata.averageRealizedNetEdge
+        : null;
+    const averageRetentionRatio =
+      typeof metadata.averageRetentionRatio === 'number' &&
+      Number.isFinite(metadata.averageRetentionRatio)
+        ? metadata.averageRetentionRatio
+        : null;
+
+    return {
+      averageRetentionRatio,
+      realizedVsExpected:
+        averageExpectedNetEdge != null && Math.abs(averageExpectedNetEdge) > 1e-9
+          ? (averageRealizedNetEdge ?? 0) / averageExpectedNetEdge
+          : null,
+    };
+  }
+
+  private selectRecentToxicityHistory(
+    auditEvents: unknown[],
+    marketId: string,
+  ): ToxicityTrendPoint[] {
+    const entries = (auditEvents ?? [])
+      .map((event) => this.extractToxicityHistoryEntry(event))
+      .filter(
+        (
+          entry,
+        ): entry is ToxicityTrendPoint & {
+          marketId: string | null;
+        } => entry != null,
+      );
+    const byMarket = entries.filter((entry) => entry.marketId === marketId);
+    const selected = byMarket.length >= 3 ? byMarket : entries;
+    return selected.slice(0, 8).map((entry) => ({
+      toxicityScore: entry.toxicityScore,
+      toxicityState: entry.toxicityState,
+      recommendedAction: entry.recommendedAction,
+      capturedAt: entry.capturedAt,
+    }));
+  }
+
+  private extractToxicityHistoryEntry(
+    event: unknown,
+  ): (ToxicityTrendPoint & { marketId: string | null }) | null {
+    if (!event || typeof event !== 'object') {
+      return null;
+    }
+
+    const record = event as Record<string, unknown>;
+    const metadata =
+      record.metadata && typeof record.metadata === 'object'
+        ? (record.metadata as Record<string, unknown>)
+        : null;
+    const toxicity =
+      metadata?.toxicity && typeof metadata.toxicity === 'object'
+        ? (metadata.toxicity as Record<string, unknown>)
+        : null;
+    const toxicityScore =
+      toxicity && typeof toxicity.toxicityScore === 'number' ? toxicity.toxicityScore : null;
+    if (toxicityScore == null) {
+      return null;
+    }
+
+    return {
+      toxicityScore,
+      toxicityState:
+        toxicity && typeof toxicity.toxicityState === 'string'
+          ? toxicity.toxicityState
+          : null,
+      recommendedAction:
+        toxicity && typeof toxicity.recommendedAction === 'string'
+          ? toxicity.recommendedAction
+          : null,
+      capturedAt: this.readDateField(event, 'createdAt')?.toISOString() ?? null,
+      marketId: this.readStringField(event, 'marketId'),
+    };
+  }
+
+  private readUpstreamEvaluationEvidence(
+    record: Awaited<ReturnType<VersionLineageRegistry['getLatestForSignalDecision']>>,
+  ): {
+    alphaAttribution: {
+      expectedNetEdge: number | null;
+      paperEdge: number | null;
+    } | null;
+    marketArchetype: string | null;
+    toxicityState: string | null;
+  } {
+    const bundle =
+      record?.replay?.activeParameterBundle &&
+      typeof record.replay.activeParameterBundle === 'object'
+        ? (record.replay.activeParameterBundle as Record<string, unknown>)
+        : null;
+    const alpha =
+      bundle?.alphaAttribution && typeof bundle.alphaAttribution === 'object'
+        ? (bundle.alphaAttribution as Record<string, unknown>)
+        : null;
+    const upstream =
+      bundle?.upstreamSignalBuildEvidence &&
+      typeof bundle.upstreamSignalBuildEvidence === 'object'
+        ? (bundle.upstreamSignalBuildEvidence as Record<string, unknown>)
+        : null;
+    const retained =
+      bundle?.retainedEdgeExpectation &&
+      typeof bundle.retainedEdgeExpectation === 'object'
+        ? (bundle.retainedEdgeExpectation as Record<string, unknown>)
+        : null;
+
+    return {
+      alphaAttribution: alpha
+        ? {
+            expectedNetEdge: this.readNumberField(alpha, 'expectedNetEdge'),
+            paperEdge: this.readNumberField(alpha, 'paperEdge'),
+          }
+        : null,
+      marketArchetype:
+        this.readStringField(retained, 'marketArchetype') ??
+        this.readStringField(upstream, 'marketArchetype'),
+      toxicityState:
+        this.readStringField(retained, 'toxicityState') ??
+        this.readStringField(upstream, 'toxicityState'),
+    };
+  }
+
+  private buildRetentionDiagnostics(input: {
+    upstreamExpectedNetEdge: number | null;
+    executionAdjustedEdge: number | null;
+    realizedNetEdge?: number | null;
+    marketArchetype: string | null;
+    toxicityState: string | null;
+  }): {
+    upstreamExpectedNetEdge: number | null;
+    currentExpectedNetEdge: number | null;
+    realizedNetEdge: number | null;
+    expectedRetentionRatio: number | null;
+    realizedRetentionRatio: number | null;
+    marketArchetype: string | null;
+    toxicityState: string | null;
+    reasonCodes: string[];
+  } {
+    const expectedRetentionRatio =
+      input.upstreamExpectedNetEdge != null &&
+      Math.abs(input.upstreamExpectedNetEdge) > 1e-9 &&
+      input.executionAdjustedEdge != null
+        ? input.executionAdjustedEdge / input.upstreamExpectedNetEdge
+        : null;
+    const realizedRetentionRatio =
+      input.upstreamExpectedNetEdge != null &&
+      Math.abs(input.upstreamExpectedNetEdge) > 1e-9 &&
+      input.realizedNetEdge != null
+        ? input.realizedNetEdge / input.upstreamExpectedNetEdge
+        : null;
+    const reasonCodes: string[] = [];
+    if (expectedRetentionRatio != null && expectedRetentionRatio < 0.35) {
+      reasonCodes.push('retained_edge_expectation_not_met');
+    }
+    if (realizedRetentionRatio != null && realizedRetentionRatio < 0.5) {
+      reasonCodes.push('realized_retention_below_expectation');
+    }
+    return {
+      upstreamExpectedNetEdge: input.upstreamExpectedNetEdge,
+      currentExpectedNetEdge: input.executionAdjustedEdge,
+      realizedNetEdge: input.realizedNetEdge ?? null,
+      expectedRetentionRatio,
+      realizedRetentionRatio,
+      marketArchetype: input.marketArchetype,
+      toxicityState: input.toxicityState,
+      reasonCodes,
+    };
+  }
+
+  private estimateExpectedFillRate(input: {
+    route: string;
+    executionStyle: string;
+    orderType: string;
+    partialFillTolerance: string | null;
+  }): number {
+    let expectedFillRate = 0.78;
+    if (input.route === 'cross') {
+      expectedFillRate += 0.14;
+    }
+    if (input.executionStyle === 'cross') {
+      expectedFillRate += 0.04;
+    }
+    if (input.orderType === 'FOK') {
+      expectedFillRate -= 0.16;
+    }
+    if (input.orderType === 'FAK') {
+      expectedFillRate -= 0.05;
+    }
+    if (input.partialFillTolerance === 'none') {
+      expectedFillRate -= 0.08;
+    }
+    if (input.partialFillTolerance === 'aggressive') {
+      expectedFillRate += 0.03;
+    }
+    return Math.max(0.15, Math.min(0.98, expectedFillRate));
+  }
+
+  private resolveCalibrationForSignal(
+    learningState: Awaited<ReturnType<LearningStateStore['load']>>,
+    strategyVariantId: string,
+    regime: string | null,
+  ) {
+    return (
+      Object.values(learningState.calibration).find(
+        (candidate) =>
+          candidate.strategyVariantId === strategyVariantId && candidate.regime === regime,
+      ) ??
+      Object.values(learningState.calibration).find(
+        (candidate) =>
+          candidate.strategyVariantId === strategyVariantId && candidate.regime == null,
+      ) ??
+      null
+    );
+  }
+
+  private resolveRegimeSnapshot(
+    learningState: Awaited<ReturnType<LearningStateStore['load']>>,
+    strategyVariantId: string,
+    regime: string | null,
+  ) {
+    const variant = learningState.strategyVariants[strategyVariantId] ?? null;
+    if (!variant) {
+      return null;
+    }
+
+    const matching = Object.values(variant.regimeSnapshots)
+      .filter((snapshot) => snapshot.regime === regime)
+      .sort((left, right) => right.sampleCount - left.sampleCount);
+    return matching[0] ?? null;
+  }
+
   private estimateRecentTradeCount(volume: number | null): number {
     if (!Number.isFinite(volume ?? Number.NaN) || (volume ?? 0) <= 0) {
       return 0;
@@ -1538,6 +2101,59 @@ export class ExecuteOrdersJob {
     }
 
     return Math.min(0.999, Math.max(0.001, price));
+  }
+
+  private buildExecutionToxicity(input: {
+    signalAgeMs: number;
+    signal: {
+      regime: string | null;
+      observedAt: Date;
+    };
+    orderbook: {
+      bestBid: number | null;
+      bestAsk: number | null;
+      spread: number | null;
+      bidLevels: unknown;
+      askLevels: unknown;
+    };
+    expiryAt: Date;
+    recentToxicityHistory: ToxicityTrendPoint[];
+  }) {
+    const bidDepth = this.topLevelDepth(input.orderbook, 'SELL');
+    const askDepth = this.topLevelDepth(input.orderbook, 'BUY');
+    const totalDepth = bidDepth + askDepth;
+    const spread = Math.max(0, input.orderbook.spread ?? 0);
+    const imbalance =
+      totalDepth > 0 ? (bidDepth - askDepth) / totalDepth : 0;
+    const flowIntensity = clamp01(spread / 0.04 + Math.abs(imbalance) * 0.5);
+    const micropriceBias = imbalance * clamp01(spread / 0.02);
+
+    return this.toxicityPolicy.evaluate({
+      features: {
+        lastReturnPct: imbalance * 0.002,
+        rollingReturnPct: imbalance * 0.001,
+        micropriceBias,
+        flowImbalanceProxy: imbalance,
+        flowIntensity,
+        btcMoveTransmission: 0,
+        signalDecayPressure: clamp01(
+          input.signalAgeMs / Math.max(appEnv.BOT_MAX_SIGNAL_AGE_MS, 1),
+        ),
+        bookUpdateStress: clamp01(spread / 0.05),
+        orderbookNoiseScore: clamp01(spread / 0.06),
+        spread,
+        spreadToDepthRatio: spread / Math.max(1, totalDepth),
+        topLevelDepth: Math.max(bidDepth, askDepth),
+        timeToExpirySeconds: Math.max(
+          0,
+          Math.floor((new Date(input.expiryAt).getTime() - Date.now()) / 1000),
+        ),
+        marketStateTransition: spread >= 0.03 ? 'stress_transition' : 'range_balance',
+      },
+      regimeLabel: input.signal.regime,
+      signalAgeMs: input.signalAgeMs,
+      recentHistory: input.recentToxicityHistory,
+    });
   }
 
   private normalizeVenueStatus(status: string | null): string {
@@ -1838,4 +2454,12 @@ function createDefaultVenueHealthLearningStore(
   }
 
   return new VenueHealthLearningStore();
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(1, value));
 }

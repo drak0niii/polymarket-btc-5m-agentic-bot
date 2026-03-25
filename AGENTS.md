@@ -1,206 +1,648 @@
-# AGENTS.md
+# instruction.md
 
-## Repository mission
+## Objective
 
-This repository exists to become a production-oriented, capital-protective, evidence-driven autonomous Polymarket trading system that compounds capital through selective, net-profitable trading.
+Upgrade this repository from approximately **8.8/10** toward **9.2/10** by improving the following areas:
 
-The system is not a toy, not a dashboard project, and not an "AI for AI's sake" experiment.
+1. better attribution
+2. better toxicity awareness
+3. better live sizing discipline
+4. better benchmark rigor
+5. better evidence
+6. better alpha sophistication
 
-Its objective is:
-
-**MAXIMIZE LONG-TERM NET CAPITAL GROWTH**
-
-That objective must be pursued only through:
-- realistic net-edge estimation
-- disciplined trade selection
-- execution-cost awareness
-- uncertainty-aware sizing
-- regime-aware capital allocation
-- explicit guardrails
-- full auditability and replayability
-
-Do not optimize for raw activity, raw PnL, or superficial autonomy.
-Optimize for net expectancy, EV retention, drawdown control, and capital efficiency.
+This upgrade must build on top of the current architecture.
+Do not remove core runtime, risk, execution, reconciliation, validation, or learning functionality.
 
 ---
 
-## Operating mindset
+## Repository context
 
-Treat the repository as a serious live-trading engine where every change must improve or protect one of the following:
-- expected net EV
-- capital preservation
-- execution quality
-- compounding efficiency
-- decision quality under uncertainty
+This repository is already strong in:
 
-Assume that bad logic will lose real money.
-Assume that overtrading, overconfidence, and poor execution are default failure modes.
-Assume that more complexity is not automatically better.
+- runtime lifecycle and orchestration
+- startup gates and crash recovery
+- risk/safety gating
+- order execution discipline
+- reconciliation and external truth checks
+- audit, lineage, diagnostics, validation, and review scaffolding
 
----
+This repository still needs improvement in:
 
-## Phase 12 mission
+- stronger predictive alpha
+- decision-grade attribution
+- forward-looking toxicity logic
+- live capital discipline
+- benchmark rigor
+- evidence-to-action coupling
 
-Phase 12 is focused purely on **capital growth and trading effectiveness**.
-
-It is not a generic autonomy phase.
-It is not a feature accumulation phase.
-It is not a "make the AI smarter" phase.
-
-Phase 12 exists to make the bot:
-- take fewer, better trades
-- reject weak opportunities after realistic costs
-- size capital better
-- detect capital leakage faster
-- reduce exposure in bad regimes
-- preserve more edge after execution
-- promote only economically stable behavior
+All work must preserve strong areas and strengthen weak ones.
 
 ---
 
-## Non-negotiable principles
+## Global rules
 
-### 1. Net edge beats raw edge
-Never rely on gross forecast edge alone.
-Every trading decision must trend toward using:
-- forecast edge
-- minus fees
-- minus expected slippage
-- minus adverse selection cost
-- minus uncertainty penalty
-- minus venue degradation penalty where relevant
+### Preserve current core behavior
+You must preserve the existing:
 
-If the net edge is weak, the system should prefer no trade.
+- runtime lifecycle
+- startup gates
+- safety-state and runtime-state gating
+- signal/evaluate/execute/reconcile/refresh pipeline
+- reconciliation and external truth checks
+- daily review / learning flow
+- decision log / lineage / diagnostics behavior
+- validation/report generation behavior
 
-### 2. Fewer, better trades
-Do not optimize for activity.
-Do not optimize for trade count.
-Do not optimize for signal firing frequency.
+### Prefer additive changes
+Add new modules and integrate them.
+Refactor existing modules only where necessary for clarity, canonicalization, or reuse.
 
-Low-quality activity is capital leakage.
-Overtrading is a bug.
+### Keep logic inspectable
+New logic should be:
 
-### 3. Costs are part of edge
-Execution is not separate from alpha.
-If execution destroys the edge, then there is no real edge.
+- deterministic where feasible
+- bounded
+- explicit
+- replayable
+- diagnosable
 
-Any module that ignores realistic costs is economically incomplete.
+### Every new decision input must produce evidence
+If a new module influences:
+- posterior
+- regime
+- admission
+- sizing
+- execution style
+- capital allocation
+it must leave structured evidence.
 
-### 4. Calibration governs aggressiveness
-When calibration weakens, confidence and size must shrink.
-No exceptions.
+### No dead modules
+No module should be added without being integrated into:
+- live paths
+- review paths
+- validation paths
+or some combination of these.
 
-### 5. Weak regimes deserve less or zero capital
-Do not treat all market regimes equally.
-Capital should flow toward proven conditions and away from destructive ones.
-
-### 6. Promotion must reflect capital-growth quality
-A variant should not promote merely because it had recent profits.
-It must prove:
-- net edge quality
-- acceptable drawdown
-- healthy calibration
-- healthy execution retention
-- stable regime behavior
-- acceptable leak profile
-
-### 7. Replayability and explicitness remain mandatory
-Do not bypass Phase 11 controls.
-Do not introduce hidden adaptive behavior.
-Do not introduce silent parameter drift.
-Every learned economic behavior must remain typed, logged, versioned, and replayable.
-
----
-
-## What not to do
-
-Do not:
-- add black-box online RL to the live path
-- optimize on gross PnL only
-- increase complexity without clear economic benefit
-- allow profitable-but-unstable variants to scale automatically
-- trade marginal net-edge opportunities just to stay active
-- bury economic logic inside ad hoc execution code
-- bypass rollout, rollback, quarantine, lineage, or logging
+### No weakening of controls
+Do not weaken:
+- safety gates
+- runtime-state permissions
+- external portfolio truth checks
+- reconciliation freshness checks
+- execution viability checks
+- lineage and diagnostics emission
 
 ---
 
-## Build order discipline
+## Existing files that matter most
 
-Implement Phase 12 in exactly 5 waves.
-Do not skip ahead.
-Do not work on later waves before current-wave verification is complete.
+### Primary upgrade surfaces
+- `apps/worker/src/jobs/buildSignals.job.ts`
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+- `apps/worker/src/jobs/executeOrders.job.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+- `apps/worker/src/validation/p23-validation.ts`
 
-### Wave 1
-Net-edge realism and no-trade logic
+### Core signal files
+- `packages/signal-engine/src/feature-builder.ts`
+- `packages/signal-engine/src/prior/prior-model.ts`
+- `packages/signal-engine/src/posterior/posterior-update.ts`
+- `packages/signal-engine/src/regime-classifier.ts`
+- `packages/signal-engine/src/edge/*`
+- `packages/signal-engine/src/ev/*`
+- `packages/signal-engine/src/walk-forward-validator.ts`
 
-### Wave 2
-Capital leak attribution and trade quality
+### Runtime/evidence files
+- `apps/worker/src/runtime/decision-log.service.ts`
+- `apps/worker/src/runtime/version-lineage-registry.ts`
+- `apps/worker/src/runtime/learning-state-store.ts`
 
-### Wave 3
-Regime economics and anti-overtrading controls
-
-### Wave 4
-Execution-cost realism and uncertainty-weighted sizing
-
-### Wave 5
-Promotion economics, capital-growth metrics, commands, and integration tests
-
----
-
-## General implementation rules
-
-### Rule A
-Prefer explicit typed inputs and outputs over implicit objects.
-
-### Rule B
-Prefer deterministic threshold-based decisions first.
-Do not begin with opaque adaptive logic where the economic safety case is unclear.
-
-### Rule C
-Prefer surgical capital reduction over blanket shutdown when conditions degrade.
-
-### Rule D
-Every meaningful decision should be explainable in terms of:
-- expected net benefit
-- estimated risk
-- uncertainty
-- cost
-- regime context
-
-### Rule E
-Economic logic must integrate with existing Phase 11 systems instead of bypassing them.
-That includes:
-- learning state
-- promotion decisions
-- quarantine policy
-- rollout controller
-- rollback controller
-- version lineage
-- replay context
+### Supporting execution/risk files
+- `packages/risk-engine/*`
+- `packages/execution-engine/*`
+- `packages/polymarket-adapter/*`
 
 ---
 
-## Success standard for Phase 12
+## High-impact implementation list
 
-Phase 12 succeeds only if the repository becomes materially better at:
-- rejecting weak trades
-- allocating capital only where justified
-- retaining more edge after costs
-- reducing capital leakage
-- avoiding destructive regimes
-- controlling overtrading
-- promoting only economically stable behavior
+These are the concrete implementations to execute one at a time.
 
-If the system becomes more complex but not more capital-efficient, Phase 12 has failed.
+1. loss attribution classifier
+2. retention by regime/archetype/toxicity
+3. toxicity momentum / shock / persistence
+4. passive-only / aggression lockout under toxic flow
+5. fast-down / slow-up live sizing policy
+6. regime-local size multipliers
+7. benchmark-relative size penalties
+8. rolling benchmark scorecards
+9. regime-specific benchmark gating
+10. BTC-to-Polymarket transmission features
+11. flow persistence / reversal features
+12. calibration drift alerts by regime and archetype
+
+Each item must be implemented, tested, and reviewed independently before moving to the next.
 
 ---
 
-## Final instruction to Codex / engineer
+# Item 1 — Loss attribution classifier
 
-Implement Phase 12 as a performance phase, not a novelty phase.
-At every step ask:
+## Goal
+Classify retained-edge loss into actionable buckets.
 
-**Does this improve net capital growth or reduce capital leakage in a measurable way?**
+## Files to add
+- `packages/signal-engine/src/edge/loss-attribution-classifier.ts`
 
-If the answer is no, do not prioritize it.
+## Files to update
+- `apps/worker/src/jobs/executeOrders.job.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+- `apps/worker/src/runtime/decision-log.service.ts`
+- `apps/worker/src/runtime/version-lineage-registry.ts`
+
+## Required outputs
+At minimum:
+- `lossCategory`
+- `lossReasonCodes`
+- `forecastQualityAssessment`
+- `executionQualityAssessment`
+- `primaryLeakageDriver`
+- `secondaryLeakageDrivers`
+
+## Required categories
+Support at least:
+- alpha_wrong
+- slippage_excess
+- fill_quality_failure
+- latency_decay
+- toxicity_damage
+- over_sizing
+- regime_drift
+- mixed
+
+## Integration requirements
+- execution must classify post-trade outcomes
+- daily review must aggregate categories
+- evidence/logging must include the classification
+
+## Definition of done
+- classifier exists
+- execution emits loss attribution
+- daily review summarizes loss buckets
+- tests cover category assignment edge cases
+
+---
+
+# Item 2 — Retention by regime/archetype/toxicity
+
+## Goal
+Make retention observable by context.
+
+## Files to add
+- `apps/worker/src/validation/retention-context-report.ts`
+
+## Files to update
+- `apps/worker/src/jobs/dailyReview.job.ts`
+- `apps/worker/src/validation/p23-validation.ts`
+- `apps/worker/src/runtime/learning-state-store.ts`
+
+## Required outputs
+At minimum:
+- retention by regime
+- retention by archetype
+- retention by toxicity state
+- top degrading contexts
+- top improving contexts
+
+## Integration requirements
+- daily review stores these summaries
+- validation artifacts include them
+- learning state stores lightweight summaries only
+
+## Definition of done
+- report exists
+- daily review uses it
+- p23 validation can emit it
+- tests cover grouping and summary logic
+
+---
+
+# Item 3 — Toxicity momentum / shock / persistence
+
+## Goal
+Make toxicity forward-looking, not only point-in-time.
+
+## Files to add
+- `packages/signal-engine/src/toxicity/toxicity-trend.ts`
+
+## Files to update
+- `packages/signal-engine/src/toxicity/toxicity-policy.ts`
+- `apps/worker/src/jobs/buildSignals.job.ts`
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+
+## Required outputs
+At minimum:
+- `toxicityMomentum`
+- `toxicityShock`
+- `toxicityPersistence`
+
+## Integration requirements
+- buildSignals attaches these to signal evidence
+- evaluation uses them to tighten thresholds or shrink size
+- daily review tracks how persistent toxicity affects retention
+
+## Definition of done
+- trend module exists
+- toxicity policy consumes it
+- evaluation behavior changes under rising or persistent toxicity
+- tests cover rising/falling/shock/persistent cases
+
+---
+
+# Item 4 — Passive-only / aggression lockout under toxic flow
+
+## Goal
+Force defensive execution behavior when toxicity is high.
+
+## Files to update
+- `apps/worker/src/jobs/executeOrders.job.ts`
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+- existing toxicity policy files as needed
+
+## Required outputs
+At minimum:
+- `executionAggressionLock`
+- `passiveOnly`
+- `aggressionReasonCodes`
+
+## Integration requirements
+- evaluation can reject or downgrade aggression
+- execution must respect lockouts
+- diagnostics must show when and why aggression was reduced
+
+## Definition of done
+- toxic conditions can enforce passive-only behavior
+- execution respects the restriction
+- tests cover lockout behavior
+
+---
+
+# Item 5 — Fast-down / slow-up live sizing policy
+
+## Goal
+Shrink size quickly under degradation and restore slowly under recovery.
+
+## Files to add or update
+- `packages/risk-engine/src/live-sizing-feedback-policy.ts`
+
+## Files to update
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+- `apps/worker/src/jobs/executeOrders.job.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+
+## Required behavior
+- size down aggressively under retention failure or high toxicity
+- size up only after stable evidence over multiple windows
+- do not let one good window restore full size immediately
+
+## Required outputs
+At minimum:
+- `downshiftMultiplier`
+- `upshiftEligibility`
+- `recoveryProbationState`
+- `sizingReasonCodes`
+
+## Definition of done
+- policy supports asymmetric response
+- evaluation uses it
+- tests cover fast-down / slow-up scenarios
+
+---
+
+# Item 6 — Regime-local size multipliers
+
+## Goal
+Allow size to differ by regime and archetype, not only globally.
+
+## Files to add
+- `packages/risk-engine/src/regime-local-sizing.ts`
+
+## Files to update
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+- `apps/worker/src/runtime/learning-state-store.ts`
+
+## Required outputs
+At minimum:
+- `regimeSizeMultiplier`
+- `archetypeSizeMultiplier`
+- `regimeSizingReasonCodes`
+
+## Integration requirements
+- evaluation applies regime-local sizing
+- daily review updates regime-local sizing evidence
+
+## Definition of done
+- regime-local size logic exists
+- evaluation consumes it
+- tests cover different regime states
+
+---
+
+# Item 7 — Benchmark-relative size penalties
+
+## Goal
+Reduce size when the strategy is not outperforming simple baselines in a context.
+
+## Files to add
+- `packages/risk-engine/src/benchmark-relative-sizing.ts`
+
+## Files to update
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+- benchmark report files as needed
+
+## Required outputs
+At minimum:
+- `baselinePenaltyMultiplier`
+- `benchmarkComparisonState`
+- `benchmarkPenaltyReasonCodes`
+
+## Integration requirements
+- daily review computes relevant benchmark status
+- evaluation can shrink size when strategy underperforms baseline in a context
+
+## Definition of done
+- benchmark-relative penalty exists
+- evaluation uses it
+- tests cover outperform / underperform cases
+
+---
+
+# Item 8 — Rolling benchmark scorecards
+
+## Goal
+Track benchmark superiority across rolling windows.
+
+## Files to add
+- `apps/worker/src/validation/rolling-benchmark-scorecard.ts`
+
+## Files to update
+- `apps/worker/src/validation/p23-validation.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+- `apps/worker/src/jobs/capitalGrowthReview.job.ts`
+
+## Required windows
+At minimum:
+- 1 day
+- 3 day
+- 7 day
+- 30 day or best available equivalent in historical context
+
+## Required outputs
+At minimum:
+- outperformance by window
+- retained-edge vs benchmark by window
+- stability of outperformance
+
+## Definition of done
+- rolling scorecard exists
+- daily review and validation can emit it
+- tests cover rolling aggregation logic
+
+---
+
+# Item 9 — Regime-specific benchmark gating
+
+## Goal
+Do not scale up regimes that fail against simple baselines.
+
+## Files to update
+- `apps/worker/src/jobs/dailyReview.job.ts`
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+- benchmark comparison modules as needed
+
+## Required outputs
+At minimum:
+- `regimeBenchmarkGateState`
+- `promotionBlockedByBenchmark`
+- `regimeBenchmarkReasonCodes`
+
+## Integration requirements
+- daily review computes benchmark gate states by regime
+- evaluation respects benchmark-based restrictions
+- capital scale-up is blocked where strategy underperforms simple baselines
+
+## Definition of done
+- gate exists
+- review produces it
+- evaluation uses it
+- tests cover pass/fail regimes
+
+---
+
+# Item 10 — BTC-to-Polymarket transmission features
+
+## Goal
+Improve alpha sophistication through better modeling of how BTC moves translate into market probability moves.
+
+## Files to add
+- `packages/signal-engine/src/alpha/btc-polymarket-transmission-v2.ts`
+
+## Files to update
+- `packages/signal-engine/src/feature-builder.ts`
+- `packages/signal-engine/src/prior/prior-model.ts`
+- `packages/signal-engine/src/posterior/posterior-update.ts`
+- `apps/worker/src/jobs/buildSignals.job.ts`
+
+## Required features
+At minimum:
+- lagged BTC move transmission
+- nonlinear BTC move sensitivity
+- divergence between BTC path and market probability response
+- recent transmission consistency or inconsistency
+
+## Definition of done
+- features exist
+- prior/posterior consume them
+- signal evidence includes them
+- tests cover feature computation and model usage
+
+---
+
+# Item 11 — Flow persistence / reversal features
+
+## Goal
+Improve alpha sophistication through richer short-horizon flow behavior.
+
+## Files to add
+- `packages/signal-engine/src/alpha/flow-persistence-reversal.ts`
+
+## Files to update
+- `packages/signal-engine/src/feature-builder.ts`
+- `packages/signal-engine/src/prior/prior-model.ts`
+- `packages/signal-engine/src/posterior/posterior-update.ts`
+- `apps/worker/src/jobs/buildSignals.job.ts`
+
+## Required features
+At minimum:
+- imbalance persistence
+- imbalance reversal probability
+- quote instability before move
+- depth depletion asymmetry
+
+## Definition of done
+- features exist
+- models consume them
+- signal job persists them
+- tests cover persistence and reversal logic
+
+---
+
+# Item 12 — Calibration drift alerts by regime and archetype
+
+## Goal
+Detect when calibration is breaking in specific contexts.
+
+## Files to add
+- `apps/worker/src/validation/calibration-drift-alerts.ts`
+
+## Files to update
+- `apps/worker/src/jobs/dailyReview.job.ts`
+- `apps/worker/src/validation/p23-validation.ts`
+- `apps/worker/src/runtime/learning-state-store.ts`
+
+## Required outputs
+At minimum:
+- `calibrationDriftState`
+- `regimeCalibrationAlert`
+- `archetypeCalibrationAlert`
+- `driftReasonCodes`
+
+## Integration requirements
+- daily review emits alerts
+- learning state stores lightweight alert summaries
+- evaluation and/or sizing can consume drift state later if needed
+
+## Definition of done
+- alerts exist
+- review emits them
+- validation can surface them
+- tests cover alert threshold behavior
+
+---
+
+## Work policy
+
+Implement these items **one at a time**.
+
+For each item, the workflow must be:
+
+1. Audit current relevant files.
+2. List exact files to add or update.
+3. Implement the item only.
+4. Add unit tests for pure modules.
+5. Add or update integration tests where needed.
+6. Run relevant tests and typecheck.
+7. Stop and report results before moving to the next item.
+
+Do not stack multiple items in one change unless explicitly instructed.
+
+---
+
+## Test policy
+
+Every item must include tests.
+
+### Required test classes
+- unit tests for pure calculators/policies
+- integration tests for changed job logic
+- validation/report tests where applicable
+
+### Minimum expectations
+- all new modules have direct unit coverage
+- each modified major job has integration coverage adjusted where needed
+- validation commands remain runnable and more informative than before
+
+---
+
+## Validation commands
+
+Prefer existing repo commands.
+Preserve or extend support for commands equivalent to:
+
+- `pnpm test`
+- `pnpm typecheck`
+- `pnpm --filter @polymarket-btc-5m-agentic-bot/worker validate:p23`
+- `pnpm --filter @polymarket-btc-5m-agentic-bot/worker validate:dataset-quality`
+
+If exact scripts differ, update safely and document them.
+
+---
+
+## Rollback and failure handling
+
+If an item causes:
+- failed typecheck
+- failed tests
+- broken validation
+- degraded evidence quality
+- broken runtime integration
+
+stop and repair before proceeding.
+
+Do not continue on a broken base.
+
+---
+
+## Success criteria
+
+This program is successful only if the repository can more clearly answer:
+
+- Where does forecast edge come from?
+- Does forecast edge survive execution?
+- What causes retained-edge loss?
+- Which regimes and archetypes really work?
+- Which toxicity states damage retention?
+- Which baselines are being beaten?
+- When should live size shrink, hold, or recover?
+- When should aggression be restricted?
+- Which regimes should be gated, penalized, or scaled up?
+
+And only if:
+- existing core functionality still works
+- risk and runtime protections remain intact
+- evidence quality improves materially
+
+---
+
+## Short checklist for contributors
+
+Before considering any item complete, verify:
+
+- [ ] Existing runtime and safety behavior preserved
+- [ ] New module added and integrated
+- [ ] Evidence emitted where relevant
+- [ ] Tests added
+- [ ] Existing commands still work or were safely extended
+- [ ] No dead modules left unintegrated
+
+---
+
+## Final implementation intent
+
+Do not treat this as cosmetic refactoring.
+
+Treat it as a focused upgrade program to move the system from:
+
+- strong execution-and-control platform with improved evidence
+
+to:
+
+- strong execution-and-control platform with sharper alpha
+- stronger attribution
+- more actionable toxicity
+- smarter capital discipline
+- harder benchmark proof
+- stronger evidence-driven live behavior

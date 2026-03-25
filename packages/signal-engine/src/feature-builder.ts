@@ -1,3 +1,17 @@
+import { BtcPolymarketLinkage } from './alpha/btc-polymarket-linkage';
+import { BtcPolymarketTransmissionV2 } from './alpha/btc-polymarket-transmission-v2';
+import { EdgeDecayProfile } from './alpha/edge-decay-profile';
+import { FlowFeaturesCalculator } from './alpha/flow-features';
+import { FlowPersistenceReversal } from './alpha/flow-persistence-reversal';
+import {
+  MarketArchetypeClassifier,
+  type MarketArchetypeLabel,
+} from './alpha/market-archetype-classifier';
+import {
+  MarketStateTransitionModel,
+  type MarketStateTransitionLabel,
+} from './alpha/market-state-transition';
+
 interface CandleSeries {
   symbol: string;
   timeframe: string;
@@ -35,12 +49,38 @@ export interface SignalFeatures {
   micropriceBias: number;
   volumeTrend: number;
   orderbookNoiseScore: number;
+  flowImbalanceProxy: number;
+  flowIntensity: number;
+  bookUpdateStress: number;
+  btcMoveTransmission: number;
+  btcLinkageConfidence: number;
+  laggedBtcMoveTransmission: number;
+  nonlinearBtcMoveSensitivity: number;
+  btcPathDivergence: number;
+  transmissionConsistency: number;
+  imbalancePersistence: number;
+  imbalanceReversalProbability: number;
+  quoteInstabilityBeforeMove: number;
+  depthDepletionAsymmetry: number;
+  signalDecayPressure: number;
+  marketStateTransition: MarketStateTransitionLabel;
+  marketStateTransitionStrength: number;
+  marketArchetype: MarketArchetypeLabel;
+  marketArchetypeConfidence: number;
   sampleCount: number;
   timeToExpirySeconds: number | null;
   capturedAt: string;
 }
 
 export class FeatureBuilder {
+  private readonly flowFeatures = new FlowFeaturesCalculator();
+  private readonly flowPersistenceReversal = new FlowPersistenceReversal();
+  private readonly btcPolymarketLinkage = new BtcPolymarketLinkage();
+  private readonly btcPolymarketTransmissionV2 = new BtcPolymarketTransmissionV2();
+  private readonly marketStateTransition = new MarketStateTransitionModel();
+  private readonly edgeDecayProfile = new EdgeDecayProfile();
+  private readonly marketArchetypeClassifier = new MarketArchetypeClassifier();
+
   build(params: {
     candles: CandleSeries;
     orderbook: Orderbook | null;
@@ -57,6 +97,7 @@ export class FeatureBuilder {
       first && last && first.open !== 0 ? (last.close - first.open) / first.open : 0;
 
     const returns: number[] = [];
+    const simpleReturns: number[] = [];
 
     for (let index = 1; index < candles.length; index += 1) {
       const previous = candles[index - 1];
@@ -64,6 +105,7 @@ export class FeatureBuilder {
 
       if (previous.close > 0 && current.close > 0) {
         returns.push(Math.log(current.close / previous.close));
+        simpleReturns.push((current.close - previous.close) / previous.close);
       }
     }
 
@@ -158,6 +200,74 @@ export class FeatureBuilder {
             ),
           )
         : null;
+    const flowFeatures = this.flowFeatures.derive({
+      lastReturnPct,
+      rollingReturnPct,
+      volumeTrend,
+      topLevelImbalance,
+      micropriceBias,
+      spreadToDepthRatio,
+      depthConcentration,
+      orderbookNoiseScore,
+    });
+    const linkage = this.btcPolymarketLinkage.evaluate({
+      lastReturnPct,
+      rollingReturnPct,
+      midpointDriftPct,
+      topLevelImbalance,
+      micropriceBias,
+      flowImbalanceProxy: flowFeatures.flowImbalanceProxy,
+      bookUpdateStress: flowFeatures.bookUpdateStress,
+    });
+    const transmissionV2 = this.btcPolymarketTransmissionV2.evaluate({
+      recentBtcReturns: simpleReturns,
+      lastReturnPct,
+      rollingReturnPct,
+      midpointDriftPct,
+      micropriceBias,
+      flowImbalanceProxy: flowFeatures.flowImbalanceProxy,
+      bookUpdateStress: flowFeatures.bookUpdateStress,
+    });
+    const flowPersistenceReversal = this.flowPersistenceReversal.evaluate({
+      recentReturns: simpleReturns,
+      topLevelImbalance,
+      micropriceBias,
+      flowImbalanceProxy: flowFeatures.flowImbalanceProxy,
+      flowIntensity: flowFeatures.flowIntensity,
+      spreadToDepthRatio,
+      depthConcentration,
+      orderbookNoiseScore,
+      bidLevels: params.orderbook?.bidLevels ?? [],
+      askLevels: params.orderbook?.askLevels ?? [],
+    });
+    const stateTransition = this.marketStateTransition.classify({
+      lastReturnPct,
+      rollingReturnPct,
+      realizedVolatility: Math.sqrt(variance),
+      flowImbalanceProxy: flowFeatures.flowImbalanceProxy,
+      bookUpdateStress: flowFeatures.bookUpdateStress,
+      btcMoveTransmission: linkage.btcMoveTransmission,
+    });
+    const decayProfile = this.edgeDecayProfile.evaluate({
+      timeToExpirySeconds,
+      realizedVolatility: Math.sqrt(variance),
+      realizedRangePct,
+      orderbookNoiseScore,
+      bookUpdateStress: flowFeatures.bookUpdateStress,
+      marketStateTransition: stateTransition.marketStateTransition,
+      flowIntensity: flowFeatures.flowIntensity,
+      sampleCount: candles.length,
+    });
+    const marketArchetype = this.marketArchetypeClassifier.classify({
+      flowImbalanceProxy: flowFeatures.flowImbalanceProxy,
+      flowIntensity: flowFeatures.flowIntensity,
+      bookUpdateStress: flowFeatures.bookUpdateStress,
+      btcMoveTransmission: linkage.btcMoveTransmission,
+      signalDecayPressure: decayProfile.signalDecayPressure,
+      marketStateTransition: stateTransition.marketStateTransition,
+      realizedVolatility: Math.sqrt(variance),
+      timeToExpirySeconds,
+    });
 
     return {
       lastReturnPct,
@@ -177,6 +287,27 @@ export class FeatureBuilder {
       micropriceBias,
       volumeTrend,
       orderbookNoiseScore,
+      flowImbalanceProxy: flowFeatures.flowImbalanceProxy,
+      flowIntensity: flowFeatures.flowIntensity,
+      bookUpdateStress: flowFeatures.bookUpdateStress,
+      btcMoveTransmission: linkage.btcMoveTransmission,
+      btcLinkageConfidence: linkage.btcLinkageConfidence,
+      laggedBtcMoveTransmission: transmissionV2.laggedBtcMoveTransmission,
+      nonlinearBtcMoveSensitivity: transmissionV2.nonlinearBtcMoveSensitivity,
+      btcPathDivergence: transmissionV2.btcPathDivergence,
+      transmissionConsistency: transmissionV2.transmissionConsistency,
+      imbalancePersistence: flowPersistenceReversal.imbalancePersistence,
+      imbalanceReversalProbability:
+        flowPersistenceReversal.imbalanceReversalProbability,
+      quoteInstabilityBeforeMove:
+        flowPersistenceReversal.quoteInstabilityBeforeMove,
+      depthDepletionAsymmetry:
+        flowPersistenceReversal.depthDepletionAsymmetry,
+      signalDecayPressure: decayProfile.signalDecayPressure,
+      marketStateTransition: stateTransition.marketStateTransition,
+      marketStateTransitionStrength: stateTransition.marketStateTransitionStrength,
+      marketArchetype: marketArchetype.marketArchetype,
+      marketArchetypeConfidence: marketArchetype.marketArchetypeConfidence,
       sampleCount: candles.length,
       timeToExpirySeconds,
       capturedAt: now.toISOString(),

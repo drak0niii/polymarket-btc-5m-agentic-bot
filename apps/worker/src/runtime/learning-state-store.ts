@@ -218,15 +218,176 @@ function normalizeLearningState(raw: unknown): LearningState {
     updatedAt: readString(record.updatedAt) ?? base.updatedAt,
     lastCycleStartedAt: readString(record.lastCycleStartedAt),
     lastCycleCompletedAt: readString(record.lastCycleCompletedAt),
-    lastCycleSummary:
-      record.lastCycleSummary && typeof record.lastCycleSummary === 'object'
-        ? (record.lastCycleSummary as LearningState['lastCycleSummary'])
-        : null,
+    lastCycleSummary: normalizeLearningCycleSummary(record.lastCycleSummary),
     strategyVariants,
     calibration,
     executionLearning: normalizeExecutionLearning(record.executionLearning),
     portfolioLearning: normalizePortfolioLearning(record.portfolioLearning),
   };
+}
+
+function normalizeLearningCycleSummary(raw: unknown): LearningState['lastCycleSummary'] {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  const summary = raw as LearningState['lastCycleSummary'] & Record<string, unknown>;
+  return {
+    ...summary,
+    reviewOutputs: normalizeReviewOutputs(summary.reviewOutputs),
+  };
+}
+
+function normalizeReviewOutputs(raw: unknown): Record<string, unknown> | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  const reviewOutputs = { ...(raw as Record<string, unknown>) };
+  if (
+    reviewOutputs.retentionContext &&
+    typeof reviewOutputs.retentionContext === 'object'
+  ) {
+    reviewOutputs.retentionContext = normalizeRetentionContextSummary(
+      reviewOutputs.retentionContext as Record<string, unknown>,
+    );
+  }
+  if (
+    reviewOutputs.calibrationDriftAlerts &&
+    typeof reviewOutputs.calibrationDriftAlerts === 'object'
+  ) {
+    reviewOutputs.calibrationDriftAlerts = normalizeCalibrationDriftAlertsSummary(
+      reviewOutputs.calibrationDriftAlerts as Record<string, unknown>,
+    );
+  }
+  if (
+    reviewOutputs.regimeLocalSizing &&
+    typeof reviewOutputs.regimeLocalSizing === 'object'
+  ) {
+    reviewOutputs.regimeLocalSizing = normalizeRegimeLocalSizingSummary(
+      reviewOutputs.regimeLocalSizing as Record<string, unknown>,
+    );
+  }
+  return reviewOutputs;
+}
+
+function normalizeRetentionContextSummary(
+  raw: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    generatedAt: readString(raw.generatedAt),
+    sampleCount: readFiniteNumber(raw.sampleCount) ?? 0,
+    retentionByRegime: normalizeContextEntries(raw.retentionByRegime, 12),
+    retentionByArchetype: normalizeContextEntries(raw.retentionByArchetype, 12),
+    retentionByToxicityState: normalizeContextEntries(raw.retentionByToxicityState, 8),
+    topDegradingContexts: normalizeContextEntries(raw.topDegradingContexts, 5),
+    topImprovingContexts: normalizeContextEntries(raw.topImprovingContexts, 5),
+  };
+}
+
+function normalizeCalibrationDriftAlertsSummary(
+  raw: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    generatedAt: readString(raw.generatedAt),
+    sampleCount: readFiniteNumber(raw.sampleCount) ?? 0,
+    calibrationDriftState: readString(raw.calibrationDriftState) ?? 'stable',
+    regimeCalibrationAlert: normalizeCalibrationDriftEntries(
+      raw.regimeCalibrationAlert,
+      12,
+    ),
+    archetypeCalibrationAlert: normalizeCalibrationDriftEntries(
+      raw.archetypeCalibrationAlert,
+      12,
+    ),
+    driftReasonCodes: Array.isArray(raw.driftReasonCodes)
+      ? raw.driftReasonCodes
+          .filter((value): value is string => typeof value === 'string')
+          .slice(0, 12)
+      : [],
+  };
+}
+
+function normalizeRegimeLocalSizingSummary(
+  raw: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    generatedAt: readString(raw.generatedAt),
+    sampleCount: readFiniteNumber(raw.sampleCount) ?? 0,
+    byRegime: normalizeSizingEntries(raw.byRegime, 12),
+    byArchetype: normalizeSizingEntries(raw.byArchetype, 12),
+    mostConstrainedContexts: normalizeSizingEntries(raw.mostConstrainedContexts, 8),
+  };
+}
+
+function normalizeContextEntries(raw: unknown, limit: number): Array<Record<string, unknown>> {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  return raw
+    .filter((entry): entry is Record<string, unknown> => entry != null && typeof entry === 'object')
+    .slice(0, limit)
+    .map((entry) => ({
+      contextType: readString(entry.contextType),
+      contextValue: readString(entry.contextValue),
+      sampleCount: readFiniteNumber(entry.sampleCount) ?? 0,
+      expectedNetEdge: readFiniteNumber(entry.expectedNetEdge),
+      realizedNetEdge: readFiniteNumber(entry.realizedNetEdge),
+      retentionRatio: readFiniteNumber(entry.retentionRatio),
+      realizedVsExpectedGap: readFiniteNumber(entry.realizedVsExpectedGap),
+      rankScore: readFiniteNumber(entry.rankScore),
+    }));
+}
+
+function normalizeSizingEntries(raw: unknown, limit: number): Array<Record<string, unknown>> {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  return raw
+    .filter((entry): entry is Record<string, unknown> => entry != null && typeof entry === 'object')
+    .slice(0, limit)
+    .map((entry) => ({
+      contextType: readString(entry.contextType),
+      contextValue: readString(entry.contextValue),
+      sampleCount: readFiniteNumber(entry.sampleCount) ?? 0,
+      retentionRatio: readFiniteNumber(entry.retentionRatio),
+      realizedVsExpectedGap: readFiniteNumber(entry.realizedVsExpectedGap),
+      recommendedSizeMultiplier:
+        readFiniteNumber(entry.recommendedSizeMultiplier) ?? 1,
+      reasonCodes: Array.isArray(entry.reasonCodes)
+        ? entry.reasonCodes.filter((item): item is string => typeof item === 'string').slice(0, 8)
+        : [],
+    }));
+}
+
+function normalizeCalibrationDriftEntries(
+  raw: unknown,
+  limit: number,
+): Array<Record<string, unknown>> {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  return raw
+    .filter((entry): entry is Record<string, unknown> => entry != null && typeof entry === 'object')
+    .slice(0, limit)
+    .map((entry) => ({
+      contextType: readString(entry.contextType),
+      contextValue: readString(entry.contextValue),
+      sampleCount: readFiniteNumber(entry.sampleCount) ?? 0,
+      averagePredictedProbability: readFiniteNumber(entry.averagePredictedProbability),
+      realizedOutcomeRate: readFiniteNumber(entry.realizedOutcomeRate),
+      averageCalibrationGap: readFiniteNumber(entry.averageCalibrationGap),
+      absoluteCalibrationGap: readFiniteNumber(entry.absoluteCalibrationGap),
+      calibrationDriftState: readString(entry.calibrationDriftState) ?? 'stable',
+      driftReasonCodes: Array.isArray(entry.driftReasonCodes)
+        ? entry.driftReasonCodes
+            .filter((value): value is string => typeof value === 'string')
+            .slice(0, 8)
+        : [],
+    }));
 }
 
 function normalizeStrategyVariants(raw: unknown): Record<string, StrategyVariantState> {
@@ -578,6 +739,10 @@ function readNumber(value: unknown, fallback = 0): number {
 
 function readNullableNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function readFiniteNumber(value: unknown): number | null {
+  return readNullableNumber(value);
 }
 
 function readBoolean(value: unknown): boolean | null {

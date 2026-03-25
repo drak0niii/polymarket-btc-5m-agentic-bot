@@ -1,472 +1,746 @@
 # instruction.md
 
-# Phase 12 — Capital Growth and Trading Effectiveness
-
 ## Objective
 
-Implement Phase 12 to improve net capital growth, trading effectiveness, and capital efficiency.
+Upgrade this repository in an execution-tight way to improve:
 
-The system must become better at:
-- rejecting weak trades
-- estimating net tradable edge honestly
-- identifying capital leakage
-- ranking regimes economically
-- controlling overtrading
-- sizing by uncertainty and liquidity reality
-- promoting only economically stable variants
+1. alpha model quality
+2. alpha-vs-execution attribution
+3. empirical validation quality
+4. toxicity-aware decisioning
+5. live sizing feedback quality
+6. baseline benchmarking
 
-Do not optimize for raw trade count.
-Do not optimize for gross PnL.
-Do not add complexity that does not clearly improve net expectancy or capital efficiency.
+This upgrade must build on top of the current architecture.
+Do not remove core runtime, risk, execution, reconciliation, validation, or learning functionality.
 
 ---
 
-# WAVE 1 — Net-edge realism
+## Repository context
 
-## Goal
-Gate trades on realistic net edge, not raw forecast edge.
-This is the highest-priority wave.
+This repository is already strong in:
 
-## Create
-- `packages/domain/src/net-edge.ts`
-- `packages/signal-engine/src/net-edge-estimator.ts`
-- `packages/signal-engine/src/net-edge-threshold-policy.ts`
-- `packages/signal-engine/src/no-trade-zone-policy.ts`
+- runtime lifecycle and orchestration
+- startup gates and crash recovery
+- risk/safety gating
+- order execution discipline
+- reconciliation and external truth checks
+- audit, lineage, and diagnostics scaffolding
+- daily review and learning scaffolding
 
-## Modify
-- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+This repository is currently weaker in:
 
-## Required behavior
+- raw alpha sophistication
+- explicit alpha-vs-execution attribution
+- toxicity-aware actionability
+- benchmark discipline against simpler alternatives
+- evidence clarity on where edge is real and where it is fragile
 
-### `packages/domain/src/net-edge.ts`
-Define canonical types for:
-- `NetEdgeInput`
-- `CostEstimateBreakdown`
-- `UncertaintyPenalty`
-- `NetEdgeBreakdown`
-- `NetEdgeDecision`
-
-### `packages/signal-engine/src/net-edge-estimator.ts`
-Implement a typed estimator that computes:
-- gross forecast edge
-- fee cost
-- slippage cost
-- adverse selection cost
-- uncertainty penalty
-- venue penalty if relevant
-- final net edge
-
-It must produce an explicit breakdown and a final recommendation.
-
-### `packages/signal-engine/src/net-edge-threshold-policy.ts`
-Implement threshold logic that:
-- enforces minimum net edge
-- raises threshold in degraded regimes
-- raises threshold under venue instability
-- rejects low-margin opportunities
-
-### `packages/signal-engine/src/no-trade-zone-policy.ts`
-Implement explicit no-trade conditions such as:
-- weak net edge
-- high uncertainty
-- poor calibration
-- poor regime health
-- poor execution context
-- venue instability
-
-### `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
-Integrate Wave 1 logic so opportunity evaluation is driven by realistic net edge and no-trade rules.
-Do not rely mainly on raw signal strength after this change.
-
-## Rules
-- keep all logic typed and explainable
-- keep all decisions compatible with replayability
-- do not bypass Phase 11 state / lineage / guardrails
-- prefer no-trade over marginal trade
-
-## Verification commands
-Run:
-
-```bash
-pnpm -r typecheck
-pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
-rg "net-edge-estimator|net-edge-threshold-policy|no-trade-zone-policy|evaluateTradeOpportunities" apps packages
-```
-
-## Wave 1 acceptance criteria
-Wave 1 is complete only if:
-- raw edge can be reduced to net edge through explicit cost adjustments
-- low-margin trades are rejectable after cost and uncertainty adjustment
-- evaluateTradeOpportunities integrates the new net-edge path
-- no-trade logic exists explicitly and is inspectable
+All work must preserve the strong parts and improve the weaker parts.
 
 ---
 
-# WAVE 2 — Capital leak attribution and trade quality
+## Ground rules
 
-## Goal
-Make the system explain where capital is leaking and how individual trades should be scored economically.
+### Preserve current core behavior
+You must preserve the existing:
 
-## Create
-- `packages/risk-engine/src/capital-leak-attribution.ts`
-- `packages/risk-engine/src/capital-leak-report.ts`
-- `apps/worker/src/jobs/capitalLeakReview.job.ts`
-- `packages/domain/src/trade-quality.ts`
-- `packages/risk-engine/src/trade-quality-scorer.ts`
-- `packages/risk-engine/src/trade-quality-history-store.ts`
+- runtime lifecycle
+- startup gates
+- safety-state and runtime-state gating
+- signal/evaluate/execute/reconcile/refresh pipeline
+- reconciliation and external truth checks
+- daily review / learning flow
+- decision log / lineage / diagnostics behavior
 
-## Required behavior
+### Prefer additive changes
+Add new modules and integrate them.
+Only refactor existing modules where necessary for clarity, canonicalization, or reuse.
 
-### `capital-leak-attribution.ts`
-Attribute capital leakage to categories such as:
-- false positive forecast
-- calibration error
-- slippage
-- adverse selection
-- missed fills
-- overtrading
-- poor sizing
-- trading in degraded regimes
-- venue degradation
+### Keep logic inspectable
+New logic should be:
 
-### `capital-leak-report.ts`
-Summarize leak categories by:
-- strategy variant
+- deterministic where feasible
+- bounded
+- explicit
+- replayable
+- diagnosable
+
+### Every new decision input must produce evidence
+If a new module influences:
+
+- posterior
 - regime
-- market context
+- admission
+- sizing
 - execution style
-- time window
+- capital allocation
 
-### `capitalLeakReview.job.ts`
-Run a periodic review that:
-- computes leak attribution
-- stores or emits diagnostic summaries
-- flags dominant leak categories
+it must leave structured evidence.
 
-### `trade-quality.ts`
-Define canonical types for:
-- `TradeQualityScore`
-- `TradeQualityBreakdown`
-- `TradeQualityLabel`
+### Do not weaken controls
+Do not bypass or weaken:
 
-### `trade-quality-scorer.ts`
-Score trades on:
-- forecast quality
-- calibration quality
-- execution quality
-- timing quality
-- policy compliance
-- realized outcome quality
+- safety-state controls
+- runtime-state permissions
+- external portfolio truth checks
+- reconciliation freshness checks
+- execution viability checks
+- lineage and diagnostics emission
 
-### `trade-quality-history-store.ts`
-Persist trade-quality results for later review and integration into policy decisions.
+### Do not change product class
+Do not convert this repository into:
 
-## Rules
-- trade quality must be explainable, not a black-box score only
-- capital-leak categories must be explicit and machine-readable
+- a symmetric market maker
+- a copy-trader
+- an opaque LLM-driven live trading bot
 
-## Verification commands
-Run:
-
-```bash
-pnpm -r typecheck
-pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
-rg "capital-leak-attribution|capital-leak-report|capitalLeakReview|trade-quality-scorer|trade-quality-history-store" apps packages
-```
-
-## Wave 2 acceptance criteria
-Wave 2 is complete only if:
-- the system can explain major loss sources in explicit categories
-- trade quality is scored structurally and persisted
-- leak review runs as a real job, not only as a utility file
+It remains a deterministic, execution-aware, directional BTC 5-minute Polymarket trading platform.
 
 ---
 
-# WAVE 3 — Regime economics and anti-overtrading
+## Existing files and surfaces that matter most
 
-## Goal
-Allocate less or zero capital to destructive regimes and reduce low-quality activity.
-
-## Create
-- `packages/risk-engine/src/regime-profitability-ranker.ts`
-- `packages/risk-engine/src/regime-capital-policy.ts`
-- `packages/risk-engine/src/regime-disable-policy.ts`
-- `packages/risk-engine/src/trade-frequency-governor.ts`
-- `packages/risk-engine/src/marginal-edge-cooldown-policy.ts`
-- `packages/risk-engine/src/opportunity-saturation-detector.ts`
-
-## Modify
+### Primary upgrade surfaces
+- `apps/worker/src/jobs/buildSignals.job.ts`
 - `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
-- optionally `apps/worker/src/jobs/executeOrders.job.ts` if frequency gating needs downstream enforcement
+- `apps/worker/src/jobs/executeOrders.job.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+- `apps/worker/src/validation/p23-validation.ts`
 
-## Required behavior
+### Core signal files
+- `packages/signal-engine/src/feature-builder.ts`
+- `packages/signal-engine/src/prior/prior-model.ts`
+- `packages/signal-engine/src/posterior/posterior-update.ts`
+- `packages/signal-engine/src/regime-classifier.ts`
+- `packages/signal-engine/src/edge/*`
+- `packages/signal-engine/src/ev/*`
+- `packages/signal-engine/src/walk-forward-validator.ts`
 
-### `regime-profitability-ranker.ts`
-Rank regimes economically using:
-- net EV
-- realized EV retention
-- drawdown behavior
-- calibration health
-- execution quality
-- sample sufficiency
+### Runtime and evidence files
+- `apps/worker/src/runtime/decision-log.service.ts`
+- `apps/worker/src/runtime/version-lineage-registry.ts`
+- `apps/worker/src/runtime/learning-state-store.ts`
 
-### `regime-capital-policy.ts`
-Map regime ranking into capital treatment.
-Examples:
-- strong → normal or elevated capital
-- tradable → normal capital
-- marginal → reduced capital
-- avoid → no-trade or near-zero capital
-
-### `regime-disable-policy.ts`
-Disable persistently destructive regimes.
-
-### `trade-frequency-governor.ts`
-Control trade frequency by:
-- regime
-- opportunity class
-- recent trade quality
-- recent capital leakage
-- recent drawdown state
-
-### `marginal-edge-cooldown-policy.ts`
-Impose cooldown after repeated weak or marginal opportunities.
-
-### `opportunity-saturation-detector.ts`
-Detect when the system is forcing activity instead of waiting for strong edge.
-
-## Rules
-- overtrading is a bug
-- do not let low-quality market conditions keep generating activity unchecked
-- integrate with existing Phase 11 guardrails, not around them
-
-## Verification commands
-Run:
-
-```bash
-pnpm -r typecheck
-pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
-rg "regime-profitability-ranker|regime-capital-policy|regime-disable-policy|trade-frequency-governor|marginal-edge-cooldown-policy|opportunity-saturation-detector" apps packages
-```
-
-## Wave 3 acceptance criteria
-Wave 3 is complete only if:
-- regimes can be ranked economically
-- bad regimes can be reduced or disabled
-- low-quality trade frequency can be suppressed explicitly
-- opportunity evaluation respects these new controls
+### Supporting execution/risk files
+- `packages/risk-engine/*`
+- `packages/execution-engine/*`
+- `packages/polymarket-adapter/*`
 
 ---
 
-# WAVE 4 — Execution-cost realism and uncertainty-weighted sizing
+## Non-goals
 
-## Goal
-Retain more edge after execution and size smaller when conditions are uncertain or liquidity is weak.
+Unless explicitly required, do not:
 
-## Create
-- `packages/execution-engine/src/realized-cost-model.ts`
-- `packages/execution-engine/src/execution-cost-calibrator.ts`
-- `packages/execution-engine/src/size-vs-liquidity-policy.ts`
-- `packages/execution-engine/src/entry-timing-efficiency-scorer.ts`
-- `packages/risk-engine/src/uncertainty-weighted-sizing.ts`
-- `packages/risk-engine/src/size-penalty-engine.ts`
-- `packages/risk-engine/src/max-loss-per-opportunity-policy.ts`
-
-## Required behavior
-
-### `realized-cost-model.ts`
-Model realized trading cost including:
-- fees
-- slippage
-- adverse selection
-- fill decay
-- cancel/replace overhead
-- missed opportunity cost if relevant
-
-### `execution-cost-calibrator.ts`
-Update cost assumptions from realized trades/fills.
-
-### `size-vs-liquidity-policy.ts`
-Limit trade size based on liquidity and execution conditions.
-
-### `entry-timing-efficiency-scorer.ts`
-Measure whether trade entry timing is efficient or consistently poor.
-
-### `uncertainty-weighted-sizing.ts`
-Size positions based on:
-- net edge
-- calibration health
-- execution health
-- regime health
-- venue health
-- drawdown state
-- sample sufficiency
-
-### `size-penalty-engine.ts`
-Apply size penalties for:
-- weak calibration
-- poor execution quality
-- poor regime health
-- venue instability
-- concentration risk
-
-### `max-loss-per-opportunity-policy.ts`
-Prevent one opportunity from consuming too much capital budget.
-
-## Rules
-- size must fall when uncertainty rises
-- do not allow static sizing to dominate in poor conditions
-- keep outputs typed and explainable
-
-## Verification commands
-Run:
-
-```bash
-pnpm -r typecheck
-pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
-rg "realized-cost-model|execution-cost-calibrator|size-vs-liquidity-policy|entry-timing-efficiency-scorer|uncertainty-weighted-sizing|size-penalty-engine|max-loss-per-opportunity-policy" apps packages
-```
-
-## Wave 4 acceptance criteria
-Wave 4 is complete only if:
-- realized execution costs are modeled explicitly
-- size can be reduced by uncertainty and liquidity conditions
-- the system has a typed path from poor conditions to smaller exposure
+- redesign the runtime architecture
+- rewrite the entire signal engine from scratch
+- replace deterministic logic with black-box live decisioning
+- remove current diagnostics, lineage, or learning state
+- touch API/UI files
+- touch startup/crash recovery flows
+- touch unrelated adapter internals
+- introduce hidden coupling between unrelated jobs
 
 ---
 
-# WAVE 5 — Promotion economics, growth metrics, commands, and tests
+## Execution plan
+
+Implementation must follow these phases in order.
+
+Do not start a later phase until the current phase passes its acceptance checks.
+
+---
+
+# Phase 1 — Canonical alpha attribution foundation
 
 ## Goal
-Promote only economically stable behavior and make capital-growth quality inspectable and proven.
+Create a canonical representation of:
 
-## Create
-- `packages/signal-engine/src/capital-growth-promotion-gate.ts`
-- `packages/signal-engine/src/promotion-stability-check.ts`
-- modify `packages/signal-engine/src/promotion-decision-engine.ts`
-- `packages/risk-engine/src/capital-growth-metrics.ts`
-- `packages/risk-engine/src/compounding-efficiency-score.ts`
+- raw forecast edge
+- paper edge
+- expected executable edge
+- realized retained edge
+
+## Files to add
+- `packages/signal-engine/src/edge/alpha-attribution.ts`
+
+## Required exports
+Create explicit interfaces such as:
+
+- `AlphaAttributionInput`
+- `AlphaAttributionOutput`
+- `ExpectedExecutionCostBreakdown`
+- `RealizedExecutionCostBreakdown`
+
+## Required output fields
+At minimum:
+
+- `rawForecastProbability`
+- `marketImpliedProbability`
+- `rawForecastEdge`
+- `confidenceAdjustedEdge`
+- `paperEdge`
+- `expectedExecutionCost`
+- `expectedNetEdge`
+- `realizedExecutionCost`
+- `realizedNetEdge`
+- `retentionRatio`
+- `capturedAt`
+
+## Integration targets
+- `apps/worker/src/jobs/buildSignals.job.ts`
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+- `apps/worker/src/jobs/executeOrders.job.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+
+## Required evidence changes
+- decision logs include attribution payloads where relevant
+- lineage payloads include attribution references where relevant
+- execution diagnostics or related evidence include expected vs realized net edge where appropriate
+
+## Definition of done
+- canonical module exists
+- jobs consume it where relevant
+- no current functionality is removed
+- decision evidence is extended, not replaced
+- tests cover core logic
+
+## Tests required
+Add unit tests for:
+- positive edge
+- negative edge
+- zero or near-zero edge
+- cost-dominant scenarios
+- retention ratio edge cases
+
+## Phase 1 acceptance gate
+Before moving to Phase 2, all of the following must be true:
+
+- repo typechecks
+- relevant tests pass
+- buildSignals, evaluateTradeOpportunities, executeOrders, and dailyReview still compile cleanly
+- attribution module is actually used, not just added
+- no existing safety behavior is degraded
+
+---
+
+# Phase 2 — Alpha feature enrichment
+
+## Goal
+Strengthen the predictive layer with richer market and flow context.
+
+## Files to add
+- `packages/signal-engine/src/alpha/flow-features.ts`
+- `packages/signal-engine/src/alpha/btc-polymarket-linkage.ts`
+- `packages/signal-engine/src/alpha/market-state-transition.ts`
+- `packages/signal-engine/src/alpha/edge-decay-profile.ts`
+- `packages/signal-engine/src/alpha/market-archetype-classifier.ts`
+
+## Files to update
+- `packages/signal-engine/src/feature-builder.ts`
+- `packages/signal-engine/src/prior/prior-model.ts`
+- `packages/signal-engine/src/posterior/posterior-update.ts`
+- `packages/signal-engine/src/regime-classifier.ts`
+- `apps/worker/src/jobs/buildSignals.job.ts`
+
+## Required new feature categories
+At minimum implement feature families for:
+
+- recent trade or flow imbalance proxy
+- book instability or update stress
+- BTC move transmission to market-implied probability
+- signal-age decay pressure
+- market archetype classification
+
+## Requirements for `feature-builder.ts`
+Extend the feature type only with fields that are actually consumed downstream.
+
+Do not add dead fields.
+
+## Requirements for `prior-model.ts`
+Refactor to use richer structured inputs.
+Keep it inspectable.
+Support component-level reasoning in diagnostics.
+
+## Requirements for `posterior-update.ts`
+Use:
+- new flow features
+- archetype signals
+- decay penalties
+- toxicity penalties if available
+- confidence-aware adjustments
+
+## Requirements for `buildSignals.job.ts`
+Persist or log the new context in admitted and rejected signal evidence.
+
+## Definition of done
+- new feature modules exist
+- feature builder returns enriched features
+- prior/posterior consume them
+- signal job records them
+- tests cover feature computation and posterior/prior behavior
+
+## Tests required
+- unit tests for each feature module
+- regression tests for `feature-builder.ts`
+- integration tests showing new features affect signal decisions
+
+## Phase 2 acceptance gate
+Before moving to Phase 3:
+
+- all Phase 1 checks still pass
+- new feature modules are integrated, not dead
+- p23 validation still runs
+- no regression in basic signal-path compilation or tests
+- evidence outputs are richer, not poorer
+
+---
+
+# Phase 3 — Toxicity-aware flow layer
+
+## Goal
+Detect and act on toxic flow or unstable microstructure.
+
+## Files to add
+- `packages/signal-engine/src/toxicity/flow-toxicity-score.ts`
+- `packages/signal-engine/src/toxicity/adverse-selection-risk.ts`
+- `packages/signal-engine/src/toxicity/book-instability-score.ts`
+- `packages/signal-engine/src/toxicity/toxicity-policy.ts`
+
+## Files to update
+- `packages/signal-engine/src/regime-classifier.ts`
+- `apps/worker/src/jobs/buildSignals.job.ts`
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+- `apps/worker/src/jobs/executeOrders.job.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+
+## Required toxicity outputs
+At minimum:
+- `toxicityScore`
+- `bookInstabilityScore`
+- `adverseSelectionRisk`
+- `toxicityState`
+- `recommendedAction`
+
+## Allowed actions
+Support at least:
+- no change
+- widen threshold
+- reduce size
+- disable aggressive execution
+- temporarily block regime
+
+## Integration requirements
+
+### Build signals
+Attach toxicity context to signal evidence.
+
+### Evaluate trades
+Use toxicity state to:
+- tighten admission
+- widen thresholds
+- shrink size
+- block certain regimes where justified
+
+### Execute orders
+Use toxicity state to:
+- reduce aggression
+- prefer safer execution mode
+- potentially reject if execution risk becomes too high
+
+### Daily review
+Track toxicity-conditioned performance.
+
+## Definition of done
+- toxicity modules exist
+- toxicity influences decisions in evaluation and/or execution
+- toxicity appears in diagnostics and lineage
+- daily review reports toxicity-conditioned outcomes
+
+## Tests required
+- unit tests for toxicity calculators
+- policy tests for each toxicity action branch
+- integration tests showing size/aggression changes under toxicity
+
+## Phase 3 acceptance gate
+Before moving to Phase 4:
+
+- all prior phase checks still pass
+- toxicity is actionable, not just logged
+- toxicity does not bypass safety-state rules
+- execution remains deterministic and bounded
+- diagnostics clearly show toxicity influence
+
+---
+
+# Phase 4 — Live sizing feedback policy
+
+## Goal
+Make recent performance and degradation influence live sizing and permissions more directly.
+
+## Files to add
+- `packages/risk-engine/src/live-sizing-feedback-policy.ts`
+
+## Files to update
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+- `apps/worker/src/jobs/executeOrders.job.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+
+## Inputs required
+At minimum the policy should consume:
+- retention ratio
+- calibration health
+- execution drift
+- regime degradation
+- toxicity state
+- venue uncertainty
+- recent realized-vs-expected performance
+
+## Outputs required
+At minimum:
+- `sizeMultiplier`
+- `aggressionCap`
+- `thresholdAdjustment`
+- `regimePermissionOverride`
+- `reasonCodes`
+
+## Integration requirements
+
+### Evaluate trades
+Apply the size multiplier and threshold adjustment.
+
+### Execute orders
+Respect aggression cap and execution-style restrictions.
+
+### Daily review
+Persist summary evidence that can feed future cycles.
+
+## Definition of done
+- policy exists
+- evaluation uses it
+- execution uses it
+- evidence is persisted
+- tests cover shrink, hold, and scale-up cases
+
+## Tests required
+- unit tests for policy under healthy/degraded/toxic cases
+- integration tests showing live size changes when retention collapses
+
+## Phase 4 acceptance gate
+Before moving to Phase 5:
+
+- all prior phase checks still pass
+- live sizing changes are evidence-driven
+- sizing does not bypass existing capital/safety protections
+- execution behavior remains compatible with current runtime controls
+
+---
+
+# Phase 5 — Baseline benchmarking framework
+
+## Goal
+Require the strategy to beat simpler alternatives.
+
+## Files to add
+- `packages/signal-engine/src/benchmarks/btc-follow-baseline.ts`
+- `packages/signal-engine/src/benchmarks/momentum-baseline.ts`
+- `packages/signal-engine/src/benchmarks/reversion-baseline.ts`
+- `packages/signal-engine/src/benchmarks/no-regime-baseline.ts`
+- `apps/worker/src/validation/baseline-comparison.ts`
+
+## Files to update
+- `apps/worker/src/validation/p23-validation.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
 - `apps/worker/src/jobs/capitalGrowthReview.job.ts`
-- `apps/worker/src/commands/print-net-edge-state.command.ts`
-- `apps/worker/src/commands/print-capital-leak-report.command.ts`
-- `apps/worker/src/commands/print-regime-profitability.command.ts`
-- `apps/worker/src/commands/print-capital-growth-metrics.command.ts`
-- `apps/worker/src/tests/net-edge-gating.integration.test.ts`
-- `apps/worker/src/tests/regime-profitability.integration.test.ts`
-- `apps/worker/src/tests/uncertainty-sizing.integration.test.ts`
-- `apps/worker/src/tests/anti-overtrading.integration.test.ts`
-- `apps/worker/src/tests/capital-leak-attribution.integration.test.ts`
 
-## Required behavior
+## Required benchmark outputs
+At minimum for each baseline:
+- sample count
+- expected EV
+- realized EV
+- realized-vs-expected
+- trade count
+- opportunity-class distribution if relevant
+- regime breakdown if relevant
 
-### `capital-growth-promotion-gate.ts`
-Promotion must require:
-- net edge quality
-- acceptable drawdown
-- healthy calibration
-- healthy execution retention
-- acceptable capital leakage
-- stable regime profitability
+## Definition of done
+- benchmark modules exist
+- p23 validation compares main strategy vs baselines
+- daily review stores benchmark comparison summaries
+- capital growth review can reference benchmark outperformance or failure
 
-### `promotion-stability-check.ts`
-Reject profitable-but-unstable challengers.
-Examples:
-- luck concentrated in one narrow context
-- poor EV consistency
-- high variance without stable retention
-- fragile regime dependence
+## Tests required
+- unit tests for baseline generators
+- validation tests showing comparison outputs are produced
 
-### `capital-growth-metrics.ts`
-Compute capital-growth-focused metrics such as:
-- net return
-- drawdown-adjusted growth
-- EV retention
-- cost leakage ratio
-- profit factor after costs
-- regime-adjusted expectancy
-- stability-adjusted capital growth score
+## Phase 5 acceptance gate
+Before moving to Phase 6:
 
-### `compounding-efficiency-score.ts`
-Produce a composite score answering how efficiently the system converts risk into growth.
-
-### `capitalGrowthReview.job.ts`
-Review:
-- what compounds efficiently
-- what is profitable but unstable
-- what should be scaled
-- what should be reduced
-
-### Commands
-Provide inspectable operator outputs for:
-- net-edge state
-- capital leak report
-- regime profitability
-- capital growth metrics
-
-### Integration tests
-Must prove:
-- raw edge can be rejected after cost adjustment
-- destructive regimes are down-ranked
-- uncertainty reduces size
-- anti-overtrading controls trigger correctly
-- capital leak attribution distinguishes different loss sources
-
-## Rules
-- do not promote on recent profits alone
-- metrics must focus on capital growth quality, not vanity performance
-- tests must verify economic logic, not only existence of files
-
-## Verification commands
-Run:
-
-```bash
-pnpm -r typecheck
-pnpm test
-pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
-rg "capital-growth-promotion-gate|promotion-stability-check|capital-growth-metrics|compounding-efficiency-score|capitalGrowthReview|print-net-edge-state|print-capital-leak-report|print-regime-profitability|print-capital-growth-metrics|net-edge-gating.integration|regime-profitability.integration|uncertainty-sizing.integration|anti-overtrading.integration|capital-leak-attribution.integration" apps packages
-```
-
-## Wave 5 acceptance criteria
-Wave 5 is complete only if:
-- promotions are gated by capital-growth quality
-- capital-growth metrics exist and are inspectable
-- operator commands expose economic state clearly
-- integration tests prove the economic controls work
+- all prior phase checks still pass
+- p23 validation still runs end to end
+- baseline comparisons are replayable and explicit
+- no benchmark depends on opaque external assumptions without documentation
 
 ---
 
-# Final Phase 12 verification gate
+# Phase 6 — Validation and evidence expansion
 
-Run all of the following before calling Phase 12 complete:
+## Goal
+Strengthen empirical proof and make output actionable.
 
-```bash
-pnpm -r typecheck
-pnpm test
-pnpm --filter @polymarket-btc-5m-agentic-bot/worker test
-```
+## Files to add
+- `apps/worker/src/validation/live-proof-scorecard.ts`
+- `apps/worker/src/validation/retention-report.ts`
+- `apps/worker/src/validation/regime-performance-report.ts`
 
-Then verify all required Phase 12 modules exist and are referenced.
+## Files to update
+- `apps/worker/src/validation/p23-validation.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+- `apps/worker/src/jobs/capitalGrowthReview.job.ts`
+- `apps/worker/src/runtime/decision-log.service.ts`
+- `apps/worker/src/runtime/version-lineage-registry.ts`
 
-Suggested search:
+## Required report outputs
+At minimum:
+- per-regime expected vs realized EV
+- per-regime retention ratio
+- per-regime calibration gaps
+- toxicity-conditioned results
+- benchmark comparison summary
+- live proof scorecard summary
 
-```bash
-rg "net-edge-estimator|no-trade-zone-policy|capital-leak-attribution|trade-quality-scorer|regime-profitability-ranker|trade-frequency-governor|realized-cost-model|uncertainty-weighted-sizing|capital-growth-promotion-gate|capital-growth-metrics|print-net-edge-state|print-capital-growth-metrics" apps packages
-```
+## Definition of done
+- reports exist
+- p23 validation writes stronger evidence artifacts
+- daily review includes summaries of retention and benchmark results
+- lineage references the relevant evidence where appropriate
+
+## Tests required
+- report generation tests
+- p23 validation regression tests
+- persistence/logging tests where applicable
+
+## Phase 6 acceptance gate
+Before moving to Phase 7:
+
+- all prior phase checks still pass
+- evidence outputs are materially richer
+- synthetic-only evidence is not treated as promotion proof
+- benchmark and retention outputs are visible in review artifacts
 
 ---
 
-# Definition of done
+# Phase 7 — Job integration hardening
 
-Phase 12 is complete only if the repository can demonstrate all of the following:
-- weak raw edge can be rejected after realistic cost adjustment
-- destructive regimes receive less or zero capital
-- capital leakage can be attributed explicitly
-- trade quality is scored and persisted
-- overtrading can be suppressed
-- position size falls when uncertainty rises
-- liquidity constraints reduce exposure explicitly
-- strategy promotion depends on capital-growth quality
-- economic operator commands expose the relevant state clearly
-- integration tests verify the most important economic controls
+## Goal
+Ensure new modules are actually wired into live paths correctly.
 
-If any of the above is missing, Phase 12 is not complete.
+## Files to update
+- `apps/worker/src/jobs/buildSignals.job.ts`
+- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+- `apps/worker/src/jobs/executeOrders.job.ts`
+- `apps/worker/src/jobs/dailyReview.job.ts`
+
+## Required integration behavior
+
+### `buildSignals.job.ts`
+Must:
+- consume enriched features
+- compute and persist alpha attribution
+- attach archetype and toxicity context
+- preserve admitted vs rejected evidence
+
+### `evaluateTradeOpportunities.job.ts`
+Must:
+- consume alpha attribution
+- apply live sizing feedback policy
+- apply toxicity-aware admission logic
+- preserve reason codes and evidence
+
+### `executeOrders.job.ts`
+Must:
+- consume retained-edge expectations
+- react to toxicity and aggression caps
+- produce realized retention diagnostics
+
+### `dailyReview.job.ts`
+Must:
+- summarize retention and benchmark evidence
+- feed live sizing inputs
+- preserve review outputs in learning state
+
+## Definition of done
+- no new modules remain unused
+- all new policy outputs influence a live or validation path
+- integration tests confirm end-to-end behavior changes
+
+## Tests required
+- integration tests across modified jobs
+- evidence regression checks where feasible
+
+## Final acceptance gate
+The full upgrade is only complete if:
+
+- all earlier phase gates pass
+- no dead modules remain
+- no current functionality was silently removed
+- tests and validation commands run successfully
+- diagnostics, lineage, and review outputs are richer than before
+- the repository can more clearly answer:
+  - where forecast edge comes from
+  - whether it survives execution
+  - which regimes actually work
+  - which baselines are being beaten
+  - whether toxicity should force defense
+  - whether live size should shrink or hold
+
+---
+
+## Required schemas
+
+### Learning state additions
+Extend learning state only as needed, but define explicit fields for:
+- latest retention summary
+- latest benchmark summary
+- latest toxicity summary
+- latest live sizing evidence summary
+
+Do not store redundant or massive raw blobs unless necessary.
+
+### Diagnostics additions
+Execution diagnostics or associated evidence should include:
+- expected net edge
+- realized net edge
+- retention ratio
+- toxicity state
+- archetype or regime context
+
+### Decision log additions
+Decision logs should be extended to include:
+- alpha attribution
+- toxicity context
+- live sizing feedback result
+- benchmark or review references when relevant
+
+---
+
+## Do-not-touch list unless necessary
+
+Avoid editing these unless there is a clear integration requirement:
+- runtime startup and crash recovery files
+- API/UI files
+- unrelated adapter internals
+- broad domain schemas beyond what is needed for evidence
+
+If you must touch them, keep changes minimal and compatibility-safe.
+
+---
+
+## Test policy
+
+Every phase must include tests.
+
+### Required test classes
+- unit tests for pure calculators/policies
+- integration tests for changed jobs
+- validation tests for report/benchmark generation
+
+### Minimum test expectations
+- all new modules have at least one direct unit test
+- each modified major job has at least one integration coverage change
+- p23 validation remains runnable and more informative than before
+
+### Preferred test placement
+Follow existing repository conventions.
+New pure modules should get direct unit tests near their package test conventions.
+Changed worker jobs should receive integration coverage under existing worker test patterns.
+
+---
+
+## Validation commands
+
+Use existing repo commands where possible rather than inventing replacements.
+
+At minimum, contributors should preserve or extend support for commands equivalent to:
+
+- `pnpm test`
+- `pnpm typecheck`
+- `pnpm --filter @polymarket-btc-5m-agentic-bot/worker validate:p23`
+- `pnpm --filter @polymarket-btc-5m-agentic-bot/worker validate:dataset-quality`
+
+If exact scripts differ, update scripts in a compatibility-safe way and document them.
+
+Do not remove current useful commands without replacing them.
+
+---
+
+## Rollback and failure handling
+
+If a phase causes:
+- failing typecheck
+- failing tests
+- broken validation
+- degraded evidence quality
+- broken runtime integration
+
+stop and repair before proceeding.
+
+Do not continue stacking phases on a broken base.
+
+If a new module adds complexity without measurable value, either simplify it or remove it before moving on.
+
+---
+
+## Success criteria
+
+This upgrade is successful only if the repository can more clearly answer:
+
+- Where does forecast edge come from?
+- Does forecast edge survive execution?
+- Which regimes really work?
+- Which baselines are being beaten?
+- Is current underperformance alpha-driven or execution-driven?
+- Is toxicity currently high enough to force defense?
+- Should live size shrink or hold based on recent evidence?
+
+And only if:
+- existing core functionality still works
+- risk and runtime protections remain intact
+- evidence quality improves materially
+
+---
+
+## Short checklist for contributors
+
+Before considering work complete, verify:
+
+- [ ] Existing runtime and safety behavior preserved
+- [ ] Alpha attribution module added and integrated
+- [ ] Feature enrichment added and integrated
+- [ ] Toxicity module added and actionable
+- [ ] Live sizing feedback policy added and used
+- [ ] Baselines added and compared
+- [ ] Validation outputs expanded
+- [ ] Decision log / lineage updated where needed
+- [ ] Tests added
+- [ ] No dead modules left unintegrated
+- [ ] Existing commands still work or were safely replaced
+
+---
+
+## Final implementation intent
+
+Do not treat this as a request for cosmetic refactoring.
+
+Treat it as a focused upgrade program to move the system from:
+
+- strong execution-and-control platform with moderate alpha
+
+to:
+
+- strong execution-and-control platform with better alpha
+- better proof
+- better attribution
+- better toxicity handling
+- better evidence-driven capital deployment
