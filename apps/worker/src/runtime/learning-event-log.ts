@@ -382,6 +382,7 @@ function readLearningEventType(value: unknown): LearningEventType | null {
   return value === 'learning_cycle_started' ||
     value === 'learning_cycle_completed' ||
     value === 'learning_cycle_failed' ||
+    value === 'learning_parameter_recommendations_generated' ||
     value === 'calibration_updated' ||
     value === 'edge_decay_detected' ||
     value === 'confidence_shrinkage_changed' ||

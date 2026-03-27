@@ -58,6 +58,7 @@ import {
 } from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
 import { CapitalLeakReviewJob } from './capitalLeakReview.job';
 import { LearningCycleRunner, type LearningCycleSample } from '@worker/orchestration/learning-cycle-runner';
+import { BoundedLearningParameterRecommender } from '@worker/orchestration/bounded-learning-parameter-recommender';
 import { LearningEventLog } from '@worker/runtime/learning-event-log';
 import { LearningStateStore } from '@worker/runtime/learning-state-store';
 import { ResolvedTradeLedger } from '@worker/runtime/resolved-trade-ledger';
@@ -143,6 +144,8 @@ export class DailyReviewJob {
   private readonly liveSizingFeedbackPolicy = new LiveSizingFeedbackPolicy();
   private readonly benchmarkRelativeSizing = new BenchmarkRelativeSizing();
   private readonly toxicityTrend = new ToxicityTrend();
+  private readonly boundedLearningParameterRecommender =
+    new BoundedLearningParameterRecommender();
   private readonly cycleArtifactDir: string;
   private readonly latestCycleArtifactPath: string;
   private activeRun: Promise<LearningCycleSummary> | null = null;
@@ -405,6 +408,16 @@ export class DailyReviewJob {
         learningState: portfolioLearning.learningState,
         capitalGrowthReport: capitalGrowthReview.report,
       });
+      const boundedParameterRecommendations =
+        this.boundedLearningParameterRecommender.recommend({
+          cycleId,
+          completedAt,
+          analyzedWindow: window,
+          priorReviewOutputs: priorState.lastCycleSummary?.reviewOutputs,
+          samples: sampleLoadResult.samples,
+          sampleSourceSummary: sampleLoadResult.sampleSourceSummary,
+          resolvedTradeLedgerPath: this.resolvedTradeLedger.getPath(),
+        });
       const summary = attachReviewOutputs(
         appendWarnings(result.summary, [
           ...executionLearning.warnings,
@@ -424,6 +437,7 @@ export class DailyReviewJob {
           ...lossAttributionReview.warnings,
           ...toxicityReview.warnings,
           ...liveSizingFeedbackReview.warnings,
+          ...boundedParameterRecommendations.warnings,
         ]),
         {
           alphaAttribution: alphaAttributionReview.summary,
@@ -440,6 +454,7 @@ export class DailyReviewJob {
           regimePerformanceReport: capitalGrowthReview.report.regimePerformanceReport,
           liveProofScorecard: capitalGrowthReview.report.liveProofScorecard,
           liveSizingFeedback: liveSizingFeedbackReview.summary,
+          boundedParameterRecommendations: boundedParameterRecommendations.reviewOutput,
         },
       );
       const finalState: LearningState = {
@@ -456,6 +471,7 @@ export class DailyReviewJob {
         ...executionLearning.events,
         ...governed.events,
         ...portfolioLearning.events,
+        boundedParameterRecommendations.event,
       ]);
       const artifact = this.buildLearningCycleArtifact({
         summary,

@@ -32,6 +32,7 @@ export type LearningEventType =
   | 'learning_cycle_started'
   | 'learning_cycle_completed'
   | 'learning_cycle_failed'
+  | 'learning_parameter_recommendations_generated'
   | 'calibration_updated'
   | 'edge_decay_detected'
   | 'confidence_shrinkage_changed'
