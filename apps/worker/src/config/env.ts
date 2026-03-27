@@ -87,6 +87,13 @@ const envSchema = z.object({
   BOT_DEPLOYMENT_TIER: z
     .enum(['research', 'paper', 'canary', 'cautious_live', 'scaled_live'])
     .default('paper'),
+  BOT_MIN_LIVE_TRADES_FOR_CANARY: z.coerce.number().int().nonnegative().default(0),
+  BOT_MIN_LIVE_TRADES_FOR_CAUTIOUS_LIVE: z.coerce.number().int().nonnegative().default(8),
+  BOT_MIN_LIVE_TRADES_FOR_SCALED_LIVE: z.coerce.number().int().nonnegative().default(20),
+  BOT_MAX_ALLOWED_REALIZED_EXPECTED_EDGE_GAP_BPS: z.coerce.number().nonnegative().default(50),
+  BOT_MAX_ALLOWED_RECONCILIATION_DEFECT_RATE: z.coerce.number().min(0).max(1).default(0.1),
+  BOT_ENABLE_SHADOW_DECISION_LOGGING: z.coerce.boolean().default(true),
+  BOT_REQUIRE_PRODUCTION_READINESS_PASS: z.coerce.boolean().default(true),
 
   MAX_OPEN_POSITIONS: z.coerce.number().int().positive().default(1),
   MAX_DAILY_LOSS_PCT: z.coerce.number().positive().default(5),

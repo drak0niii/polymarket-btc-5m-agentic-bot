@@ -34,11 +34,13 @@ export interface BenchmarkRelativeSizingInput {
 
 export interface BenchmarkRelativeSizingDecision {
   baselinePenaltyMultiplier: number;
+  clampAmount: number;
   benchmarkComparisonState: BenchmarkComparisonState;
   regimeBenchmarkGateState: RegimeBenchmarkGateState;
   promotionBlockedByBenchmark: boolean;
   regimeBenchmarkReasonCodes: string[];
   benchmarkPenaltyReasonCodes: string[];
+  rationale: string[];
   evidence: Record<string, unknown>;
   capturedAt: string;
 }
@@ -168,11 +170,13 @@ export class BenchmarkRelativeSizing {
 
     return {
       baselinePenaltyMultiplier,
+      clampAmount: clamp(1 - baselinePenaltyMultiplier, 0, 1),
       benchmarkComparisonState,
       regimeBenchmarkGateState,
       promotionBlockedByBenchmark,
       regimeBenchmarkReasonCodes: Array.from(new Set(gateReasonCodes)),
       benchmarkPenaltyReasonCodes: Array.from(new Set(reasonCodes)),
+      rationale: Array.from(new Set([...reasonCodes, ...gateReasonCodes])),
       evidence: {
         regime,
         strategyContext,
@@ -185,4 +189,8 @@ export class BenchmarkRelativeSizing {
       capturedAt: new Date().toISOString(),
     };
   }
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
 }

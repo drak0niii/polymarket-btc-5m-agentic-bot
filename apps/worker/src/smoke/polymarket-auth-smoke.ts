@@ -1,12 +1,15 @@
 import { z } from 'zod';
 import { redactSecrets } from '@worker/config/secret-provider';
 import {
+  GammaClient,
   OfficialPolymarketTradingClient,
   VenueOrderType,
 } from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
+import { UserWebSocketStateService } from '@worker/runtime/user-websocket-state.service';
 
 const smokeEnvSchema = z.object({
   POLY_CLOB_HOST: z.string().min(1, 'POLY_CLOB_HOST is required'),
+  POLY_GAMMA_HOST: z.string().min(1).default('https://gamma-api.polymarket.com'),
   POLY_CHAIN_ID: z.coerce.number().int().positive().default(137),
   POLY_PRIVATE_KEY: z.string().min(1, 'POLY_PRIVATE_KEY is required'),
   POLY_API_KEY: z.string().min(1, 'POLY_API_KEY is required'),
@@ -26,6 +29,7 @@ const smokeEnvSchema = z.object({
   POLY_SMOKE_EXPIRATION_SECONDS: z.coerce.number().int().positive().default(75),
   POLY_SMOKE_MAX_WAIT_MS: z.coerce.number().int().positive().default(10000),
   POLY_SMOKE_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(1000),
+  BOT_USER_WS_URL: z.string().optional(),
 });
 
 export type PolymarketSmokeEnv = z.infer<typeof smokeEnvSchema>;
@@ -35,6 +39,7 @@ export type PolymarketSmokeStepName =
   | 'get_balance_allowance'
   | 'get_open_orders'
   | 'get_trades'
+  | 'user_stream_auth'
   | 'submit'
   | 'open_order_visibility'
   | 'heartbeat'
@@ -123,6 +128,39 @@ function sanitizeError(error: unknown): string {
   return JSON.stringify(redactSecrets({ message }));
 }
 
+async function findSmokeMarketId(
+  gammaBaseUrl: string,
+  tokenId: string,
+): Promise<string | null> {
+  const gammaClient = new GammaClient(gammaBaseUrl);
+  let offset = 0;
+  const limit = 200;
+  const normalizedTokenId = tokenId.trim();
+
+  while (true) {
+    const response = await gammaClient.listMarketsDetailed({
+      active: true,
+      closed: false,
+      limit,
+      offset,
+    });
+    if (response.markets.length === 0) {
+      return null;
+    }
+
+    for (const market of response.markets) {
+      const tokenIds = new Set<string>(
+        (market.clobTokenIds ?? []).map((value) => String(value ?? '').trim()),
+      );
+      if (tokenIds.has(normalizedTokenId)) {
+        return market.id;
+      }
+    }
+
+    offset += limit;
+  }
+}
+
 export async function runPolymarketAuthenticatedSmoke(
   env: NodeJS.ProcessEnv = process.env,
   clientOverride?: OfficialPolymarketTradingClient,
@@ -190,6 +228,56 @@ export async function runPolymarketAuthenticatedSmoke(
         trades: tradesBefore.length,
       }),
     );
+
+    const smokeMarketId = await findSmokeMarketId(
+      config.POLY_GAMMA_HOST,
+      config.POLY_SMOKE_TOKEN_ID,
+    );
+    if (!smokeMarketId) {
+      throw new Error(`smoke_user_stream_market_missing:${config.POLY_SMOKE_TOKEN_ID}`);
+    }
+    const userStreamService = new UserWebSocketStateService(
+      Math.max(config.POLY_SMOKE_MAX_WAIT_MS, 5_000),
+      {
+        url: config.BOT_USER_WS_URL ?? undefined,
+        gammaBaseUrl: config.POLY_GAMMA_HOST,
+        auth: {
+          apiKey: config.POLY_API_KEY,
+          secret: config.POLY_API_SECRET,
+          passphrase: config.POLY_API_PASSPHRASE,
+        },
+        restClient: client,
+      },
+    );
+    try {
+      await userStreamService.start([
+        {
+          marketId: smokeMarketId,
+          tokenIds: [config.POLY_SMOKE_TOKEN_ID],
+        },
+      ]);
+      const userStreamAuthenticated = await waitForCondition(async () => {
+        const health = userStreamService.evaluateHealth();
+        return health.connected && health.trusted && health.subscribedMarkets > 0;
+      }, config.POLY_SMOKE_MAX_WAIT_MS, Math.min(config.POLY_SMOKE_POLL_INTERVAL_MS, 250));
+      if (!userStreamAuthenticated) {
+        throw new Error('smoke_user_stream_auth_unconfirmed');
+      }
+      const userStreamHealth = userStreamService.evaluateHealth();
+      steps.push(
+        passStep('user_stream_auth', 'passed', {
+          marketId: smokeMarketId,
+          connectionStatus: userStreamHealth.connectionStatus,
+          trusted: userStreamHealth.trusted,
+          connected: userStreamHealth.connected,
+          subscribedMarkets: userStreamHealth.subscribedMarkets,
+          lastTrafficAt: userStreamHealth.lastTrafficAt,
+          lastEventAt: userStreamHealth.lastEventAt,
+        }),
+      );
+    } finally {
+      userStreamService.stop();
+    }
 
     const expiration =
       config.POLY_SMOKE_ORDER_TYPE === 'GTD'
@@ -287,6 +375,7 @@ export async function runPolymarketAuthenticatedSmoke(
       'get_balance_allowance',
       'get_open_orders',
       'get_trades',
+      'user_stream_auth',
       'submit',
       'open_order_visibility',
       'heartbeat',

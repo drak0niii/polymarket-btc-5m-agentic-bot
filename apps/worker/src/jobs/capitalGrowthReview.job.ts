@@ -5,10 +5,12 @@ import { AppLogger } from '@worker/common/logger';
 import { DecisionLogService } from '@worker/runtime/decision-log.service';
 import { LearningStateStore } from '@worker/runtime/learning-state-store';
 import type { BaselineComparisonReport } from '@worker/validation/baseline-comparison';
+import type { DailyDecisionQualityReport } from '@worker/validation/daily-decision-quality-report';
 import type { LiveProofScorecard } from '@worker/validation/live-proof-scorecard';
 import type { RegimePerformanceReport } from '@worker/validation/regime-performance-report';
 import type { RollingBenchmarkScorecard } from '@worker/validation/rolling-benchmark-scorecard';
 import type { RetentionReport } from '@worker/validation/retention-report';
+import { readLatestDailyDecisionQualityReport } from '@worker/validation/daily-decision-quality-report';
 import type { LearningState, TradeQualityScore } from '@polymarket-btc-5m-agentic-bot/domain';
 import {
   CapitalGrowthMetricsCalculator,
@@ -49,6 +51,7 @@ export interface CapitalGrowthReviewReport {
   shouldScale: string[];
   shouldReduce: string[];
   baselineComparison: BaselineComparisonReport | null;
+  dailyDecisionQualityReport: DailyDecisionQualityReport | null;
   rollingBenchmarkScorecard: RollingBenchmarkScorecard | null;
   retentionReport: RetentionReport | null;
   regimePerformanceReport: RegimePerformanceReport | null;
@@ -99,6 +102,7 @@ export class CapitalGrowthReviewJob {
     learningState?: LearningState;
     capitalLeakReport?: CapitalLeakReport | null;
     baselineComparison?: BaselineComparisonReport | null;
+    dailyDecisionQualityReport?: DailyDecisionQualityReport | null;
     rollingBenchmarkScorecard?: RollingBenchmarkScorecard | null;
     retentionReport?: RetentionReport | null;
     regimePerformanceReport?: RegimePerformanceReport | null;
@@ -115,7 +119,11 @@ export class CapitalGrowthReviewJob {
       (await readLatestCapitalLeakReport(
         path.join(this.learningStateStore.getPaths().rootDir, 'capital-leak'),
       ));
+    const dailyDecisionQualityReport =
+      input.dailyDecisionQualityReport ??
+      (await readLatestDailyDecisionQualityReport(this.learningStateStore.getPaths().rootDir));
     const latestValidationProof = await readLatestValidationProofBundle();
+    const dailyCapitalEfficiency = summarizeDailyCapitalEfficiency(dailyDecisionQualityReport);
     const variants = Object.keys(learningState.strategyVariants)
       .sort()
       .map((strategyVariantId) =>
@@ -124,6 +132,7 @@ export class CapitalGrowthReviewJob {
           learningState,
           tradeQualityScores,
           capitalLeakReport,
+          dailyCapitalEfficiencyHealthy: dailyCapitalEfficiency.healthy,
         }),
       );
 
@@ -148,6 +157,7 @@ export class CapitalGrowthReviewJob {
         .map((variant) => variant.strategyVariantId),
       baselineComparison:
         input.baselineComparison ?? latestValidationProof.baselineComparison,
+      dailyDecisionQualityReport,
       rollingBenchmarkScorecard:
         input.rollingBenchmarkScorecard ?? latestValidationProof.rollingBenchmarkScorecard,
       retentionReport:
@@ -163,6 +173,9 @@ export class CapitalGrowthReviewJob {
       ...(report.baselineComparison?.underperformedBenchmarkIds ?? []).map(
         (benchmarkId) => `underperforming_baseline:${benchmarkId}`,
       ),
+      ...(dailyCapitalEfficiency.healthy
+        ? []
+        : ['daily_capital_efficiency_weak']),
       ...(report.rollingBenchmarkScorecard?.windows
         .filter((window) => window.benchmarkComparisonState === 'underperforming')
         .map((window) => `rolling_benchmark_underperformance:${window.windowKey}`) ?? []),
@@ -248,6 +261,7 @@ export class CapitalGrowthReviewJob {
     learningState: LearningState;
     tradeQualityScores: TradeQualityScore[];
     capitalLeakReport: CapitalLeakReport | null;
+    dailyCapitalEfficiencyHealthy: boolean;
   }): CapitalGrowthVariantReview {
     const variant = input.learningState.strategyVariants[input.strategyVariantId];
     const variantTradeQuality = input.tradeQualityScores.filter(
@@ -329,7 +343,8 @@ export class CapitalGrowthReviewJob {
     const recommendation: CapitalGrowthVariantReview['recommendation'] =
       promotionGate.passed &&
       stabilityCheck.stable &&
-      metrics.compoundingEfficiency.score >= 0.78
+      metrics.compoundingEfficiency.score >= 0.78 &&
+      input.dailyCapitalEfficiencyHealthy
         ? 'scale'
         : profitableButUnstable ||
             metrics.netReturn <= 0 ||
@@ -348,6 +363,9 @@ export class CapitalGrowthReviewJob {
         ...metrics.reasons,
         ...promotionGate.reasons,
         ...stabilityCheck.reasons,
+        ...(input.dailyCapitalEfficiencyHealthy
+          ? []
+          : ['daily_capital_efficiency_blocks_scale']),
         `recommendation_${recommendation}`,
       ],
     };
@@ -434,6 +452,38 @@ export async function readLatestValidationProofBundle(
     }
     throw error;
   }
+}
+
+function summarizeDailyCapitalEfficiency(
+  report: DailyDecisionQualityReport | null,
+): { healthy: boolean; positiveNetDayShare: number; capitalEfficiencyRatio: number | null } {
+  if (!report || report.summary.dayCount === 0) {
+    return {
+      healthy: true,
+      positiveNetDayShare: 0,
+      capitalEfficiencyRatio: null,
+    };
+  }
+
+  const positiveNetDayShare =
+    report.summary.dayCount > 0
+      ? report.summary.positiveNetDayCount / report.summary.dayCount
+      : 0;
+  const capitalEfficiencyRatio = report.summary.capitalEfficiencyRatio;
+  const averageGap =
+    report.byDay
+      .map((entry) => entry.realizedVsExpectedGapBps)
+      .filter((value): value is number => value != null && Number.isFinite(value))
+      .reduce((sum, value, _, array) => sum + value / array.length, 0);
+
+  return {
+    healthy:
+      positiveNetDayShare >= 0.5 &&
+      (capitalEfficiencyRatio == null || capitalEfficiencyRatio >= 0.55) &&
+      averageGap >= -40,
+    positiveNetDayShare,
+    capitalEfficiencyRatio,
+  };
 }
 
 function buildContextShares(variant: LearningState['strategyVariants'][string]): PromotionStabilityContextShare[] {

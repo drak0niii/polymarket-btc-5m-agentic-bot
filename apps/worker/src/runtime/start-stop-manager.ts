@@ -107,7 +107,11 @@ export class StartStopManager {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`venue preflight ${message}`);
+      const prefix =
+        'assertLiveStartupAllowed' in this.startupGateService
+          ? 'startup readiness'
+          : 'venue preflight';
+      throw new Error(`${prefix} ${message}`);
     }
   }
 }

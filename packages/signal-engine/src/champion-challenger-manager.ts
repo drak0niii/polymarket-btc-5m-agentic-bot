@@ -20,6 +20,12 @@ export interface ChampionChallengerSyncResult {
   events: LearningEvent[];
 }
 
+export interface LivePromotionCandidateFilterDecision {
+  variantId: string;
+  eligible: boolean;
+  reasonCodes: string[];
+}
+
 export class ChampionChallengerManager {
   sync(input: {
     registry: StrategyDeploymentRegistryState;
@@ -113,6 +119,43 @@ export class ChampionChallengerManager {
       retiredVariantIds,
       events,
     };
+  }
+
+  filterPromotionCandidates(input: {
+    registry: StrategyDeploymentRegistryState;
+    liveGateDecisions: Record<
+      string,
+      {
+        passed: boolean;
+        reasonCodes: string[];
+      }
+    >;
+  }): LivePromotionCandidateFilterDecision[] {
+    return Object.values(input.registry.variants)
+      .filter((variant) => variant.variantId !== input.registry.incumbentVariantId)
+      .filter((variant) => variant.status !== 'retired')
+      .map((variant) => {
+        const liveGate = input.liveGateDecisions[variant.variantId] ?? null;
+        if (liveGate == null) {
+          return {
+            variantId: variant.variantId,
+            eligible: false,
+            reasonCodes: ['live_promotion_gate_missing'],
+          };
+        }
+        if (!liveGate.passed) {
+          return {
+            variantId: variant.variantId,
+            eligible: false,
+            reasonCodes: [...liveGate.reasonCodes],
+          };
+        }
+        return {
+          variantId: variant.variantId,
+          eligible: true,
+          reasonCodes: ['live_promotion_gate_passed'],
+        };
+      });
   }
 }
 

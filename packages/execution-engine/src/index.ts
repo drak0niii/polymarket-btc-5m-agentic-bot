@@ -20,6 +20,7 @@ export {
   type PartialFillTolerance,
 } from './execution-semantics-policy';
 export * from './fee-accounting-service';
+export * from './fill-realism-store';
 export * from './fill-probability-estimator';
 export * from './fill-state-service';
 export * from './maker-quality-policy';
@@ -34,7 +35,9 @@ export {
   type ResolvedOrderIntent,
   type VenueOrderConstraints,
 } from './order-planner';
+export * from './post-fill-toxicity-store';
 export * from './realized-cost-model';
+export * from './realized-vs-expected-edge-store';
 export * from './size-vs-liquidity-policy';
 export * from './slippage-estimator';
 export {

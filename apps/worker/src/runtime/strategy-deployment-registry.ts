@@ -240,6 +240,22 @@ function normalizeVariants(raw: unknown): Record<string, StrategyVariantRecord> 
         Number.isFinite(record.capitalAllocationPct)
           ? record.capitalAllocationPct
           : fallback.capitalAllocationPct,
+      liveTrustScore:
+        typeof record.liveTrustScore === 'number' && Number.isFinite(record.liveTrustScore)
+          ? record.liveTrustScore
+          : fallback.liveTrustScore,
+      evidenceWindowStart:
+        readString(record.evidenceWindowStart) ?? fallback.evidenceWindowStart,
+      evidenceWindowEnd:
+        readString(record.evidenceWindowEnd) ?? fallback.evidenceWindowEnd,
+      promotionReasonCodes: Array.isArray(record.promotionReasonCodes)
+        ? record.promotionReasonCodes.filter((item): item is string => typeof item === 'string')
+        : fallback.promotionReasonCodes,
+      demotionReasonCodes: Array.isArray(record.demotionReasonCodes)
+        ? record.demotionReasonCodes.filter((item): item is string => typeof item === 'string')
+        : fallback.demotionReasonCodes,
+      quarantineUntil:
+        readString(record.quarantineUntil) ?? fallback.quarantineUntil,
       lastShadowEvaluatedAt: readString(record.lastShadowEvaluatedAt),
       createdAt: readString(record.createdAt) ?? fallback.createdAt,
       updatedAt: readString(record.updatedAt) ?? fallback.updatedAt,

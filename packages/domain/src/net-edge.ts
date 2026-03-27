@@ -24,9 +24,17 @@ export interface CostEstimateBreakdown {
   feeCost: number;
   slippageCost: number;
   adverseSelectionCost: number;
+  queuePenaltyCost: number;
   venuePenalty: number;
   spreadComponent: number;
   liquidityComponent: number;
+  partialFillComponent: number;
+  cancelReplaceComponent: number;
+  queueDelayComponent: number;
+  feeBps: number;
+  slippageBps: number;
+  adverseSelectionPenaltyBps: number;
+  queuePenaltyBps: number;
   totalCost: number;
 }
 
@@ -44,9 +52,17 @@ export interface NetEdgeBreakdown {
   executionStyle: 'maker' | 'taker' | 'hybrid';
   costEstimate: CostEstimateBreakdown;
   uncertaintyPenalty: UncertaintyPenalty;
+  grossEdgeBps: number;
+  feeBps: number;
+  slippageBps: number;
+  adverseSelectionPenaltyBps: number;
+  queuePenaltyBps: number;
+  uncertaintyPenaltyBps: number;
+  netEdgeBps: number;
   afterFeesEdge: number;
   afterSlippageEdge: number;
   afterAdverseSelectionEdge: number;
+  afterQueueEdge: number;
   afterUncertaintyEdge: number;
   finalNetEdge: number;
   missingInputs: string[];

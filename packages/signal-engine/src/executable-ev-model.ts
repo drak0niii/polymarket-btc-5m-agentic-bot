@@ -8,6 +8,15 @@ export interface ExecutableEvInput {
   features: SignalFeatures;
   regime: RegimeClassification;
   feeRate: number;
+  executionAssumptions?: {
+    fillProbability?: number | null;
+    expectedSlippage?: number | null;
+    expectedFillDelayMs?: number | null;
+    partialFillRate?: number | null;
+    cancelSuccessRate?: number | null;
+    adverseSelectionCost?: number | null;
+    confidenceMultiplier?: number | null;
+  } | null;
 }
 
 export interface ExecutableEvOutput {
@@ -27,6 +36,7 @@ export interface ExecutableEvOutput {
 export class ExecutableEvModel {
   calculate(input: ExecutableEvInput): ExecutableEvOutput {
     const signalStrength = Math.abs(input.directionalEdge);
+    const executionAssumptions = input.executionAssumptions ?? null;
     const baseFillProbability = clamp(
       0.38 +
         Math.min(0.25, input.features.topLevelDepth / 80) +
@@ -37,28 +47,50 @@ export class ExecutableEvModel {
     );
 
     const fillProbability = clamp(
-      baseFillProbability * input.regime.fillProbabilityMultiplier,
+      Math.max(
+        baseFillProbability * input.regime.fillProbabilityMultiplier,
+        executionAssumptions?.fillProbability ?? 0,
+      ),
       0.03,
       0.98,
     );
 
     const expectedFee = Math.max(0, input.feeRate);
-    const expectedSlippage =
+    const expectedSlippage = Math.max(
       Math.max(0, input.features.spread) *
-      (0.22 + input.regime.slippageMultiplier * 0.33);
+        (0.22 + input.regime.slippageMultiplier * 0.33),
+      executionAssumptions?.expectedSlippage ?? 0,
+    );
     const expectedPartialFillLoss =
-      signalStrength * (1 - fillProbability) * 0.15 * input.regime.partialFillPenaltyMultiplier;
+      signalStrength *
+      Math.max(
+        (1 - fillProbability) * 0.15 * input.regime.partialFillPenaltyMultiplier,
+        (executionAssumptions?.partialFillRate ?? 0) * 0.18,
+      );
     const expectedMissedFillCost =
       signalStrength * (1 - fillProbability) * 0.18 * input.regime.missedFillPenaltyMultiplier;
     const expectedCancellationCost =
-      signalStrength *
-      Math.max(0, input.features.orderbookNoiseScore) *
-      0.08 *
-      input.regime.cancellationPenaltyMultiplier;
-    const expectedAdverseSelectionCost =
+      Math.max(
+        signalStrength *
+          Math.max(0, input.features.orderbookNoiseScore) *
+          0.08 *
+          input.regime.cancellationPenaltyMultiplier,
+        Math.max(0, 1 - (executionAssumptions?.cancelSuccessRate ?? 1)) * 0.0025,
+      );
+    const expectedAdverseSelectionCost = Math.max(
       Math.max(input.features.realizedVolatility, input.features.realizedRangePct) *
-      0.22 *
-      input.regime.adverseSelectionMultiplier;
+        0.22 *
+        input.regime.adverseSelectionMultiplier,
+      executionAssumptions?.adverseSelectionCost ?? 0,
+    );
+    const fillDelayPenalty =
+      (executionAssumptions?.expectedFillDelayMs ?? 0) > 0
+        ? clamp(
+            ((executionAssumptions?.expectedFillDelayMs ?? 0) - 10_000) / 100_000,
+            0,
+            0.12,
+          )
+        : 0;
 
     const expectedEv =
       input.directionalEdge * fillProbability -
@@ -67,13 +99,16 @@ export class ExecutableEvModel {
       expectedPartialFillLoss -
       expectedMissedFillCost -
       expectedCancellationCost -
-      expectedAdverseSelectionCost;
+      expectedAdverseSelectionCost -
+      fillDelayPenalty;
 
     const confidence = clamp01(
       input.regime.confidence *
         fillProbability *
         (1 - Math.min(0.8, input.features.orderbookNoiseScore)) *
-        (0.7 + Math.min(0.3, signalStrength * 4)),
+        (0.7 + Math.min(0.3, signalStrength * 4)) *
+        (executionAssumptions?.confidenceMultiplier ?? 1) *
+        (1 - fillDelayPenalty),
     );
 
     return {
@@ -97,6 +132,11 @@ export class ExecutableEvModel {
         expectedMissedFillCost,
         expectedCancellationCost,
         expectedAdverseSelectionCost,
+        fillDelayPenalty,
+        executionAssumptionsFillProbability:
+          executionAssumptions?.fillProbability ?? 0,
+        executionAssumptionsExpectedSlippage:
+          executionAssumptions?.expectedSlippage ?? 0,
       },
       capturedAt: new Date().toISOString(),
     };

@@ -10,6 +10,9 @@ export type RegimeLabel =
 export interface RegimeClassification {
   label: RegimeLabel;
   confidence: number;
+  regimeLabel: RegimeLabel;
+  regimeConfidence: number;
+  regimeTransitionRisk: number;
   reasonCodes: string[];
   toxicityBias: number;
   bookInstabilityBias: number;
@@ -40,6 +43,14 @@ export class RegimeClassifier {
         clamp01(features.spread / 0.05) * 0.15 +
         clamp01((18 - Math.max(0, features.topLevelDepth)) / 18) * 0.1,
     );
+    const regimeTransitionRisk = clamp01(
+      features.marketStateTransitionStrength * 0.28 +
+        features.signalDecayPressure * 0.2 +
+        toxicityBias * 0.22 +
+        bookInstabilityBias * 0.2 +
+        (features.marketStateTransition === 'mean_reversion' ? 0.08 : 0) +
+        (features.timeToExpirySeconds != null && features.timeToExpirySeconds <= 120 ? 0.12 : 0),
+    );
 
     if (
       (features.timeToExpirySeconds !== null &&
@@ -50,6 +61,9 @@ export class RegimeClassifier {
       return {
         label: 'near_resolution_microstructure_chaos',
         confidence: 0.95,
+        regimeLabel: 'near_resolution_microstructure_chaos',
+        regimeConfidence: 0.95,
+        regimeTransitionRisk: clamp01(Math.max(0.92, regimeTransitionRisk)),
         reasonCodes: [
           'phase2_expiry_pressure',
           'phase2_signal_decay_pressure',
@@ -81,6 +95,9 @@ export class RegimeClassifier {
       return {
         label: 'illiquid_noisy_book',
         confidence: 0.88,
+        regimeLabel: 'illiquid_noisy_book',
+        regimeConfidence: 0.88,
+        regimeTransitionRisk: clamp01(Math.max(0.74, regimeTransitionRisk)),
         reasonCodes: [
           'phase2_book_update_stress',
           'phase2_stressed_microstructure',
@@ -109,9 +126,13 @@ export class RegimeClassifier {
         Math.sign(features.lastReturnPct || 0) !==
           Math.sign(features.rollingReturnPct || 0))
     ) {
+      const confidence = clamp01(0.7 + features.marketArchetypeConfidence * 0.15);
       return {
         label: 'spike_and_revert',
-        confidence: clamp01(0.7 + features.marketArchetypeConfidence * 0.15),
+        confidence,
+        regimeLabel: 'spike_and_revert',
+        regimeConfidence: confidence,
+        regimeTransitionRisk: clamp01(Math.max(0.58, regimeTransitionRisk)),
         reasonCodes: [
           'phase2_mean_reversion_context',
           ...(toxicityBias >= 0.5 ? ['phase3_flow_toxicity_watch'] : []),
@@ -142,13 +163,17 @@ export class RegimeClassifier {
       features.signalDecayPressure < 0.65 &&
       features.btcMoveTransmission > -0.15
     ) {
+      const confidence = clamp01(
+        0.72 +
+          features.marketStateTransitionStrength * 0.1 +
+          features.marketArchetypeConfidence * 0.08,
+      );
       return {
         label: 'momentum_continuation',
-        confidence: clamp01(
-          0.72 +
-            features.marketStateTransitionStrength * 0.1 +
-            features.marketArchetypeConfidence * 0.08,
-        ),
+        confidence,
+        regimeLabel: 'momentum_continuation',
+        regimeConfidence: confidence,
+        regimeTransitionRisk: clamp01(regimeTransitionRisk * 0.75),
         reasonCodes: [
           'phase2_trend_follow_through',
           'phase2_btc_linkage_supportive',
@@ -170,13 +195,17 @@ export class RegimeClassifier {
       };
     }
 
+    const confidence = clamp01(
+      0.65 +
+        (features.marketArchetype === 'balanced_rotation' ? 0.08 : 0) -
+        features.signalDecayPressure * 0.12,
+    );
     return {
       label: 'low_volatility_drift',
-      confidence: clamp01(
-        0.65 +
-          (features.marketArchetype === 'balanced_rotation' ? 0.08 : 0) -
-          features.signalDecayPressure * 0.12,
-      ),
+      confidence,
+      regimeLabel: 'low_volatility_drift',
+      regimeConfidence: confidence,
+      regimeTransitionRisk: clamp01(regimeTransitionRisk * 0.7),
       reasonCodes: [
         'phase2_balanced_rotation_or_drift',
         ...(bookInstabilityBias >= 0.55 ? ['phase3_book_instability_watch'] : []),

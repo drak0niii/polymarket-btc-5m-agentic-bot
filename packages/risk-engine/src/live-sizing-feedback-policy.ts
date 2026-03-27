@@ -17,11 +17,16 @@ export interface LiveSizingFeedbackInput {
   toxicityState: LiveFeedbackToxicityState;
   venueUncertainty: NetEdgeVenueUncertaintyLabel | null;
   realizedVsExpected: number | null;
+  trustScore?: number | null;
+  evidenceQualityMultiplier?: number | null;
 }
 
 export interface LiveSizingFeedbackDecision {
   sizeMultiplier: number;
   downshiftMultiplier: number;
+  executionQualityAdjustment: number;
+  evidenceQualityAdjustment: number;
+  finalCombinedSizingFeedback: number;
   upshiftEligibility: LiveFeedbackUpshiftEligibility;
   recoveryProbationState: LiveFeedbackRecoveryProbationState;
   sizingReasonCodes: string[];
@@ -236,8 +241,24 @@ export class LiveSizingFeedbackPolicy {
       sizingReasonCodes.push('slow_recovery_cap_applied');
     }
 
-    const sizeMultiplier = clamp(
+    const executionQualityAdjustment = clamp(
       Math.min(downshiftMultiplier, recoveryCap),
+      0,
+      1,
+    );
+    const evidenceQualityAdjustment = clamp(
+      input.evidenceQualityMultiplier ?? 1,
+      0,
+      1,
+    );
+    if (evidenceQualityAdjustment < 1) {
+      sizingReasonCodes.push('evidence_quality_cap_applied');
+    }
+    if ((input.trustScore ?? 1) < 0.45) {
+      sizingReasonCodes.push('trust_score_not_ready_for_full_size');
+    }
+    const sizeMultiplier = clamp(
+      Math.min(executionQualityAdjustment, evidenceQualityAdjustment),
       0,
       1,
     );
@@ -246,6 +267,9 @@ export class LiveSizingFeedbackPolicy {
     return {
       sizeMultiplier,
       downshiftMultiplier,
+      executionQualityAdjustment,
+      evidenceQualityAdjustment,
+      finalCombinedSizingFeedback: sizeMultiplier,
       upshiftEligibility,
       recoveryProbationState,
       sizingReasonCodes: reasonCodes,
@@ -263,6 +287,10 @@ export class LiveSizingFeedbackPolicy {
         realizedVsExpected: input.realizedVsExpected,
         downshiftMultiplier,
         recoveryCap,
+        trustScore: input.trustScore ?? null,
+        evidenceQualityMultiplier: input.evidenceQualityMultiplier ?? null,
+        executionQualityAdjustment,
+        evidenceQualityAdjustment,
         upshiftEligibility,
         recoveryProbationState,
       },

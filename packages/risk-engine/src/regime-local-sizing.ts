@@ -17,12 +17,14 @@ export interface RegimeLocalSizingInput {
   regimeSnapshotRealizedVsExpected: number | null;
   retentionByRegime: RegimeLocalSizingContextEntry[];
   retentionByArchetype: RegimeLocalSizingContextEntry[];
+  evidenceCapMultiplier?: number | null;
 }
 
 export interface RegimeLocalSizingDecision {
   regimeSizeMultiplier: number;
   archetypeSizeMultiplier: number;
   combinedSizeMultiplier: number;
+  evidenceCapMultiplier: number;
   regimeSizingReasonCodes: string[];
   evidence: Record<string, unknown>;
   capturedAt: string;
@@ -124,16 +126,22 @@ export class RegimeLocalSizing {
 
     regimeSizeMultiplier = clamp(regimeSizeMultiplier, 0.35, 1);
     archetypeSizeMultiplier = clamp(archetypeSizeMultiplier, 0.4, 1);
-    const combinedSizeMultiplier = clamp(
+    const rawCombinedSizeMultiplier = clamp(
       regimeSizeMultiplier * archetypeSizeMultiplier,
       0.2,
       1,
     );
+    const evidenceCapMultiplier = clamp(input.evidenceCapMultiplier ?? 1, 0, 1);
+    const combinedSizeMultiplier = Math.min(rawCombinedSizeMultiplier, evidenceCapMultiplier);
+    if (combinedSizeMultiplier < rawCombinedSizeMultiplier) {
+      reasonCodes.push('regime_local_sizing_capped_by_evidence');
+    }
 
     return {
       regimeSizeMultiplier,
       archetypeSizeMultiplier,
       combinedSizeMultiplier,
+      evidenceCapMultiplier,
       regimeSizingReasonCodes: Array.from(new Set(reasonCodes)),
       evidence: {
         regime: input.regime,
@@ -143,6 +151,8 @@ export class RegimeLocalSizing {
         regimeSnapshotRealizedVsExpected: input.regimeSnapshotRealizedVsExpected,
         regimeEntry,
         archetypeEntry,
+        evidenceCapMultiplier,
+        rawCombinedSizeMultiplier,
       },
       capturedAt: new Date().toISOString(),
     };
@@ -166,6 +176,7 @@ export function buildRegimeLocalSizingSummary(input: {
           entry.retentionRatio != null ? entry.retentionRatio : null,
         retentionByRegime: [entry],
         retentionByArchetype: [],
+        evidenceCapMultiplier: 1,
       });
       return {
         contextType: 'regime' as const,
@@ -189,6 +200,7 @@ export function buildRegimeLocalSizingSummary(input: {
         regimeSnapshotRealizedVsExpected: null,
         retentionByRegime: [],
         retentionByArchetype: [entry],
+        evidenceCapMultiplier: 1,
       });
       return {
         contextType: 'archetype' as const,

@@ -37,6 +37,7 @@ export class StrategyRolloutController {
     registry: StrategyDeploymentRegistryState,
     input: { marketId: string; observedAt: string },
   ): StrategySignalAssignment {
+    const now = new Date();
     const incumbent = registry.incumbentVariantId
       ? registry.variants[registry.incumbentVariantId] ?? null
       : null;
@@ -54,11 +55,11 @@ export class StrategyRolloutController {
       };
     }
 
-    if (incumbent.status === 'quarantined') {
+    if (variantIsBlocked(incumbent, now)) {
       return {
         variantId: null,
         strategyVersionId: null,
-        stage: activeRollout?.stage ?? 'shadow_only',
+        stage: activeRollout?.stage ?? incumbent.rolloutStage,
         allocationPct: 0,
         bucketKey,
         reasonCodes: ['incumbent_variant_quarantined'],
@@ -69,35 +70,39 @@ export class StrategyRolloutController {
       return {
         variantId: incumbent.variantId,
         strategyVersionId: incumbent.strategyVersionId,
-        stage: 'full',
-        allocationPct: 1,
+        stage: normalizeStage(incumbent.rolloutStage),
+        allocationPct: effectiveAllocationPct(incumbent),
         bucketKey,
-        reasonCodes: ['incumbent_only'],
+        reasonCodes:
+          incumbent.status === 'probation' || isProbationActive(incumbent, now)
+            ? ['incumbent_on_probation']
+            : ['incumbent_only'],
       };
     }
 
     const challenger = registry.variants[activeRollout.challengerVariantId] ?? null;
     if (
       !challenger ||
-      challenger.status === 'quarantined' ||
-      activeRollout.stage === 'shadow_only' ||
+      variantIsBlocked(challenger, now) ||
+      normalizeStage(activeRollout.stage) === 'shadow_only' ||
+      normalizeStage(activeRollout.stage) === 'paper' ||
       activeRollout.challengerAllocationPct <= 0
     ) {
       return {
         variantId: incumbent.variantId,
         strategyVersionId: incumbent.strategyVersionId,
-        stage: activeRollout.stage,
-        allocationPct: 0,
+        stage: normalizeStage(activeRollout.stage),
+        allocationPct: effectiveAllocationPct(incumbent),
         bucketKey,
         reasonCodes: ['challenger_not_live'],
       };
     }
 
-    if (activeRollout.stage === 'full') {
+    if (normalizeStage(activeRollout.stage) === 'scaled_live') {
       return {
         variantId: challenger.variantId,
         strategyVersionId: challenger.strategyVersionId,
-        stage: activeRollout.stage,
+        stage: normalizeStage(activeRollout.stage),
         allocationPct: 1,
         bucketKey,
         reasonCodes: ['full_challenger_rollout'],
@@ -109,7 +114,7 @@ export class StrategyRolloutController {
       return {
         variantId: challenger.variantId,
         strategyVersionId: challenger.strategyVersionId,
-        stage: activeRollout.stage,
+        stage: normalizeStage(activeRollout.stage),
         allocationPct: activeRollout.challengerAllocationPct,
         bucketKey,
         reasonCodes: ['bounded_challenger_assignment'],
@@ -119,8 +124,8 @@ export class StrategyRolloutController {
     return {
       variantId: incumbent.variantId,
       strategyVersionId: incumbent.strategyVersionId,
-      stage: activeRollout.stage,
-      allocationPct: 1 - activeRollout.challengerAllocationPct,
+      stage: normalizeStage(activeRollout.stage),
+      allocationPct: Math.max(0, 1 - activeRollout.challengerAllocationPct),
       bucketKey,
       reasonCodes: ['incumbent_retained_for_bucket'],
     };
@@ -130,6 +135,7 @@ export class StrategyRolloutController {
     registry: StrategyDeploymentRegistryState,
     input: { strategyVersionId: string | null },
   ): StrategyExecutionRolloutControls {
+    const now = new Date();
     const variant =
       input.strategyVersionId == null
         ? null
@@ -139,20 +145,20 @@ export class StrategyRolloutController {
     if (!variant) {
       return {
         variantId: null,
-        stage: 'full',
+        stage: 'scaled_live',
         sizeMultiplier: 1,
         blocked: false,
         reasonCodes: ['strategy_variant_untracked'],
       };
     }
 
-    if (variant.status === 'quarantined' || variant.status === 'retired') {
+    if (variantIsBlocked(variant, now)) {
       return {
         variantId: variant.variantId,
-        stage: variant.rolloutStage,
+        stage: normalizeStage(variant.rolloutStage),
         sizeMultiplier: 0,
         blocked: true,
-        reasonCodes: [`strategy_variant_${variant.status}`],
+        reasonCodes: ['strategy_variant_quarantined'],
       };
     }
 
@@ -160,11 +166,12 @@ export class StrategyRolloutController {
     if (
       activeRollout &&
       activeRollout.challengerVariantId === variant.variantId &&
-      activeRollout.stage === 'shadow_only'
+      (normalizeStage(activeRollout.stage) === 'shadow_only' ||
+        normalizeStage(activeRollout.stage) === 'paper')
     ) {
       return {
         variantId: variant.variantId,
-        stage: activeRollout.stage,
+        stage: normalizeStage(activeRollout.stage),
         sizeMultiplier: 0,
         blocked: true,
         reasonCodes: ['shadow_only_variant_not_live'],
@@ -174,19 +181,26 @@ export class StrategyRolloutController {
     if (activeRollout && activeRollout.challengerVariantId === variant.variantId) {
       return {
         variantId: variant.variantId,
-        stage: activeRollout.stage,
+        stage: normalizeStage(activeRollout.stage),
         sizeMultiplier: activeRollout.challengerAllocationPct,
         blocked: false,
-        reasonCodes: ['challenger_rollout_size_bound'],
+        reasonCodes:
+          variant.status === 'probation' || isProbationActive(variant, now)
+            ? ['challenger_rollout_size_bound', 'variant_probation_active']
+            : ['challenger_rollout_size_bound'],
       };
     }
 
+    const stage = normalizeStage(variant.rolloutStage);
     return {
       variantId: variant.variantId,
-      stage: variant.rolloutStage,
-      sizeMultiplier: 1,
-      blocked: false,
-      reasonCodes: ['incumbent_or_shadow_variant'],
+      stage,
+      sizeMultiplier: effectiveAllocationPct(variant),
+      blocked: stage === 'shadow_only' || stage === 'paper',
+      reasonCodes:
+        variant.status === 'probation' || isProbationActive(variant, now)
+          ? ['incumbent_or_shadow_variant', 'variant_probation_active']
+          : ['incumbent_or_shadow_variant'],
     };
   }
 
@@ -215,6 +229,7 @@ export class StrategyRolloutController {
         evaluationMode: 'shadow_only',
         rolloutStage: 'shadow_only',
         capitalAllocationPct: 0,
+        promotionReasonCodes: [...input.decision.reasons],
         updatedAt: now.toISOString(),
       });
       if (nextRegistry.activeRollout?.challengerVariantId === candidate.variantId) {
@@ -224,19 +239,23 @@ export class StrategyRolloutController {
     }
 
     if (input.decision.verdict === 'canary') {
+      const targetStage = nextAllowedStage(candidate.rolloutStage, input.decision.targetRolloutStage);
       const incumbentVariantId = nextRegistry.incumbentVariantId;
       nextRegistry.activeRollout = buildRolloutRecord({
         incumbentVariantId,
         challengerVariantId: candidate.variantId,
-        stage: input.decision.targetRolloutStage,
+        stage: targetStage,
         appliedReason: input.decision.reasons.join(','),
         appliedAt: now.toISOString(),
       });
       nextRegistry.variants[candidate.variantId] = updateVariant(candidate, {
         status: 'canary',
-        evaluationMode: evaluationModeForStage(input.decision.targetRolloutStage),
-        rolloutStage: input.decision.targetRolloutStage,
-        capitalAllocationPct: stageAllocationPct(input.decision.targetRolloutStage),
+        evaluationMode: evaluationModeForStage(targetStage),
+        rolloutStage: targetStage,
+        capitalAllocationPct: stageAllocationPct(targetStage),
+        promotionReasonCodes: [...input.decision.reasons],
+        demotionReasonCodes: [],
+        quarantineUntil: null,
         updatedAt: now.toISOString(),
       });
       return {
@@ -246,6 +265,7 @@ export class StrategyRolloutController {
     }
 
     if (input.decision.verdict === 'promote') {
+      const targetStage = nextAllowedStage(candidate.rolloutStage, input.decision.targetRolloutStage);
       const previousIncumbentId = nextRegistry.incumbentVariantId;
       if (previousIncumbentId && nextRegistry.variants[previousIncumbentId]) {
         nextRegistry.variants[previousIncumbentId] = updateVariant(
@@ -262,15 +282,18 @@ export class StrategyRolloutController {
       nextRegistry.incumbentVariantId = candidate.variantId;
       nextRegistry.variants[candidate.variantId] = updateVariant(candidate, {
         status: 'incumbent',
-        evaluationMode: 'full',
-        rolloutStage: 'full',
-        capitalAllocationPct: 1,
+        evaluationMode: evaluationModeForStage(targetStage),
+        rolloutStage: targetStage,
+        capitalAllocationPct: stageAllocationPct(targetStage),
+        promotionReasonCodes: [...input.decision.reasons],
+        demotionReasonCodes: [],
+        quarantineUntil: null,
         updatedAt: now.toISOString(),
       });
       nextRegistry.activeRollout = buildRolloutRecord({
         incumbentVariantId: previousIncumbentId,
         challengerVariantId: candidate.variantId,
-        stage: 'full',
+        stage: targetStage,
         appliedReason: input.decision.reasons.join(','),
         appliedAt: now.toISOString(),
       });
@@ -280,7 +303,110 @@ export class StrategyRolloutController {
       };
     }
 
+    if (input.decision.verdict === 'rollback') {
+      return this.applyLiveDemotionDecision({
+        registry: nextRegistry,
+        variantId: candidate.variantId,
+        decision: {
+          action: 'demote',
+          reasonCodes: [...input.decision.reasons],
+          quarantineUntil: null,
+        },
+        cycleId: input.cycleId,
+        now,
+      });
+    }
+
     return { registry: nextRegistry, event: null };
+  }
+
+  applyLiveDemotionDecision(input: {
+    registry: StrategyDeploymentRegistryState;
+    variantId: string;
+    decision: {
+      action: 'none' | 'probation' | 'demote' | 'quarantine';
+      reasonCodes: string[];
+      quarantineUntil: string | null;
+    };
+    cycleId: string;
+    now?: Date;
+  }): StrategyRolloutMutationResult {
+    const now = input.now ?? new Date();
+    if (input.decision.action === 'none') {
+      return { registry: input.registry, event: null };
+    }
+
+    const nextRegistry = cloneRegistry(input.registry, now);
+    const variant = nextRegistry.variants[input.variantId] ?? null;
+    if (!variant) {
+      return { registry: nextRegistry, event: null };
+    }
+
+    if (input.decision.action === 'quarantine') {
+      nextRegistry.variants[input.variantId] = updateVariant(variant, {
+        status: 'quarantined',
+        evaluationMode: 'shadow_only',
+        rolloutStage: 'shadow_only',
+        capitalAllocationPct: 0,
+        demotionReasonCodes: [...input.decision.reasonCodes],
+        quarantineUntil: input.decision.quarantineUntil,
+        updatedAt: now.toISOString(),
+      });
+      if (nextRegistry.activeRollout?.challengerVariantId === input.variantId) {
+        nextRegistry.activeRollout = null;
+      }
+      return {
+        registry: nextRegistry,
+        event: buildRolloutEvent(
+          input.cycleId,
+          buildRolloutRecord({
+            incumbentVariantId: nextRegistry.incumbentVariantId,
+            challengerVariantId: input.variantId,
+            stage: 'shadow_only',
+            appliedReason: input.decision.reasonCodes.join(','),
+            appliedAt: now.toISOString(),
+          }),
+          now,
+        ),
+      };
+    }
+
+    const nextStage =
+      input.decision.action === 'demote'
+        ? previousAllowedStage(variant.rolloutStage)
+        : clampProbationStage(variant.rolloutStage);
+    nextRegistry.variants[input.variantId] = updateVariant(variant, {
+      status: 'probation',
+      evaluationMode: evaluationModeForStage(nextStage),
+      rolloutStage: nextStage,
+      capitalAllocationPct: stageAllocationPct(nextStage),
+      demotionReasonCodes: [...input.decision.reasonCodes],
+      quarantineUntil: input.decision.quarantineUntil,
+      updatedAt: now.toISOString(),
+    });
+    if (nextRegistry.activeRollout?.challengerVariantId === input.variantId) {
+      nextRegistry.activeRollout = buildRolloutRecord({
+        incumbentVariantId: nextRegistry.activeRollout.incumbentVariantId,
+        challengerVariantId: input.variantId,
+        stage: nextStage,
+        appliedReason: input.decision.reasonCodes.join(','),
+        appliedAt: now.toISOString(),
+      });
+    }
+    return {
+      registry: nextRegistry,
+      event: buildRolloutEvent(
+        input.cycleId,
+        buildRolloutRecord({
+          incumbentVariantId: nextRegistry.incumbentVariantId,
+          challengerVariantId: input.variantId,
+          stage: nextStage,
+          appliedReason: input.decision.reasonCodes.join(','),
+          appliedAt: now.toISOString(),
+        }),
+        now,
+      ),
+    };
   }
 
   applyRollback(input: {
@@ -311,7 +437,7 @@ export class StrategyRolloutController {
       nextRegistry.variants[targetVariant.variantId] = updateVariant(targetVariant, {
         status: 'incumbent',
         evaluationMode: 'full',
-        rolloutStage: 'full',
+        rolloutStage: 'scaled_live',
         capitalAllocationPct: 1,
         updatedAt: now.toISOString(),
       });
@@ -337,32 +463,34 @@ export class StrategyRolloutController {
 }
 
 export function stageAllocationPct(stage: StrategyRolloutStage): number {
-  switch (stage) {
+  switch (normalizeStage(stage)) {
     case 'shadow_only':
       return 0;
-    case 'canary_1pct':
-      return 0.01;
-    case 'canary_5pct':
+    case 'paper':
+      return 0;
+    case 'canary':
       return 0.05;
-    case 'partial':
+    case 'cautious_live':
       return 0.25;
-    case 'full':
+    case 'scaled_live':
       return 1;
   }
+  return 0;
 }
 
 function evaluationModeForStage(stage: StrategyRolloutStage): StrategyVariantEvaluationMode {
-  switch (stage) {
+  switch (normalizeStage(stage)) {
     case 'shadow_only':
+    case 'paper':
       return 'shadow_only';
-    case 'canary_1pct':
-    case 'canary_5pct':
+    case 'canary':
       return 'canary';
-    case 'partial':
+    case 'cautious_live':
       return 'partial';
-    case 'full':
+    case 'scaled_live':
       return 'full';
   }
+  return 'shadow_only';
 }
 
 function buildRolloutRecord(input: {
@@ -372,13 +500,14 @@ function buildRolloutRecord(input: {
   appliedReason: string;
   appliedAt: string;
 }): StrategyRolloutRecord {
+  const normalizedStage = normalizeStage(input.stage);
   return {
     incumbentVariantId: input.incumbentVariantId,
     challengerVariantId: input.challengerVariantId,
-    stage: input.stage,
-    challengerAllocationPct: stageAllocationPct(input.stage),
+    stage: normalizedStage,
+    challengerAllocationPct: stageAllocationPct(normalizedStage),
     rolloutSalt: createHash('sha256')
-      .update(`${input.challengerVariantId}:${input.appliedAt}:${input.stage}`)
+      .update(`${input.challengerVariantId}:${input.appliedAt}:${normalizedStage}`)
       .digest('hex')
       .slice(0, 16),
     appliedReason: input.appliedReason,
@@ -397,7 +526,7 @@ function buildRolloutEvent(
   return {
     id: `${cycleId}:rollout:${rollout.challengerVariantId}:${rollout.stage}`,
     type: 'strategy_rollout_changed',
-    severity: rollout.stage === 'full' ? 'warning' : 'info',
+    severity: normalizeStage(rollout.stage) === 'scaled_live' ? 'warning' : 'info',
     createdAt: now.toISOString(),
     cycleId,
     strategyVariantId: rollout.challengerVariantId,
@@ -434,4 +563,96 @@ function cloneRegistry(
     retiredVariantIds: [...registry.retiredVariantIds],
     updatedAt: now.toISOString(),
   };
+}
+
+function variantIsBlocked(variant: StrategyVariantRecord, now: Date): boolean {
+  return variant.status === 'quarantined' || variant.status === 'retired' || isQuarantineActive(variant, now);
+}
+
+function effectiveAllocationPct(variant: StrategyVariantRecord): number {
+  const stageAllocation = stageAllocationPct(variant.rolloutStage);
+  const explicitAllocation =
+    typeof variant.capitalAllocationPct === 'number' && Number.isFinite(variant.capitalAllocationPct)
+      ? variant.capitalAllocationPct
+      : stageAllocation;
+  return Math.min(1, Math.max(0, explicitAllocation));
+}
+
+function isQuarantineActive(variant: StrategyVariantRecord, now: Date): boolean {
+  if (variant.quarantineUntil == null || variant.status !== 'quarantined') {
+    return false;
+  }
+  const timestamp = new Date(variant.quarantineUntil).getTime();
+  return Number.isFinite(timestamp) && timestamp > now.getTime();
+}
+
+function isProbationActive(variant: StrategyVariantRecord, now: Date): boolean {
+  if (variant.status !== 'probation' || variant.quarantineUntil == null) {
+    return false;
+  }
+  const timestamp = new Date(variant.quarantineUntil).getTime();
+  return Number.isFinite(timestamp) && timestamp > now.getTime();
+}
+
+function normalizeStage(stage: StrategyRolloutStage): StrategyRolloutStage {
+  switch (stage) {
+    case 'canary_1pct':
+      return 'paper';
+    case 'canary_5pct':
+      return 'canary';
+    case 'partial':
+      return 'cautious_live';
+    case 'full':
+      return 'scaled_live';
+    default:
+      return stage;
+  }
+}
+
+function nextAllowedStage(
+  current: StrategyRolloutStage,
+  requested: StrategyRolloutStage,
+): StrategyRolloutStage {
+  const ladder: StrategyRolloutStage[] = [
+    'shadow_only',
+    'paper',
+    'canary',
+    'cautious_live',
+    'scaled_live',
+  ];
+  const normalizedCurrent = normalizeStage(current);
+  const normalizedRequested = normalizeStage(requested);
+  const currentIndex = ladder.indexOf(normalizedCurrent);
+  const requestedIndex = ladder.indexOf(normalizedRequested);
+  if (requestedIndex <= currentIndex + 1) {
+    return normalizedRequested;
+  }
+  return ladder[Math.min(currentIndex + 1, ladder.length - 1)] ?? normalizedRequested;
+}
+
+function previousAllowedStage(current: StrategyRolloutStage): StrategyRolloutStage {
+  const ladder: StrategyRolloutStage[] = [
+    'shadow_only',
+    'paper',
+    'canary',
+    'cautious_live',
+    'scaled_live',
+  ];
+  const normalizedCurrent = normalizeStage(current);
+  const currentIndex = ladder.indexOf(normalizedCurrent);
+  if (currentIndex <= 0) {
+    return 'shadow_only';
+  }
+  return ladder[currentIndex - 1] ?? 'shadow_only';
+}
+
+function clampProbationStage(current: StrategyRolloutStage): StrategyRolloutStage {
+  const normalizedCurrent = normalizeStage(current);
+  if (normalizedCurrent === 'scaled_live') {
+    return 'cautious_live';
+  }
+  if (normalizedCurrent === 'cautious_live') {
+    return 'canary';
+  }
+  return normalizedCurrent;
 }

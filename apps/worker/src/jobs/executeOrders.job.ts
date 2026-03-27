@@ -830,6 +830,7 @@ export class ExecuteOrdersJob {
         continue;
       }
 
+      const feeSnapshot = await this.resolveVenueFeeSnapshot(tokenId);
       let orderPlan;
       try {
         orderPlan = this.orderPlanner.plan({
@@ -857,7 +858,15 @@ export class ExecuteOrdersJob {
           liquidity: {
             topLevelDepth,
             executableDepth: topLevelDepth,
+            recentMatchedVolume: snapshot.volume ?? 0,
+            restingSizeAhead: topLevelDepth,
+            bestBid: bestBid > 0 ? bestBid : null,
+            bestAsk: bestAsk > 0 ? bestAsk : null,
+            spread: orderbook.spread ?? null,
           },
+          regime: signal.regime ?? null,
+          venueUncertaintyLabel: venueAssessment.label,
+          feeRateBpsEstimate: feeSnapshot?.feeRateBps ?? 20,
         });
       } catch (error) {
         await this.rejectSignal(
@@ -915,7 +924,6 @@ export class ExecuteOrdersJob {
         continue;
       }
 
-      const feeSnapshot = await this.resolveVenueFeeSnapshot(tokenId);
       const feeModel = this.venueFeeModel.evaluate({
         tokenId,
         route: orderPlan.route,
@@ -925,6 +933,49 @@ export class ExecuteOrdersJob {
         venueFeeFetchedAt: feeSnapshot?.fetchedAt ?? null,
         source: feeSnapshot ? 'venue_live' : 'fallback',
       });
+      const plannerFillProbabilityEstimate = (orderPlan as Record<string, any>).fillProbabilityEstimate;
+      const plannerQueueEstimate = (orderPlan as Record<string, any>).queueEstimate;
+      const plannerSlippageEstimate = (orderPlan as Record<string, any>).slippageEstimate;
+      const executionPlannerAssumptions = {
+        expectedFillProbability: orderPlan.expectedFillProbability,
+        expectedFillFraction: orderPlan.expectedFillFraction,
+        expectedQueueDelayMs: orderPlan.expectedQueueDelayMs,
+        expectedQueueDelayProfile:
+          plannerFillProbabilityEstimate?.expectedQueueDelayProfile ?? {
+            averageMs: orderPlan.expectedQueueDelayMs ?? null,
+            p50Ms: orderPlan.expectedQueueDelayMs ?? null,
+            p90Ms: orderPlan.expectedQueueDelayMs ?? null,
+          },
+        expectedRealizedCostBps: Math.max(
+          orderPlan.expectedRealizedCostBps,
+          feeModel.netFeeBps +
+            (plannerSlippageEstimate?.finalExpectedSlippageBps ?? 0) +
+            orderPlan.expectedAdverseSelectionPenaltyBps,
+        ),
+        expectedAdverseSelectionPenaltyBps: orderPlan.expectedAdverseSelectionPenaltyBps,
+        recommendedOrderStyleRationale: orderPlan.recommendedOrderStyleRationale,
+        executionBucketContext: orderPlan.executionBucketContext,
+        fillProbabilityByHorizon: plannerFillProbabilityEstimate?.fillProbabilityByHorizon ?? null,
+        fillProbabilityConfidence: plannerFillProbabilityEstimate?.confidence ?? null,
+        fillProbabilityEvidenceCount: plannerFillProbabilityEstimate?.evidenceCount ?? 0,
+        queueEstimate: {
+          centralEstimateMs: plannerQueueEstimate?.centralEstimateMs ?? orderPlan.expectedQueueDelayMs,
+          lowerBoundMs: plannerQueueEstimate?.lowerBoundMs ?? orderPlan.expectedQueueDelayMs,
+          upperBoundMs: plannerQueueEstimate?.upperBoundMs ?? orderPlan.expectedQueueDelayMs,
+          confidence: plannerQueueEstimate?.confidence ?? null,
+          evidenceCount: plannerQueueEstimate?.evidenceCount ?? 0,
+        },
+        slippageEstimate: {
+          geometryBasedComponent: plannerSlippageEstimate?.geometryBasedComponent ?? null,
+          empiricalAdjustmentComponent: plannerSlippageEstimate?.empiricalAdjustmentComponent ?? null,
+          finalExpectedSlippageBps: plannerSlippageEstimate?.finalExpectedSlippageBps ?? null,
+          evidenceStrength: plannerSlippageEstimate?.evidenceStrength ?? null,
+          evidenceCount: plannerSlippageEstimate?.evidenceCount ?? 0,
+        },
+        postFillToxicitySummary:
+          (orderPlan as Record<string, any>).postFillToxicitySummary ?? null,
+        feeRateBpsEstimate: feeModel.netFeeBps,
+      };
       const executionAdjustedEdge =
         signal.expectedEv -
         Math.max(0, executionCostAssessment.breakdown.totalCost - executionCostCalibration.feeCost);
@@ -1151,6 +1202,10 @@ export class ExecuteOrdersJob {
           marketId: market.id,
           tokenId,
           attempts: (priorIntent?.attempts ?? 0) + 1,
+          details: {
+            executionPlannerAssumptions,
+            feeModel,
+          },
         });
         const submitStartedAtMs = Date.now();
         try {
@@ -1221,6 +1276,7 @@ export class ExecuteOrdersJob {
               details: {
                 error: lastError,
                 reasonCode: normalized?.reasonCode ?? 'submit_unknown_visibility',
+                executionPlannerAssumptions,
               },
             });
             await this.prisma.auditEvent.create({
@@ -1273,6 +1329,10 @@ export class ExecuteOrdersJob {
           marketId: market.id,
           tokenId,
           attempts: (priorIntent?.attempts ?? 0) + 1,
+          details: {
+            executionPlannerAssumptions,
+            feeModel,
+          },
         });
         postedStatus = 'submitted';
         venueOrderId = localOrderId;
@@ -1496,6 +1556,7 @@ export class ExecuteOrdersJob {
             minOrderSize,
             negRisk,
             feeModel,
+            executionPlannerAssumptions,
             executionCostCalibration,
             executionCostAssessment,
             toxicity,

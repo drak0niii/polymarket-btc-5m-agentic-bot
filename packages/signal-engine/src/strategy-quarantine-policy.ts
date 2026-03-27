@@ -21,6 +21,11 @@ export class StrategyQuarantinePolicy {
     variant: StrategyVariantRecord;
     evidence: ShadowEvaluationEvidence;
     learningState: LearningState;
+    liveDemotionDecision?: {
+      action: 'none' | 'probation' | 'demote' | 'quarantine';
+      reasonCodes: string[];
+      quarantineUntil: string | null;
+    };
     now?: Date;
   }): StrategyQuarantineAssessment {
     const now = input.now ?? new Date();
@@ -112,6 +117,42 @@ export class StrategyQuarantinePolicy {
             marketContext: dedupedRecords[0]?.scope.marketContext ?? null,
           },
           decidedAt: now.toISOString(),
+          until: input.liveDemotionDecision?.quarantineUntil ?? null,
+        },
+      };
+    }
+
+    if (input.liveDemotionDecision?.action === 'quarantine') {
+      return {
+        records: [],
+        decision: {
+          status: 'quarantined',
+          severity: 'high',
+          reasons: [...input.liveDemotionDecision.reasonCodes],
+          scope: {
+            strategyVariantId: input.variant.variantId,
+          },
+          decidedAt: now.toISOString(),
+          until: input.liveDemotionDecision.quarantineUntil,
+        },
+      };
+    }
+
+    if (
+      input.liveDemotionDecision?.action === 'probation' ||
+      input.liveDemotionDecision?.action === 'demote'
+    ) {
+      return {
+        records: [],
+        decision: {
+          status: 'probation',
+          severity: input.liveDemotionDecision.action === 'demote' ? 'high' : 'medium',
+          reasons: [...input.liveDemotionDecision.reasonCodes],
+          scope: {
+            strategyVariantId: input.variant.variantId,
+          },
+          decidedAt: now.toISOString(),
+          until: input.liveDemotionDecision.quarantineUntil,
         },
       };
     }
@@ -123,13 +164,14 @@ export class StrategyQuarantinePolicy {
       return {
         records: [],
         decision: {
-          status: 'watch',
+          status: 'probation',
           severity: 'medium',
           reasons: ['variant_on_watch_for_degraded_health'],
           scope: {
             strategyVariantId: input.variant.variantId,
           },
           decidedAt: now.toISOString(),
+          until: null,
         },
       };
     }

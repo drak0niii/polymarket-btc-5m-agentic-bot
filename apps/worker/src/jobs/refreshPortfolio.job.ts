@@ -8,6 +8,8 @@ import {
   ExternalPortfolioSnapshot,
 } from '@worker/portfolio/external-portfolio.service';
 import { FeeAccountingService } from '@polymarket-btc-5m-agentic-bot/execution-engine';
+import { LearningStateStore } from '@worker/runtime/learning-state-store';
+import { ResolvedTradeLedger } from '@worker/runtime/resolved-trade-ledger';
 
 interface LedgerState {
   marketId: string;
@@ -33,6 +35,8 @@ export class RefreshPortfolioJob {
   private readonly logger = new AppLogger('RefreshPortfolioJob');
   private readonly externalPortfolioService: ExternalPortfolioService;
   private readonly feeAccounting = new FeeAccountingService();
+  private readonly learningStateStore = new LearningStateStore();
+  private readonly resolvedTradeLedger = new ResolvedTradeLedger();
 
   constructor(private readonly prisma: PrismaClient) {
     this.externalPortfolioService = new ExternalPortfolioService(this.prisma);
@@ -252,7 +256,28 @@ export class RefreshPortfolioJob {
         externalSnapshot.tradingPermissions?.allowNewEntries ?? false,
     });
 
+    await this.syncResolvedTradeLedgerPointer();
+
     return { snapshotId: snapshot.id };
+  }
+
+  private async syncResolvedTradeLedgerPointer(): Promise<void> {
+    const latest = (await this.resolvedTradeLedger.loadRecent(1))[0] ?? null;
+    const nextPointer = {
+      resolvedTradeLedgerPath: this.resolvedTradeLedger.getPath(),
+      lastResolvedTradeAt: latest?.finalizedTimestamp ?? null,
+      lastResolvedTradeId: latest?.tradeId ?? null,
+    };
+    const currentPointer = await this.learningStateStore.loadResolvedTradePointer();
+    if (
+      currentPointer?.resolvedTradeLedgerPath === nextPointer.resolvedTradeLedgerPath &&
+      currentPointer?.lastResolvedTradeAt === nextPointer.lastResolvedTradeAt &&
+      currentPointer?.lastResolvedTradeId === nextPointer.lastResolvedTradeId
+    ) {
+      return;
+    }
+
+    await this.learningStateStore.saveResolvedTradePointer(nextPointer);
   }
 
   private reconcileExternalInventoryLedgers(

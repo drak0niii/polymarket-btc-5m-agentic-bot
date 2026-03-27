@@ -26,6 +26,110 @@ export type ExecutionStyle = 'unknown' | 'maker' | 'taker' | 'hybrid';
 
 export type LearningTradeSide = 'unknown' | 'buy' | 'sell';
 
+export type LearningCycleStatus = 'completed' | 'completed_with_warnings' | 'failed';
+
+export type LearningEventType =
+  | 'learning_cycle_started'
+  | 'learning_cycle_completed'
+  | 'learning_cycle_failed'
+  | 'calibration_updated'
+  | 'edge_decay_detected'
+  | 'confidence_shrinkage_changed'
+  | 'strategy_variant_registered'
+  | 'shadow_evaluation_completed'
+  | 'strategy_promotion_decided'
+  | 'strategy_quarantined'
+  | 'strategy_rollout_changed'
+  | 'strategy_rollback_triggered'
+  | 'execution_learning_updated'
+  | 'execution_policy_versioned'
+  | 'adverse_selection_detected'
+  | 'portfolio_learning_updated'
+  | 'capital_allocation_decided'
+  | 'correlation_signal_detected';
+
+export type LearningEventSeverity = 'info' | 'warning' | 'critical';
+
+export type LearningMetricScalar = string | number | boolean | null;
+
+export interface LearningMetricSnapshot {
+  [key: string]: LearningMetricScalar;
+}
+
+export interface LearningEvidenceWindow {
+  from?: string | null;
+  to?: string | null;
+  sampleCount?: number | null;
+}
+
+export interface LearningEvidenceReference {
+  source?:
+    | 'resolved_trade_ledger'
+    | 'learning_event_log'
+    | 'audit_event'
+    | 'validation_artifact'
+    | 'runtime_checkpoint'
+    | 'manual_review'
+    | 'unknown';
+  sourceId?: string | null;
+  artifactPath?: string | null;
+  strategyVariantId?: string | null;
+  regime?: string | null;
+  marketId?: string | null;
+  window?: LearningEvidenceWindow | null;
+  metricSnapshot?: LearningMetricSnapshot;
+  notes?: string[];
+}
+
+export type LearningParameterValue = string | number | boolean | null;
+
+export interface LearningRollbackCriterion {
+  trigger: string;
+  comparator?: 'lte' | 'gte' | 'eq' | 'contains' | 'exists';
+  threshold?: LearningParameterValue;
+  rationale?: string;
+}
+
+export interface LearningParameterChange {
+  parameter: string;
+  previousValue?: LearningParameterValue;
+  nextValue?: LearningParameterValue;
+  scope?: {
+    strategyVariantId?: string | null;
+    regime?: string | null;
+    marketContext?: string | null;
+  };
+  rationale?: string[];
+  boundedBy?: string[];
+  evidenceRefs?: LearningEvidenceReference[];
+  rollbackCriteria?: LearningRollbackCriterion[];
+  changedAt?: string | null;
+}
+
+export interface LearningDecisionEvidence {
+  summary?: string | null;
+  evidenceRefs?: LearningEvidenceReference[];
+  metricSnapshot?: LearningMetricSnapshot;
+  changeSet?: LearningParameterChange[];
+  warnings?: string[];
+  payload?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface LearningEventDetails {
+  evidenceRefs?: LearningEvidenceReference[];
+  metricSnapshot?: LearningMetricSnapshot;
+  changeSet?: LearningParameterChange[];
+  warnings?: string[];
+  errors?: string[];
+  payload?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface LearningReviewOutputs {
+  [key: string]: unknown;
+}
+
 export interface RegimePerformanceSnapshot {
   key: string;
   regime: string;
@@ -202,27 +306,38 @@ export interface PortfolioLearningState {
 export interface PromotionDecision {
   decision: 'not_evaluated' | 'reject' | 'shadow_only' | 'canary' | 'promote' | 'rollback';
   reasons: string[];
-  evidence: Record<string, unknown>;
+  evidence: LearningDecisionEvidence;
+  rollbackCriteria?: LearningRollbackCriterion[];
   decidedAt: string | null;
 }
 
 export interface QuarantineDecision {
-  status: 'none' | 'watch' | 'quarantine_recommended' | 'quarantined';
+  status:
+    | 'none'
+    | 'watch'
+    | 'probation'
+    | 'quarantine_recommended'
+    | 'quarantined';
   severity: 'none' | 'low' | 'medium' | 'high';
   reasons: string[];
+  evidence?: LearningDecisionEvidence;
   scope: {
     strategyVariantId?: string | null;
     regime?: string | null;
     marketContext?: string | null;
   };
   decidedAt: string | null;
+  until?: string | null;
+  rollbackCriteria?: LearningRollbackCriterion[];
 }
 
 export interface CapitalAllocationDecision {
   status: 'unchanged' | 'reduce' | 'hold' | 'increase';
   targetMultiplier: number;
   reasons: string[];
+  evidence?: LearningDecisionEvidence;
   decidedAt: string | null;
+  rollbackCriteria?: LearningRollbackCriterion[];
 }
 
 export interface StrategyVariantState {
@@ -241,7 +356,7 @@ export interface LearningCycleSummary {
   cycleId: string;
   startedAt: string;
   completedAt: string | null;
-  status: 'completed' | 'completed_with_warnings' | 'failed';
+  status: LearningCycleStatus;
   analyzedWindow: {
     from: string;
     to: string;
@@ -253,37 +368,19 @@ export interface LearningCycleSummary {
   degradedContexts: string[];
   warnings: string[];
   errors: string[];
-  reviewOutputs?: Record<string, unknown> | null;
+  reviewOutputs?: LearningReviewOutputs | null;
 }
 
 export interface LearningEvent {
   id: string;
-  type:
-    | 'learning_cycle_started'
-    | 'learning_cycle_completed'
-    | 'learning_cycle_failed'
-    | 'calibration_updated'
-    | 'edge_decay_detected'
-    | 'confidence_shrinkage_changed'
-    | 'strategy_variant_registered'
-    | 'shadow_evaluation_completed'
-    | 'strategy_promotion_decided'
-    | 'strategy_quarantined'
-    | 'strategy_rollout_changed'
-    | 'strategy_rollback_triggered'
-    | 'execution_learning_updated'
-    | 'execution_policy_versioned'
-    | 'adverse_selection_detected'
-    | 'portfolio_learning_updated'
-    | 'capital_allocation_decided'
-    | 'correlation_signal_detected';
-  severity: 'info' | 'warning' | 'critical';
+  type: LearningEventType;
+  severity: LearningEventSeverity;
   createdAt: string;
   cycleId: string | null;
   strategyVariantId: string | null;
   contextKey: string | null;
   summary: string;
-  details: Record<string, unknown>;
+  details: LearningEventDetails;
 }
 
 export interface LearningState {
@@ -356,7 +453,8 @@ export function createDefaultPromotionDecision(): PromotionDecision {
   return {
     decision: 'not_evaluated',
     reasons: [],
-    evidence: {},
+    evidence: createDefaultLearningDecisionEvidence(),
+    rollbackCriteria: [],
     decidedAt: null,
   };
 }
@@ -366,8 +464,11 @@ export function createDefaultQuarantineDecision(): QuarantineDecision {
     status: 'none',
     severity: 'none',
     reasons: [],
+    evidence: createDefaultLearningDecisionEvidence(),
     scope: {},
     decidedAt: null,
+    until: null,
+    rollbackCriteria: [],
   };
 }
 
@@ -376,7 +477,31 @@ export function createDefaultCapitalAllocationDecision(): CapitalAllocationDecis
     status: 'unchanged',
     targetMultiplier: 1,
     reasons: [],
+    evidence: createDefaultLearningDecisionEvidence(),
     decidedAt: null,
+    rollbackCriteria: [],
+  };
+}
+
+export function createDefaultLearningDecisionEvidence(): LearningDecisionEvidence {
+  return {
+    summary: null,
+    evidenceRefs: [],
+    metricSnapshot: {},
+    changeSet: [],
+    warnings: [],
+    payload: {},
+  };
+}
+
+export function createDefaultLearningEventDetails(): LearningEventDetails {
+  return {
+    evidenceRefs: [],
+    metricSnapshot: {},
+    changeSet: [],
+    warnings: [],
+    errors: [],
+    payload: {},
   };
 }
 

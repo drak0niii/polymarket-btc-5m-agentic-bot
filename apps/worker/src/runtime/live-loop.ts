@@ -15,6 +15,7 @@ import { MarketAnalysisAgent } from '@worker/agents/market-analysis.agent';
 import { RiskVerificationAgent } from '@worker/agents/risk-verification.agent';
 import { ExecutionPortfolioAgent } from '@worker/agents/execution-portfolio.agent';
 import { VenueOpenOrderHeartbeatService } from './venue-open-order-heartbeat.service';
+import { ExecutionStateWatchdog } from './execution-state-watchdog';
 import { permissionsForRuntimeState } from './runtime-state-machine';
 import { MarketWebSocketStateService } from '@polymarket-btc-5m-agentic-bot/market-data';
 import { UserWebSocketStateService } from './user-websocket-state.service';
@@ -43,6 +44,7 @@ export class LiveLoop {
   private readonly riskVerificationAgent: RiskVerificationAgent;
   private readonly executionPortfolioAgent: ExecutionPortfolioAgent;
   private readonly venueHeartbeatService: VenueOpenOrderHeartbeatService;
+  private readonly executionStateWatchdog: ExecutionStateWatchdog;
   private readonly liquidationPolicy = new InventoryLiquidationPolicy();
   private venueHeartbeatProtectionActive = false;
 
@@ -97,6 +99,7 @@ export class LiveLoop {
       this.runtimeControl,
       async (reasonCode) => this.handleVenueHeartbeatDegraded(reasonCode),
     );
+    this.executionStateWatchdog = new ExecutionStateWatchdog(this.runtimeControl);
   }
 
   async start(): Promise<void> {
@@ -487,6 +490,7 @@ export class LiveLoop {
   private async enforceStreamHealth(): Promise<void> {
     const marketHealth = this.marketStreamService.evaluateHealth();
     const userHealth = this.userStreamService.evaluateHealth();
+    await this.enforceExecutionStateTruth(userHealth);
 
     if (!marketHealth.healthy && this.stateStore.getState() === 'running') {
       this.stateStore.setState('degraded', marketHealth.reasonCode ?? 'market_stream_unhealthy');
@@ -518,6 +522,112 @@ export class LiveLoop {
           metadata: userHealth as unknown as object,
         },
       });
+    }
+  }
+
+  private async enforceExecutionStateTruth(userHealth: ReturnType<UserWebSocketStateService['evaluateHealth']>): Promise<void> {
+    const heartbeatHealth = this.venueHeartbeatService.evaluateHealth();
+    const openOrderStatuses = await this.prisma.order.findMany({
+      where: {
+        status: {
+          in: ['submitted', 'acknowledged', 'partially_filled', 'filled'],
+        },
+      },
+      select: {
+        id: true,
+        status: true,
+        lastError: true,
+        lastVenueStatus: true,
+        updatedAt: true,
+      },
+      take: 100,
+    });
+    const now = Date.now();
+    const retryingCount = openOrderStatuses.filter((order) =>
+      typeof order.lastError === 'string' && order.lastError.toLowerCase().includes('retry'),
+    ).length;
+    const failedCount = openOrderStatuses.filter((order) =>
+      typeof order.lastError === 'string' &&
+      (order.lastError.toLowerCase().includes('failed') ||
+        order.lastError.toLowerCase().includes('reject'))
+    ).length;
+    const locallyFilledAbsent = openOrderStatuses.filter((order) => {
+      if (order.status !== 'filled') {
+        return false;
+      }
+      const status = String(order.lastVenueStatus ?? '').toLowerCase();
+      return status.includes('missing_from_open_orders') || status.includes('absent_from_venue');
+    });
+    const oldestLocallyFilledAbsentAgeMs =
+      locallyFilledAbsent.length === 0
+        ? null
+        : Math.max(
+            0,
+            now -
+              Math.min(
+                ...locallyFilledAbsent.map((order) => order.updatedAt?.getTime() ?? now),
+              ),
+          );
+
+    const watchdogDecision = await this.executionStateWatchdog.evaluate({
+      currentState: this.stateStore.getState(),
+      anomalyInput: {
+        userStream: {
+          stale: userHealth.stale,
+          liveOrdersWhileStale: userHealth.liveOrdersWhileStale,
+          connected: userHealth.connected,
+          reconnectAttempt: userHealth.reconnectAttempt,
+          openOrders: userHealth.openOrders,
+          lastTrafficAgeMs: userHealth.lastTrafficAgeMs,
+          divergenceDetected: userHealth.divergenceDetected,
+        },
+        venueTruth: {
+          disagreementCount: heartbeatHealth.disagreementCount,
+          unresolvedGhostMismatch: heartbeatHealth.unresolvedGhostMismatch,
+          lastVenueTruthAgeMs: heartbeatHealth.lastVenueTruthRefreshAt
+            ? Math.max(0, now - new Date(heartbeatHealth.lastVenueTruthRefreshAt).getTime())
+            : null,
+          workingOpenOrders: heartbeatHealth.workingOpenOrders,
+          cancelPendingTooLongCount: heartbeatHealth.cancelPendingTooLongCount,
+        },
+        lifecycle: {
+          retryingCount,
+          failedCount,
+          ghostExposureDetected: heartbeatHealth.unresolvedGhostMismatch,
+          unresolvedIntentCount: 0,
+          locallyFilledButAbsentCount: locallyFilledAbsent.length,
+          oldestLocallyFilledAbsentAgeMs,
+        },
+      },
+    });
+
+    if (!watchdogDecision.transitionRequest) {
+      return;
+    }
+
+    const nextState = watchdogDecision.transitionRequest.nextState;
+    if (nextState === this.stateStore.getState()) {
+      return;
+    }
+
+    this.stateStore.setState(
+      nextState,
+      watchdogDecision.reasonCodes.join('|') || watchdogDecision.transitionRequest.reasonCode,
+    );
+    await this.runtimeControl.updateRuntimeStatus(
+      this.stateStore.getState(),
+      this.stateStore.getReason() ?? watchdogDecision.transitionRequest.reasonCode,
+    );
+    await this.prisma.auditEvent.create({
+      data: {
+        eventType: 'runtime.execution_state_watchdog_transition',
+        message: 'Execution-state watchdog requested a runtime downgrade.',
+        metadata: watchdogDecision as unknown as object,
+      },
+    });
+
+    if (nextState === 'reconciliation_only' || nextState === 'cancel_only') {
+      await this.stopEntries();
     }
   }
 

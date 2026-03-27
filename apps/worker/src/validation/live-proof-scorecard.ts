@@ -1,5 +1,6 @@
 import type { DatasetQualityReport } from './dataset-quality';
 import type { BaselineComparisonReport } from './baseline-comparison';
+import type { DailyDecisionQualityReport } from './daily-decision-quality-report';
 import type { RetentionReport } from './retention-report';
 import type { RegimePerformanceReport } from './regime-performance-report';
 
@@ -40,6 +41,12 @@ export interface LiveProofScorecard {
     elevatedOrWorseShare: number;
     blockedShare: number;
   };
+  dailyDecisionQualitySummary: {
+    dayCount: number;
+    positiveNetDayShare: number;
+    averageNetPnlAfterFees: number;
+    averageRealizedVsExpectedGapBps: number | null;
+  } | null;
 }
 
 export function buildLiveProofScorecard(input: {
@@ -67,6 +74,7 @@ export function buildLiveProofScorecard(input: {
   baselineComparison: BaselineComparisonReport;
   retentionReport: RetentionReport;
   regimePerformanceReport: RegimePerformanceReport;
+  dailyDecisionQualityReport?: DailyDecisionQualityReport | null;
   now?: Date;
 }): LiveProofScorecard {
   const blockers = new Set<string>();
@@ -144,6 +152,25 @@ export function buildLiveProofScorecard(input: {
     blockers.add('blocked_toxicity_share_too_high');
   }
 
+  const dailyDecisionQualitySummary = summarizeDailyDecisionQuality(
+    input.dailyDecisionQualityReport ?? null,
+  );
+  if (dailyDecisionQualitySummary) {
+    if (dailyDecisionQualitySummary.positiveNetDayShare < 0.5) {
+      blockers.add('daily_net_day_share_too_low');
+    } else {
+      strengths.add('daily_net_day_share_healthy');
+    }
+    if (
+      dailyDecisionQualitySummary.averageRealizedVsExpectedGapBps != null &&
+      dailyDecisionQualitySummary.averageRealizedVsExpectedGapBps < -40
+    ) {
+      blockers.add('daily_realized_vs_expected_gap_too_negative');
+    } else {
+      strengths.add('daily_realized_vs_expected_gap_acceptable');
+    }
+  }
+
   const proofScore = clamp01(
     input.governance.confidence * 0.25 +
       input.robustness.score * 0.2 +
@@ -158,7 +185,8 @@ export function buildLiveProofScorecard(input: {
           (entry) => (entry.retentionRatio ?? -1) >= 0.75,
         ).length,
         input.regimePerformanceReport.perRegime.length,
-      ) * 0.1,
+      ) * 0.1 +
+      (dailyDecisionQualitySummary?.positiveNetDayShare ?? 0) * 0.05,
   );
 
   const promotableEvidence =
@@ -211,6 +239,7 @@ export function buildLiveProofScorecard(input: {
       elevatedOrWorseShare,
       blockedShare,
     },
+    dailyDecisionQualitySummary,
   };
 }
 
@@ -241,4 +270,34 @@ function ratio(numerator: number, denominator: number): number {
     return 0;
   }
   return numerator / denominator;
+}
+
+function summarizeDailyDecisionQuality(
+  report: DailyDecisionQualityReport | null,
+): LiveProofScorecard['dailyDecisionQualitySummary'] {
+  if (!report || report.byDay.length === 0) {
+    return null;
+  }
+  const positiveNetDayShare = ratio(
+    report.summary.positiveNetDayCount,
+    report.summary.dayCount,
+  );
+  const averageNetPnlAfterFees =
+    report.byDay.reduce((sum, entry) => sum + entry.netPnlAfterFees, 0) /
+    report.byDay.length;
+  const realizedGapValues = report.byDay
+    .map((entry) => entry.realizedVsExpectedGapBps)
+    .filter((value): value is number => value != null && Number.isFinite(value));
+  const averageRealizedVsExpectedGapBps =
+    realizedGapValues.length === 0
+      ? null
+      : realizedGapValues.reduce((sum, value) => sum + value, 0) /
+        realizedGapValues.length;
+
+  return {
+    dayCount: report.summary.dayCount,
+    positiveNetDayShare,
+    averageNetPnlAfterFees,
+    averageRealizedVsExpectedGapBps,
+  };
 }

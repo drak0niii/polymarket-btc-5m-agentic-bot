@@ -11,11 +11,13 @@ import {
   buildStrategyVariantId,
   createDefaultLearningState,
   createDefaultStrategyVariantState,
+  type ResolvedTradeRecord,
 } from '@polymarket-btc-5m-agentic-bot/domain';
 import { DailyReviewJob } from '../jobs/dailyReview.job';
 import { EvaluateTradeOpportunitiesJob } from '../jobs/evaluateTradeOpportunities.job';
 import { LearningEventLog } from '../runtime/learning-event-log';
 import { LearningStateStore } from '../runtime/learning-state-store';
+import { ResolvedTradeLedger } from '../runtime/resolved-trade-ledger';
 import { StrategyDeploymentRegistry } from '../runtime/strategy-deployment-registry';
 import { VersionLineageRegistry } from '../runtime/version-lineage-registry';
 import { TradeQualityHistoryStore } from '@polymarket-btc-5m-agentic-bot/risk-engine';
@@ -402,6 +404,7 @@ async function runEvaluationScenario(input: {
 }) {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'item6-evaluate-'));
   const learningStateStore = new LearningStateStore(rootDir);
+  const resolvedTradeLedger = new ResolvedTradeLedger(rootDir);
   const versionLineageRegistry = new VersionLineageRegistry(path.join(rootDir, 'lineage'));
   const deploymentRegistry = new StrategyDeploymentRegistry(path.join(rootDir, 'deployment'));
   const tradeQualityHistoryStore = new TradeQualityHistoryStore(path.join(rootDir, 'quality'));
@@ -459,6 +462,9 @@ async function runEvaluationScenario(input: {
     },
   };
   await learningStateStore.save(learningState);
+  for (const record of buildResolvedTradeFixtures(strategyVariantId, input.regime)) {
+    await resolvedTradeLedger.append(record);
+  }
 
   const signal = {
     id: 'signal-1',
@@ -689,6 +695,8 @@ async function runEvaluationScenario(input: {
     versionLineageRegistry,
     venueHealthLearningStore as never,
     tradeQualityHistoryStore,
+    undefined,
+    resolvedTradeLedger,
   );
   const result = await job.run({
     maxOpenPositions: 2,
@@ -724,6 +732,112 @@ async function runEvaluationScenario(input: {
         ? approvedDecision.positionSize
         : null,
     liveSizing,
+  };
+}
+
+function buildResolvedTradeFixtures(
+  strategyVariantId: string,
+  regime: string,
+): ResolvedTradeRecord[] {
+  return Array.from({ length: 10 }, (_, index) =>
+    createResolvedTradeFixture({
+      tradeId: `item6-trade-${regime}-${index + 1}`,
+      orderId: `item6-order-${regime}-${index + 1}`,
+      strategyVariantId,
+      strategyVersion: strategyVariantId.replace('variant:', ''),
+      regime,
+      archetype:
+        regime === 'near_resolution_microstructure_chaos'
+          ? 'stressed_microstructure'
+          : 'trend_follow_through',
+      finalizedTimestamp: new Date(Date.UTC(2026, 2, 25, 0, index)).toISOString(),
+      capturedAt: new Date(Date.UTC(2026, 2, 25, 0, index)).toISOString(),
+    }),
+  );
+}
+
+function createResolvedTradeFixture(
+  overrides: Partial<ResolvedTradeRecord>,
+): ResolvedTradeRecord {
+  return {
+    tradeId: overrides.tradeId ?? 'item6-trade-default',
+    orderId: overrides.orderId ?? 'item6-order-default',
+    venueOrderId: overrides.venueOrderId ?? 'item6-venue-order-default',
+    marketId: overrides.marketId ?? 'm1',
+    tokenId: overrides.tokenId ?? 'yes1',
+    strategyVariantId: overrides.strategyVariantId ?? buildStrategyVariantId('strategy-live-1'),
+    strategyVersion: overrides.strategyVersion ?? 'strategy-live-1',
+    regime: overrides.regime ?? 'trend_burst',
+    archetype: overrides.archetype ?? 'trend_follow_through',
+    decisionTimestamp: overrides.decisionTimestamp ?? '2026-03-25T00:00:00.000Z',
+    submissionTimestamp: overrides.submissionTimestamp ?? '2026-03-25T00:00:01.000Z',
+    firstFillTimestamp: overrides.firstFillTimestamp ?? '2026-03-25T00:00:02.000Z',
+    finalizedTimestamp: overrides.finalizedTimestamp ?? '2026-03-25T00:00:10.000Z',
+    side: overrides.side ?? 'BUY',
+    intendedPrice: overrides.intendedPrice ?? 0.54,
+    averageFillPrice: overrides.averageFillPrice ?? 0.541,
+    size: overrides.size ?? 20,
+    notional: overrides.notional ?? 10.82,
+    estimatedFeeAtDecision: overrides.estimatedFeeAtDecision ?? 0.05,
+    realizedFee: overrides.realizedFee ?? 0.051,
+    estimatedSlippageBps: overrides.estimatedSlippageBps ?? 10,
+    realizedSlippageBps: overrides.realizedSlippageBps ?? 11,
+    queueDelayMs: overrides.queueDelayMs ?? 2_500,
+    fillFraction: overrides.fillFraction ?? 1,
+    expectedNetEdgeBps: overrides.expectedNetEdgeBps ?? 58,
+    realizedNetEdgeBps: overrides.realizedNetEdgeBps ?? 62,
+    maxFavorableExcursionBps: overrides.maxFavorableExcursionBps ?? 95,
+    maxAdverseExcursionBps: overrides.maxAdverseExcursionBps ?? -18,
+    toxicityScoreAtDecision: overrides.toxicityScoreAtDecision ?? 0.18,
+    benchmarkContext: overrides.benchmarkContext ?? {
+      benchmarkComparisonState: 'outperforming',
+      baselinePenaltyMultiplier: 1,
+      regimeBenchmarkGateState: 'passed',
+      underperformedBenchmarkIds: [],
+      outperformedBenchmarkIds: ['btc_follow_baseline'],
+      reasonCodes: ['item6_fixture'],
+    },
+    lossAttributionCategory: overrides.lossAttributionCategory ?? 'mixed',
+    executionAttributionCategory:
+      overrides.executionAttributionCategory ?? 'queue_decay',
+    lifecycleState:
+      overrides.lifecycleState ?? 'economically_resolved_with_portfolio_truth',
+    attribution: overrides.attribution ?? {
+      benchmarkContext: overrides.benchmarkContext ?? {
+        benchmarkComparisonState: 'outperforming',
+        baselinePenaltyMultiplier: 1,
+        regimeBenchmarkGateState: 'passed',
+        underperformedBenchmarkIds: [],
+        outperformedBenchmarkIds: ['btc_follow_baseline'],
+        reasonCodes: ['item6_fixture'],
+      },
+      lossAttributionCategory: 'mixed',
+      executionAttributionCategory: 'queue_decay',
+      primaryLeakageDriver: 'queue_delay',
+      secondaryLeakageDrivers: ['slippage'],
+      reasonCodes: ['item6_fixture'],
+    },
+    executionQuality: overrides.executionQuality ?? {
+      intendedPrice: overrides.intendedPrice ?? 0.54,
+      averageFillPrice: overrides.averageFillPrice ?? 0.541,
+      size: overrides.size ?? 20,
+      notional: overrides.notional ?? 10.82,
+      estimatedFeeAtDecision: overrides.estimatedFeeAtDecision ?? 0.05,
+      realizedFee: overrides.realizedFee ?? 0.051,
+      estimatedSlippageBps: overrides.estimatedSlippageBps ?? 10,
+      realizedSlippageBps: overrides.realizedSlippageBps ?? 11,
+      queueDelayMs: overrides.queueDelayMs ?? 2_500,
+      fillFraction: overrides.fillFraction ?? 1,
+    },
+    netOutcome: overrides.netOutcome ?? {
+      expectedNetEdgeBps: overrides.expectedNetEdgeBps ?? 58,
+      realizedNetEdgeBps: overrides.realizedNetEdgeBps ?? 62,
+      maxFavorableExcursionBps: overrides.maxFavorableExcursionBps ?? 95,
+      maxAdverseExcursionBps: overrides.maxAdverseExcursionBps ?? -18,
+      realizedPnl: 0.72,
+    },
+    capturedAt:
+      overrides.capturedAt ?? overrides.finalizedTimestamp ?? '2026-03-25T00:00:10.000Z',
   };
 }
 

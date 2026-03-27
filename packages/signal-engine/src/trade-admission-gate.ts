@@ -1,3 +1,5 @@
+import type { NoTradeClassifierOutput } from './no-trade/no-trade-classifier';
+
 export type TradeAdmissionReasonCode =
   | 'edge_definition_missing'
   | 'no_signal'
@@ -14,6 +16,8 @@ export type TradeAdmissionReasonCode =
   | 'positive_direction_but_negative_ev'
   | 'positive_ev_but_below_confidence'
   | 'regime_blocked'
+  | 'regime_confidence_too_low'
+  | 'regime_evidence_insufficient'
   | 'trade_permitted';
 
 export interface ExecutableEdgeEstimate {
@@ -48,11 +52,24 @@ export interface TradeAdmissionGateInput {
   riskHealthy: boolean;
   regimeAllowed: boolean;
   noTradeZoneBlocked?: boolean;
+  noTradeClassifier?: NoTradeClassifierOutput | null;
   halfLifeExpired?: boolean;
   paperEdgeDetected?: boolean;
   admissionThreshold?: number;
   executableEdge: ExecutableEdgeEstimate;
   minimumConfidence?: number;
+  regimeLabel?: string | null;
+  regimeConfidence?: number | null;
+  regimeTransitionRisk?: number | null;
+  minimumRegimeConfidence?: number;
+  regimeEvidenceSampleCount?: number | null;
+  minimumRegimeEvidenceSampleCount?: number;
+}
+
+export interface TradeAdmissionEvidenceQualitySummary {
+  regimeEvidenceSampleCount: number | null;
+  minimumRegimeEvidenceSampleCount: number;
+  regimeEvidenceQuality: 'strong' | 'limited' | 'insufficient';
 }
 
 export interface TradeAdmissionGateResult {
@@ -60,23 +77,44 @@ export interface TradeAdmissionGateResult {
   reasonCode: TradeAdmissionReasonCode;
   reasonMessage: string;
   executableEdge: ExecutableEdgeEstimate;
+  rejectionReasons: string[];
+  regimeContext: {
+    regimeLabel: string | null;
+    regimeConfidence: number | null;
+    regimeTransitionRisk: number | null;
+  };
+  evidenceQualitySummary: TradeAdmissionEvidenceQualitySummary;
 }
 
 export class TradeAdmissionGate {
   evaluate(input: TradeAdmissionGateInput): TradeAdmissionGateResult {
     const minimumConfidence = input.minimumConfidence ?? 0.6;
+    const minimumRegimeConfidence = input.minimumRegimeConfidence ?? 0.58;
+    const minimumRegimeEvidenceSampleCount = input.minimumRegimeEvidenceSampleCount ?? 0;
     const threshold = input.admissionThreshold ?? input.executableEdge.threshold ?? 0;
+    const evidenceQualitySummary = summarizeEvidenceQuality(
+      input.regimeEvidenceSampleCount ?? null,
+      minimumRegimeEvidenceSampleCount,
+    );
 
     if (!input.edgeDefinitionVersion) {
       return this.reject(
         'edge_definition_missing',
         'Trade admission is blocked because no canonical edge definition was supplied.',
         input.executableEdge,
+        input,
+        evidenceQualitySummary,
       );
     }
 
     if (!input.signalPresent || input.directionalEdge == null) {
-      return this.reject('no_signal', 'No executable signal is present.', input.executableEdge);
+      return this.reject(
+        'no_signal',
+        'No executable signal is present.',
+        input.executableEdge,
+        input,
+        evidenceQualitySummary,
+      );
     }
 
     if (input.noTradeZoneBlocked) {
@@ -84,6 +122,18 @@ export class TradeAdmissionGate {
         'no_trade_zone',
         'A strict no-trade zone is active for this setup.',
         input.executableEdge,
+        input,
+        evidenceQualitySummary,
+      );
+    }
+
+    if (input.noTradeClassifier && !input.noTradeClassifier.allowTrade) {
+      return this.reject(
+        'no_trade_zone',
+        `No-trade classifier blocked this setup: ${input.noTradeClassifier.reasonCodes.join(',')}.`,
+        input.executableEdge,
+        input,
+        evidenceQualitySummary,
       );
     }
 
@@ -92,6 +142,8 @@ export class TradeAdmissionGate {
         'edge_half_life_expired',
         'The signal edge decayed beyond its admissible half-life.',
         input.executableEdge,
+        input,
+        evidenceQualitySummary,
       );
     }
 
@@ -100,6 +152,35 @@ export class TradeAdmissionGate {
         'regime_blocked',
         'Current regime does not permit new entries.',
         input.executableEdge,
+        input,
+        evidenceQualitySummary,
+      );
+    }
+
+    if (
+      typeof input.regimeConfidence === 'number' &&
+      Number.isFinite(input.regimeConfidence) &&
+      input.regimeConfidence < minimumRegimeConfidence
+    ) {
+      return this.reject(
+        'regime_confidence_too_low',
+        'Regime confidence is below the deployment threshold.',
+        input.executableEdge,
+        input,
+        evidenceQualitySummary,
+      );
+    }
+
+    if (
+      minimumRegimeEvidenceSampleCount > 0 &&
+      evidenceQualitySummary.regimeEvidenceQuality === 'insufficient'
+    ) {
+      return this.reject(
+        'regime_evidence_insufficient',
+        'Regime-specific live evidence is insufficient for admission.',
+        input.executableEdge,
+        input,
+        evidenceQualitySummary,
       );
     }
 
@@ -108,19 +189,39 @@ export class TradeAdmissionGate {
         'friction_input_missing',
         'Required executable-friction inputs are missing.',
         input.executableEdge,
+        input,
+        evidenceQualitySummary,
       );
     }
 
     if (!input.liquidityHealthy) {
-      return this.reject('bad_liquidity', 'Liquidity gate failed.', input.executableEdge);
+      return this.reject(
+        'bad_liquidity',
+        'Liquidity gate failed.',
+        input.executableEdge,
+        input,
+        evidenceQualitySummary,
+      );
     }
 
     if (!input.freshnessHealthy || input.executableEdge.staleInputs.length > 0) {
-      return this.reject('stale_data', 'Freshness gate failed.', input.executableEdge);
+      return this.reject(
+        'stale_data',
+        'Freshness gate failed.',
+        input.executableEdge,
+        input,
+        evidenceQualitySummary,
+      );
     }
 
     if (!input.venueHealthy) {
-      return this.reject('venue_unhealthy', 'Venue health gate failed.', input.executableEdge);
+      return this.reject(
+        'venue_unhealthy',
+        'Venue health gate failed.',
+        input.executableEdge,
+        input,
+        evidenceQualitySummary,
+      );
     }
 
     if (!input.reconciliationHealthy) {
@@ -128,15 +229,29 @@ export class TradeAdmissionGate {
         'reconciliation_unhealthy',
         'Reconciliation health gate failed.',
         input.executableEdge,
+        input,
+        evidenceQualitySummary,
       );
     }
 
     if (!input.riskHealthy) {
-      return this.reject('risk_blocked', 'Risk gate failed.', input.executableEdge);
+      return this.reject(
+        'risk_blocked',
+        'Risk gate failed.',
+        input.executableEdge,
+        input,
+        evidenceQualitySummary,
+      );
     }
 
     if (Math.abs(input.directionalEdge) < 0.0025) {
-      return this.reject('weak_signal', 'Directional edge is too weak.', input.executableEdge);
+      return this.reject(
+        'weak_signal',
+        'Directional edge is too weak.',
+        input.executableEdge,
+        input,
+        evidenceQualitySummary,
+      );
     }
 
     if (input.paperEdgeDetected && (input.executableEdge.finalNetEdge ?? 0) <= threshold) {
@@ -144,6 +259,8 @@ export class TradeAdmissionGate {
         'paper_edge_only',
         'Raw directional edge is positive but executable net edge is not.',
         input.executableEdge,
+        input,
+        evidenceQualitySummary,
       );
     }
 
@@ -156,6 +273,8 @@ export class TradeAdmissionGate {
         'positive_direction_but_negative_ev',
         'Directional edge exists but executable EV is non-positive.',
         input.executableEdge,
+        input,
+        evidenceQualitySummary,
       );
     }
 
@@ -168,6 +287,8 @@ export class TradeAdmissionGate {
         'positive_ev_but_below_confidence',
         'Executable EV is positive but confidence is below the deployment threshold.',
         input.executableEdge,
+        input,
+        evidenceQualitySummary,
       );
     }
 
@@ -176,6 +297,13 @@ export class TradeAdmissionGate {
       reasonCode: 'trade_permitted',
       reasonMessage: 'All trade-admission gates passed.',
       executableEdge: input.executableEdge,
+      rejectionReasons: [],
+      regimeContext: {
+        regimeLabel: input.regimeLabel ?? null,
+        regimeConfidence: finiteOrNull(input.regimeConfidence),
+        regimeTransitionRisk: finiteOrNull(input.regimeTransitionRisk),
+      },
+      evidenceQualitySummary,
     };
   }
 
@@ -183,12 +311,53 @@ export class TradeAdmissionGate {
     reasonCode: Exclude<TradeAdmissionReasonCode, 'trade_permitted'>,
     reasonMessage: string,
     executableEdge: ExecutableEdgeEstimate,
+    input: TradeAdmissionGateInput,
+    evidenceQualitySummary: TradeAdmissionEvidenceQualitySummary,
   ): TradeAdmissionGateResult {
     return {
       admitted: false,
       reasonCode,
       reasonMessage,
       executableEdge,
+      rejectionReasons: [
+        reasonCode,
+        ...(input.noTradeClassifier?.reasonCodes ?? []),
+      ],
+      regimeContext: {
+        regimeLabel: input.regimeLabel ?? null,
+        regimeConfidence: finiteOrNull(input.regimeConfidence),
+        regimeTransitionRisk: finiteOrNull(input.regimeTransitionRisk),
+      },
+      evidenceQualitySummary,
     };
   }
+}
+
+function summarizeEvidenceQuality(
+  sampleCount: number | null,
+  minimumSampleCount: number,
+): TradeAdmissionEvidenceQualitySummary {
+  const normalized = finiteOrNull(sampleCount);
+  if (minimumSampleCount <= 0) {
+    return {
+      regimeEvidenceSampleCount: normalized,
+      minimumRegimeEvidenceSampleCount: minimumSampleCount,
+      regimeEvidenceQuality: normalized == null ? 'limited' : 'strong',
+    };
+  }
+  const regimeEvidenceQuality =
+    normalized == null || normalized < minimumSampleCount
+      ? 'insufficient'
+      : normalized < minimumSampleCount * 2
+        ? 'limited'
+        : 'strong';
+  return {
+    regimeEvidenceSampleCount: normalized,
+    minimumRegimeEvidenceSampleCount: minimumSampleCount,
+    regimeEvidenceQuality,
+  };
+}
+
+function finiteOrNull(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }

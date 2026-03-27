@@ -1,3 +1,4 @@
+import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import type { PrismaClient } from '@prisma/client';
@@ -6,7 +7,9 @@ import {
   type ExecutionStyle,
   type LearningEvent,
   type LearningCycleSummary,
+  type LearningCycleStatus,
   type LearningState,
+  type ResolvedTradeRecord,
   type LearningTradeSide,
   type PortfolioAllocationDecisionRecord,
   type TradeQualityScore,
@@ -22,6 +25,7 @@ import {
   BenchmarkRelativeSizing,
   CapitalGrowthMetricsCalculator,
   CapitalAllocationEngine,
+  LiveTrustScore,
   LiveSizingFeedbackPolicy,
   PortfolioLearningStateBuilder,
   buildRegimeLocalSizingSummary,
@@ -34,9 +38,12 @@ import {
 } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import {
   CapitalGrowthPromotionGate,
+  buildLivePromotionEvidencePacket,
   ChampionChallengerManager,
+  LiveDemotionGate,
   LiveCalibrationStore,
   LiveCalibrationUpdater,
+  LivePromotionGate,
   PromotionDecisionEngine,
   PromotionStabilityCheck,
   ShadowEvaluationEngine,
@@ -53,6 +60,7 @@ import { CapitalLeakReviewJob } from './capitalLeakReview.job';
 import { LearningCycleRunner, type LearningCycleSample } from '@worker/orchestration/learning-cycle-runner';
 import { LearningEventLog } from '@worker/runtime/learning-event-log';
 import { LearningStateStore } from '@worker/runtime/learning-state-store';
+import { ResolvedTradeLedger } from '@worker/runtime/resolved-trade-ledger';
 import { RollbackController } from '@worker/runtime/rollback-controller';
 import { StrategyDeploymentRegistry } from '@worker/runtime/strategy-deployment-registry';
 import { StrategyRolloutController } from '@worker/runtime/strategy-rollout-controller';
@@ -69,8 +77,37 @@ import {
 import { CapitalGrowthReviewJob } from './capitalGrowthReview.job';
 import { buildRetentionContextReport } from '../validation/retention-context-report';
 import { buildCalibrationDriftAlerts } from '../validation/calibration-drift-alerts';
+import {
+  buildDailyDecisionQualityReport,
+  persistDailyDecisionQualityReport,
+  type DailyDecisionQualityRejectedDecision,
+} from '../validation/daily-decision-quality-report';
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+interface LearningCycleSampleSourceSummary {
+  sourceOfTruth: 'resolved_trade_ledger' | 'execution_diagnostic_fallback';
+  resolvedTradeCount: number;
+  executionDiagnosticCount: number;
+}
+
+interface PersistedLearningCycleArtifact {
+  cycleId: string;
+  startedAt: string;
+  completedAt: string | null;
+  status: LearningCycleStatus;
+  analyzedWindow: {
+    from: string;
+    to: string;
+  };
+  sampleSourceSummary: LearningCycleSampleSourceSummary;
+  reviewOutputKeys: string[];
+  eventLogPath: string;
+  learningStatePath: string;
+  resolvedTradeLedgerPath: string;
+  summary: LearningCycleSummary;
+  recordedAt: string;
+}
 
 export class DailyReviewJob {
   private readonly logger = new AppLogger('DailyReviewJob');
@@ -85,9 +122,12 @@ export class DailyReviewJob {
   private readonly tradeQualityHistoryStore: TradeQualityHistoryStore;
   private readonly regimeProfitabilityRanker = new RegimeProfitabilityRanker();
   private readonly capitalGrowthMetricsCalculator = new CapitalGrowthMetricsCalculator();
+  private readonly liveTrustScore = new LiveTrustScore();
   private readonly championChallengerManager = new ChampionChallengerManager();
   private readonly shadowEvaluationEngine = new ShadowEvaluationEngine();
   private readonly capitalGrowthPromotionGate = new CapitalGrowthPromotionGate();
+  private readonly livePromotionGate = new LivePromotionGate();
+  private readonly liveDemotionGate = new LiveDemotionGate();
   private readonly promotionStabilityCheck = new PromotionStabilityCheck();
   private readonly promotionDecisionEngine = new PromotionDecisionEngine();
   private readonly quarantinePolicy = new StrategyQuarantinePolicy();
@@ -97,11 +137,15 @@ export class DailyReviewJob {
   private readonly venueHealthLearningStore: VenueHealthLearningStore;
   private readonly capitalLeakReviewJob: CapitalLeakReviewJob;
   private readonly capitalGrowthReviewJob: CapitalGrowthReviewJob;
+  private readonly resolvedTradeLedger: ResolvedTradeLedger;
   private readonly venueUncertaintyDetector = new VenueUncertaintyDetector();
   private readonly venueModePolicy = new VenueModePolicy();
   private readonly liveSizingFeedbackPolicy = new LiveSizingFeedbackPolicy();
   private readonly benchmarkRelativeSizing = new BenchmarkRelativeSizing();
   private readonly toxicityTrend = new ToxicityTrend();
+  private readonly cycleArtifactDir: string;
+  private readonly latestCycleArtifactPath: string;
+  private activeRun: Promise<LearningCycleSummary> | null = null;
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -110,6 +154,7 @@ export class DailyReviewJob {
     strategyDeploymentRegistry?: StrategyDeploymentRegistry,
     versionLineageRegistry?: VersionLineageRegistry,
     venueHealthLearningStore?: VenueHealthLearningStore,
+    resolvedTradeLedger?: ResolvedTradeLedger,
   ) {
     this.learningStateStore = learningStateStore ?? new LearningStateStore();
     this.learningEventLog = learningEventLog ?? new LearningEventLog();
@@ -122,6 +167,14 @@ export class DailyReviewJob {
     this.tradeQualityHistoryStore = new TradeQualityHistoryStore(
       path.join(this.learningStateStore.getPaths().rootDir, 'trade-quality'),
     );
+    this.cycleArtifactDir = path.join(
+      this.learningStateStore.getPaths().rootDir,
+      'learning-cycles',
+    );
+    this.latestCycleArtifactPath = path.join(this.cycleArtifactDir, 'latest.json');
+    this.resolvedTradeLedger =
+      resolvedTradeLedger ??
+      new ResolvedTradeLedger(this.learningStateStore.getPaths().rootDir);
     this.capitalLeakReviewJob = new CapitalLeakReviewJob(
       prisma,
       this.learningStateStore,
@@ -154,6 +207,24 @@ export class DailyReviewJob {
   }
 
   async run(options?: {
+    now?: Date;
+    force?: boolean;
+    priorState?: Awaited<ReturnType<LearningStateStore['load']>>;
+  }): Promise<LearningCycleSummary> {
+    if (this.activeRun) {
+      return this.activeRun;
+    }
+
+    const runPromise = this.runInternal(options).finally(() => {
+      if (this.activeRun === runPromise) {
+        this.activeRun = null;
+      }
+    });
+    this.activeRun = runPromise;
+    return runPromise;
+  }
+
+  private async runInternal(options?: {
     now?: Date;
     force?: boolean;
     priorState?: Awaited<ReturnType<LearningStateStore['load']>>;
@@ -209,9 +280,20 @@ export class DailyReviewJob {
         },
       },
     ]);
+    await this.writeLearningCycleAuditEvent({
+      eventType: 'learning.cycle_started',
+      message: 'Daily learning cycle started.',
+      metadata: {
+        cycleId,
+        analyzedWindow: {
+          from: window.from.toISOString(),
+          to: window.to.toISOString(),
+        },
+      },
+    });
 
     try {
-      const samples = await this.loadRealizedOutcomeSamples(window.from, window.to);
+      const sampleLoadResult = await this.loadRealizedOutcomeSamples(window.from, window.to);
       const completedAt = new Date();
       const result = await this.runner.run({
         cycleId,
@@ -219,7 +301,7 @@ export class DailyReviewJob {
         completedAt,
         analyzedWindow: window,
         priorState: startedState,
-        samples,
+        samples: sampleLoadResult.samples,
       });
       const executionLearning = await this.runWaveThreeExecutionLearning({
         cycleId,
@@ -252,12 +334,19 @@ export class DailyReviewJob {
         to: window.to,
         learningState: portfolioLearning.learningState,
       });
+      const dailyDecisionQualityReview =
+        await this.runPhaseEightDailyDecisionQualityReview({
+          now: completedAt,
+          from: window.from,
+          to: window.to,
+        });
       const capitalGrowthReview = await this.capitalGrowthReviewJob.run({
         now: completedAt,
         from: window.from,
         to: window.to,
         learningState: portfolioLearning.learningState,
         capitalLeakReport: capitalLeakReview.report,
+        dailyDecisionQualityReport: dailyDecisionQualityReview.report,
       });
       const baselineBenchmarkReview = await this.runPhaseFiveBaselineBenchmarkReview({
         now: completedAt,
@@ -322,6 +411,7 @@ export class DailyReviewJob {
           ...portfolioLearning.warnings,
           ...venueLearning.warnings,
           ...capitalLeakReview.warnings,
+          ...dailyDecisionQualityReview.warnings,
           ...capitalGrowthReview.warnings,
           ...baselineBenchmarkReview.warnings,
           ...benchmarkRelativeSizingReview.warnings,
@@ -342,6 +432,7 @@ export class DailyReviewJob {
           regimeLocalSizing: regimeLocalSizingReview.summary,
           lossAttribution: lossAttributionReview.summary,
           toxicity: toxicityReview.summary,
+          dailyDecisionQuality: dailyDecisionQualityReview.summary,
           baselineBenchmarks: capitalGrowthReview.report.baselineComparison,
           benchmarkRelativeSizing: benchmarkRelativeSizingReview.summary,
           rollingBenchmarkScorecard: rollingBenchmarkScorecardReview.summary,
@@ -366,6 +457,21 @@ export class DailyReviewJob {
         ...governed.events,
         ...portfolioLearning.events,
       ]);
+      const artifact = this.buildLearningCycleArtifact({
+        summary,
+        sampleSourceSummary: sampleLoadResult.sampleSourceSummary,
+      });
+      const artifactPath = await this.persistLearningCycleArtifact(artifact);
+      await this.writeLearningCycleAuditEvent({
+        eventType: 'learning.cycle_completed',
+        message: 'Daily learning cycle completed.',
+        metadata: {
+          cycleId,
+          status: summary.status,
+          sampleSourceSummary: sampleLoadResult.sampleSourceSummary,
+          artifactPath,
+        },
+      });
 
       this.logger.log('Daily learning cycle completed.', {
         cycleId,
@@ -417,6 +523,26 @@ export class DailyReviewJob {
           },
         },
       ]);
+      const failureSummary = summary;
+      const artifact = this.buildLearningCycleArtifact({
+        summary: failureSummary,
+        sampleSourceSummary: {
+          sourceOfTruth: 'execution_diagnostic_fallback',
+          resolvedTradeCount: 0,
+          executionDiagnosticCount: 0,
+        },
+      });
+      const artifactPath = await this.persistLearningCycleArtifact(artifact);
+      await this.writeLearningCycleAuditEvent({
+        eventType: 'learning.cycle_failed',
+        message: 'Daily learning cycle failed.',
+        metadata: {
+          cycleId,
+          status: summary.status,
+          errors: summary.errors,
+          artifactPath,
+        },
+      });
 
       this.logger.error('Daily learning cycle failed.', undefined, {
         cycleId,
@@ -447,6 +573,11 @@ export class DailyReviewJob {
     const events: LearningEvent[] = [];
     const recentTradeQualityScores = await this.tradeQualityHistoryStore.readLatest(5_000);
     const latestCapitalLeakReport = await this.capitalLeakReviewJob.readLatestReport();
+    const evidenceWindowStart = new Date(input.now.getTime() - 30 * ONE_DAY_MS);
+    const resolvedTrades = await this.resolvedTradeLedger.loadWindow({
+      start: evidenceWindowStart,
+      end: input.now,
+    });
 
     const sync = this.championChallengerManager.sync({
       registry,
@@ -473,8 +604,64 @@ export class DailyReviewJob {
           variant.variantId !== registry.incumbentVariantId && variant.status !== 'retired',
       )
       .sort((left, right) => left.variantId.localeCompare(right.variantId));
+    const livePromotionGateDecisions = new Map<
+      string,
+      ReturnType<LivePromotionGate['evaluate']>
+    >();
+    const liveDemotionGateDecisions = new Map<
+      string,
+      ReturnType<LiveDemotionGate['evaluate']>
+    >();
+    const liveEvidencePackets = new Map<string, ReturnType<typeof this.buildLivePromotionPacket>>();
 
     for (const challenger of challengers) {
+      const packet = this.buildLivePromotionPacket({
+        strategyVariantId: challenger.variantId,
+        strategyVersionId: challenger.strategyVersionId,
+        learningState,
+        resolvedTrades,
+        evidenceWindowStart,
+        evidenceWindowEnd: input.now,
+      });
+      liveEvidencePackets.set(challenger.variantId, packet);
+      livePromotionGateDecisions.set(
+        challenger.variantId,
+        this.livePromotionGate.evaluate({
+          evidencePacket: packet,
+          now: input.now,
+        }),
+      );
+      liveDemotionGateDecisions.set(
+        challenger.variantId,
+        this.liveDemotionGate.evaluate({
+          evidencePacket: packet,
+          now: input.now,
+        }),
+      );
+    }
+
+    const liveCandidateFilters = new Map(
+      this.championChallengerManager
+        .filterPromotionCandidates({
+          registry,
+          liveGateDecisions: Object.fromEntries(
+            [...livePromotionGateDecisions.entries()].map(([variantId, decision]) => [
+              variantId,
+              {
+                passed: decision.passed,
+                reasonCodes: decision.reasonCodes,
+              },
+            ]),
+          ),
+        })
+        .map((decision) => [decision.variantId, decision]),
+    );
+
+    for (const challenger of challengers) {
+      const livePromotionGateDecision = livePromotionGateDecisions.get(challenger.variantId) ?? null;
+      const liveDemotionGateDecision = liveDemotionGateDecisions.get(challenger.variantId) ?? null;
+      const liveEvidencePacket = liveEvidencePackets.get(challenger.variantId) ?? null;
+      const liveCandidateFilter = liveCandidateFilters.get(challenger.variantId) ?? null;
       const shadowEvidence = this.shadowEvaluationEngine.evaluate({
         candidate: challenger,
         incumbent,
@@ -484,6 +671,12 @@ export class DailyReviewJob {
       registry.variants[challenger.variantId] = {
         ...challenger,
         lastShadowEvaluatedAt: input.now.toISOString(),
+        liveTrustScore: liveEvidencePacket?.liveTrustScoreSummary.trustScore ?? null,
+        evidenceWindowStart: liveEvidencePacket?.evidenceWindowStart ?? null,
+        evidenceWindowEnd: liveEvidencePacket?.evidenceWindowEnd ?? null,
+        promotionReasonCodes: livePromotionGateDecision?.reasonCodes ?? [],
+        demotionReasonCodes: liveDemotionGateDecision?.reasonCodes ?? [],
+        quarantineUntil: liveDemotionGateDecision?.quarantineUntil ?? challenger.quarantineUntil ?? null,
         updatedAt: input.now.toISOString(),
       };
       events.push({
@@ -502,6 +695,14 @@ export class DailyReviewJob {
         variant: challenger,
         evidence: shadowEvidence,
         learningState,
+        liveDemotionDecision:
+          liveDemotionGateDecision == null
+            ? undefined
+            : {
+                action: liveDemotionGateDecision.action,
+                reasonCodes: liveDemotionGateDecision.reasonCodes,
+                quarantineUntil: liveDemotionGateDecision.quarantineUntil,
+              },
         now: input.now,
       });
       learningState.strategyVariants[challenger.variantId] = {
@@ -620,8 +821,22 @@ export class DailyReviewJob {
             ? registry.activeRollout.stage
             : challenger.rolloutStage,
         economicControls,
+        liveControls: {
+          livePromotionGate: livePromotionGateDecision ?? undefined,
+          liveDemotionGate: liveDemotionGateDecision ?? undefined,
+          liveEvidencePacket:
+            liveEvidencePacket == null
+              ? undefined
+              : {
+                  ...liveEvidencePacket,
+                  capturedAt: input.now.toISOString(),
+                },
+        },
         now: input.now,
       });
+      if (liveCandidateFilter && !liveCandidateFilter.eligible) {
+        decision.reasons = [...new Set([...decision.reasons, ...liveCandidateFilter.reasonCodes])];
+      }
       learningState.strategyVariants[challenger.variantId] = {
         ...learningState.strategyVariants[challenger.variantId]!,
         lastPromotionDecision: {
@@ -718,6 +933,137 @@ export class DailyReviewJob {
       registry = rolloutMutation.registry;
       if (rolloutMutation.event) {
         events.push(rolloutMutation.event);
+      }
+    }
+
+    const refreshedIncumbent =
+      registry.incumbentVariantId == null ? null : registry.variants[registry.incumbentVariantId] ?? null;
+    if (refreshedIncumbent) {
+      const liveEvidencePacket = this.buildLivePromotionPacket({
+        strategyVariantId: refreshedIncumbent.variantId,
+        strategyVersionId: refreshedIncumbent.strategyVersionId,
+        learningState,
+        resolvedTrades,
+        evidenceWindowStart,
+        evidenceWindowEnd: input.now,
+      });
+      const livePromotionGateDecision = this.livePromotionGate.evaluate({
+        evidencePacket: liveEvidencePacket,
+        now: input.now,
+      });
+      const liveDemotionGateDecision = this.liveDemotionGate.evaluate({
+        evidencePacket: liveEvidencePacket,
+        now: input.now,
+      });
+      registry.variants[refreshedIncumbent.variantId] = {
+        ...refreshedIncumbent,
+        liveTrustScore: liveEvidencePacket.liveTrustScoreSummary.trustScore,
+        evidenceWindowStart: liveEvidencePacket.evidenceWindowStart,
+        evidenceWindowEnd: liveEvidencePacket.evidenceWindowEnd,
+        promotionReasonCodes: livePromotionGateDecision.reasonCodes,
+        demotionReasonCodes: liveDemotionGateDecision.reasonCodes,
+        quarantineUntil:
+          liveDemotionGateDecision.quarantineUntil ?? refreshedIncumbent.quarantineUntil ?? null,
+        updatedAt: input.now.toISOString(),
+      };
+
+      if (liveDemotionGateDecision.action !== 'none') {
+        const incumbentState =
+          learningState.strategyVariants[refreshedIncumbent.variantId] ??
+          createDefaultStrategyVariantState(refreshedIncumbent.variantId);
+        learningState.strategyVariants[refreshedIncumbent.variantId] = {
+          ...incumbentState,
+          lastPromotionDecision: {
+            decision: 'rollback',
+            reasons: [...liveDemotionGateDecision.reasonCodes],
+            evidence: {
+              livePromotionGate: livePromotionGateDecision,
+              liveDemotionGate: liveDemotionGateDecision,
+              liveEvidencePacket,
+            },
+            decidedAt: input.now.toISOString(),
+          },
+          lastQuarantineDecision: {
+            status:
+              liveDemotionGateDecision.action === 'quarantine' ? 'quarantined' : 'probation',
+            severity:
+              liveDemotionGateDecision.action === 'quarantine' ? 'high' : 'medium',
+            reasons: [...liveDemotionGateDecision.reasonCodes],
+            scope: {
+              strategyVariantId: refreshedIncumbent.variantId,
+            },
+            decidedAt: input.now.toISOString(),
+            until: liveDemotionGateDecision.quarantineUntil,
+          },
+        };
+        await this.versionLineageRegistry.recordDecision({
+          decisionId: `${input.cycleId}:demotion:${refreshedIncumbent.variantId}`,
+          decisionType: 'promotion',
+          recordedAt: input.now.toISOString(),
+          summary: `Live demotion decision ${liveDemotionGateDecision.action} for ${refreshedIncumbent.variantId}.`,
+          strategyVariantId: refreshedIncumbent.variantId,
+          cycleId: input.cycleId,
+          lineage: {
+            strategyVersion: buildStrategyVersionLineage({
+              strategyVersionId: refreshedIncumbent.strategyVersionId,
+              strategyVariantId: refreshedIncumbent.variantId,
+            }),
+            featureSetVersion: null,
+            calibrationVersion: buildCalibrationVersionLineage(
+              findCalibrationForVariantState(learningState, refreshedIncumbent.variantId),
+            ),
+            executionPolicyVersion: buildExecutionPolicyVersionLineage(
+              findExecutionPolicyVersionForVariant(learningState, refreshedIncumbent.variantId),
+            ),
+            riskPolicyVersion: buildRiskPolicyVersionLineage({
+              policyId: 'live-demotion-gate',
+              parameters: {
+                livePromotionGateDecision,
+                liveDemotionGateDecision,
+                liveEvidencePacket,
+              },
+            }),
+            allocationPolicyVersion: null,
+          },
+          replay: {
+            marketState: null,
+            runtimeState: {
+              cycleId: input.cycleId,
+            },
+            learningState: {
+              liveEvidencePacket,
+              livePromotionGateDecision,
+              liveDemotionGateDecision,
+            },
+            lineageState: {
+              incumbentVariantId: registry.incumbentVariantId,
+              activeRollout: registry.activeRollout,
+            },
+            activeParameterBundle: {
+              liveEvidencePacket,
+              livePromotionGateDecision,
+              liveDemotionGateDecision,
+            },
+            venueMode: null,
+            venueUncertainty: null,
+          },
+          tags: ['phase6', 'demotion', liveDemotionGateDecision.action],
+        });
+        const mutation = this.rolloutController.applyLiveDemotionDecision({
+          registry,
+          variantId: refreshedIncumbent.variantId,
+          decision: {
+            action: liveDemotionGateDecision.action,
+            reasonCodes: liveDemotionGateDecision.reasonCodes,
+            quarantineUntil: liveDemotionGateDecision.quarantineUntil,
+          },
+          cycleId: input.cycleId,
+          now: input.now,
+        });
+        registry = mutation.registry;
+        if (mutation.event) {
+          events.push(mutation.event);
+        }
       }
     }
 
@@ -916,6 +1262,115 @@ export class DailyReviewJob {
       stabilityAdjustedCapitalGrowthScore:
         metrics.stabilityAdjustedCapitalGrowthScore,
       compoundingEfficiencyScore: metrics.compoundingEfficiency.score,
+    };
+  }
+
+  private buildLivePromotionPacket(input: {
+    strategyVariantId: string;
+    strategyVersionId: string;
+    learningState: LearningState;
+    resolvedTrades: ResolvedTradeRecord[];
+    evidenceWindowStart: Date;
+    evidenceWindowEnd: Date;
+  }) {
+    const variantState =
+      input.learningState.strategyVariants[input.strategyVariantId] ??
+      createDefaultStrategyVariantState(input.strategyVariantId);
+    const variantTrades = input.resolvedTrades.filter((trade) => {
+      return (
+        trade.strategyVariantId === input.strategyVariantId ||
+        trade.strategyVersion === input.strategyVersionId
+      );
+    });
+    const liveTrustScoreSummary = this.liveTrustScore.evaluate({
+      strategyVariantId: input.strategyVariantId,
+      regime: null,
+      resolvedTrades: variantTrades,
+    });
+    return buildLivePromotionEvidencePacket({
+      strategyVariantId: input.strategyVariantId,
+      evidenceWindowStart: input.evidenceWindowStart.toISOString(),
+      evidenceWindowEnd: input.evidenceWindowEnd.toISOString(),
+      resolvedTrades: variantTrades,
+      liveTrustScoreSummary: {
+        trustScore: liveTrustScoreSummary.trustScore,
+        sampleCount: liveTrustScoreSummary.sampleCount,
+        componentBreakdown: liveTrustScoreSummary.componentBreakdown,
+        reasonCodes: liveTrustScoreSummary.reasonCodes,
+      },
+      regimeSnapshots: Object.values(variantState.regimeSnapshots).map((snapshot) => ({
+        regime: snapshot.regime,
+        health: snapshot.health,
+        realizedVsExpected: snapshot.realizedVsExpected,
+      })),
+      now: input.evidenceWindowEnd,
+    });
+  }
+
+  private async runPhaseEightDailyDecisionQualityReview(input: {
+    now: Date;
+    from: Date;
+    to: Date;
+  }): Promise<{
+    report: ReturnType<typeof buildDailyDecisionQualityReport>;
+    warnings: string[];
+    summary: Record<string, unknown>;
+  }> {
+    const resolvedTrades = await this.resolvedTradeLedger.loadWindow({
+      start: input.from,
+      end: input.to,
+    });
+    const rejectedDecisions = await this.loadRejectedDecisionQualityEvidence(
+      input.from,
+      input.to,
+    );
+    const report = buildDailyDecisionQualityReport({
+      from: input.from,
+      to: input.to,
+      resolvedTrades,
+      rejectedDecisions,
+      now: input.now,
+    });
+    await persistDailyDecisionQualityReport(
+      report,
+      this.learningStateStore.getPaths().rootDir,
+    );
+
+    const summary = {
+      generatedAt: report.generatedAt,
+      overall: report.overall,
+      summary: report.summary,
+      byDay: report.byDay.slice(-7),
+      weakestRegimes: [...report.byRegime]
+        .sort((left, right) => left.netPnlAfterFees - right.netPnlAfterFees)
+        .slice(0, 5),
+    };
+    const warnings: string[] = [];
+    if (report.summary.negativeNetDayCount > report.summary.positiveNetDayCount) {
+      warnings.push('daily_decision_quality_negative_days_dominant');
+    }
+    if (
+      report.overall.realizedVsExpectedGapBps != null &&
+      report.overall.realizedVsExpectedGapBps < -50
+    ) {
+      warnings.push('daily_decision_quality_realized_gap_negative');
+    }
+
+    const prismaAny = this.prisma as any;
+    if (prismaAny.auditEvent?.create) {
+      await prismaAny.auditEvent.create({
+        data: {
+          eventType: 'learning.daily_decision_quality_review',
+          message: 'Daily decision-quality report generated.',
+          metadata: summary as object,
+        },
+      });
+    }
+
+    return {
+      report,
+      warnings,
+      summary,
     };
   }
 
@@ -1276,8 +1731,169 @@ export class DailyReviewJob {
   private async loadRealizedOutcomeSamples(
     from: Date,
     to: Date,
+  ): Promise<{
+    samples: LearningCycleSample[];
+    sampleSourceSummary: LearningCycleSampleSourceSummary;
+  }> {
+    const resolvedTrades = await this.resolvedTradeLedger.loadWindow({
+      start: from,
+      end: to,
+    });
+    if (resolvedTrades.length > 0) {
+      return {
+        samples: await this.buildLearningCycleSamplesFromResolvedTrades(resolvedTrades),
+        sampleSourceSummary: {
+          sourceOfTruth: 'resolved_trade_ledger',
+          resolvedTradeCount: resolvedTrades.length,
+          executionDiagnosticCount: 0,
+        },
+      };
+    }
+
+    const fallbackSamples = await this.loadLegacyDiagnosticSamples(from, to);
+    return {
+      samples: fallbackSamples,
+      sampleSourceSummary: {
+        sourceOfTruth: 'execution_diagnostic_fallback',
+        resolvedTradeCount: 0,
+        executionDiagnosticCount: fallbackSamples.length,
+      },
+    };
+  }
+
+  private async buildLearningCycleSamplesFromResolvedTrades(
+    resolvedTrades: ResolvedTradeRecord[],
   ): Promise<LearningCycleSample[]> {
     const prismaAny = this.prisma as any;
+    const orderIds = resolvedTrades.map((trade) => trade.orderId);
+    const diagnostics =
+      orderIds.length > 0 && prismaAny.executionDiagnostic?.findMany
+        ? (((await prismaAny.executionDiagnostic.findMany({
+            where: {
+              orderId: {
+                in: orderIds,
+              },
+            },
+            orderBy: {
+              capturedAt: 'asc',
+            },
+          })) as Array<Record<string, unknown>>) ?? [])
+        : [];
+    const latestDiagnosticByOrderId = new Map<string, Record<string, unknown>>();
+    for (const diagnostic of diagnostics) {
+      const orderId = readString(diagnostic.orderId);
+      if (orderId) {
+        latestDiagnosticByOrderId.set(orderId, diagnostic);
+      }
+    }
+
+    const orders = orderIds.length && prismaAny.order?.findMany
+      ? ((await prismaAny.order.findMany({
+          where: {
+            id: {
+              in: orderIds,
+            },
+          },
+          include: {
+            signal: true,
+            market: true,
+          },
+        })) as Array<Record<string, unknown>>)
+      : [];
+    const orderById = new Map(
+      orders.map((order) => [readString(order.id) ?? '', order]),
+    );
+
+    const samples: LearningCycleSample[] = [];
+    for (const trade of resolvedTrades) {
+      const order = orderById.get(trade.orderId) ?? null;
+      const signal =
+        order?.signal && typeof order.signal === 'object'
+          ? (order.signal as Record<string, unknown>)
+          : null;
+      const market =
+        order?.market && typeof order.market === 'object'
+          ? (order.market as Record<string, unknown>)
+          : null;
+      const diagnostic = latestDiagnosticByOrderId.get(trade.orderId) ?? null;
+      const observedAt =
+        trade.decisionTimestamp ??
+        trade.submissionTimestamp ??
+        trade.firstFillTimestamp ??
+        trade.finalizedTimestamp;
+      const orderbook =
+        trade.marketId && trade.tokenId && prismaAny.orderbook?.findFirst
+          ? ((await prismaAny.orderbook.findFirst({
+              where: {
+                marketId: trade.marketId,
+                tokenId: trade.tokenId,
+                observedAt: {
+                  lte: new Date(observedAt),
+                },
+              },
+              orderBy: {
+                observedAt: 'desc',
+              },
+            })) as Record<string, unknown> | null)
+          : null;
+      const signalObservedAt = readDate(signal?.observedAt);
+      const expiryAt = readDate(market?.expiresAt);
+      const acknowledgedAt =
+        readDate(order?.acknowledgedAt) ??
+        readDate(order?.createdAt) ??
+        readDate(trade.submissionTimestamp);
+      const timeToExpirySeconds =
+        signalObservedAt && expiryAt
+          ? Math.max(0, Math.floor((expiryAt.getTime() - signalObservedAt.getTime()) / 1000))
+          : null;
+      const entryDelayMs =
+        signalObservedAt && acknowledgedAt
+          ? Math.max(0, acknowledgedAt.getTime() - signalObservedAt.getTime())
+          : null;
+      samples.push({
+        strategyVariantId:
+          trade.strategyVariantId ??
+          (trade.strategyVersion ? buildStrategyVariantId(trade.strategyVersion) : 'unknown_strategy_variant'),
+        regime: trade.regime ?? readString(diagnostic?.regime) ?? readString(signal?.regime) ?? 'unknown_regime',
+        side: mapSide(trade.side),
+        expectedEv:
+          bpsToEv(trade.expectedNetEdgeBps) ??
+          readNumber(diagnostic?.expectedEv, null) ??
+          readNumber(signal?.expectedEv, null) ??
+          0,
+        realizedEv:
+          bpsToEv(trade.realizedNetEdgeBps) ??
+          readNumber(diagnostic?.realizedEv, null) ??
+          0,
+        fillRate: clampRatio(readNumber(trade.fillFraction, null)),
+        realizedSlippage:
+          bpsToEv(trade.realizedSlippageBps) ??
+          readNumber(diagnostic?.realizedSlippage, null),
+        liquidityDepth: extractTopDepth(orderbook, mapSide(trade.side)),
+        spread: readNumber(orderbook?.spread, null),
+        timeToExpirySeconds,
+        entryDelayMs,
+        executionStyle: inferExecutionStyle(diagnostic ?? {}, order),
+        observedAt,
+        predictedProbability: readNumber(signal?.posteriorProbability, null) ?? 0.5,
+        realizedOutcome:
+          coalesceRealizedOutcome(trade, diagnostic) ??
+          0,
+      });
+    }
+
+    return samples;
+  }
+
+  private async loadLegacyDiagnosticSamples(
+    from: Date,
+    to: Date,
+  ): Promise<LearningCycleSample[]> {
+    const prismaAny = this.prisma as any;
+    if (!prismaAny.executionDiagnostic?.findMany) {
+      return [];
+    }
+
     const diagnostics = (await prismaAny.executionDiagnostic.findMany({
       where: {
         capturedAt: {
@@ -1393,6 +2009,69 @@ export class DailyReviewJob {
     }
 
     return samples;
+  }
+
+  private buildLearningCycleArtifact(input: {
+    summary: LearningCycleSummary;
+    sampleSourceSummary: LearningCycleSampleSourceSummary;
+  }): PersistedLearningCycleArtifact {
+    return {
+      cycleId: input.summary.cycleId,
+      startedAt: input.summary.startedAt,
+      completedAt: input.summary.completedAt,
+      status: input.summary.status,
+      analyzedWindow: input.summary.analyzedWindow,
+      sampleSourceSummary: input.sampleSourceSummary,
+      reviewOutputKeys: Object.keys(input.summary.reviewOutputs ?? {}).sort(),
+      eventLogPath: this.learningEventLog.getPath(),
+      learningStatePath: this.learningStateStore.getPaths().statePath,
+      resolvedTradeLedgerPath: this.resolvedTradeLedger.getPath(),
+      summary: input.summary,
+      recordedAt: new Date().toISOString(),
+    };
+  }
+
+  private async persistLearningCycleArtifact(
+    artifact: PersistedLearningCycleArtifact,
+  ): Promise<string> {
+    await fs.mkdir(this.cycleArtifactDir, { recursive: true });
+    const artifactPath = path.join(this.cycleArtifactDir, `${artifact.cycleId}.json`);
+    const latestTmpPath = `${this.latestCycleArtifactPath}.tmp`;
+    const artifactTmpPath = `${artifactPath}.tmp`;
+    const serialized = `${JSON.stringify(artifact, null, 2)}\n`;
+
+    try {
+      await fs.writeFile(artifactTmpPath, serialized, 'utf8');
+      await fs.rename(artifactTmpPath, artifactPath);
+      await fs.writeFile(latestTmpPath, serialized, 'utf8');
+      await fs.rename(latestTmpPath, this.latestCycleArtifactPath);
+      return artifactPath;
+    } catch (error) {
+      await Promise.all([
+        safeUnlinkIfPresent(artifactTmpPath),
+        safeUnlinkIfPresent(latestTmpPath),
+      ]);
+      throw error;
+    }
+  }
+
+  private async writeLearningCycleAuditEvent(input: {
+    eventType: string;
+    message: string;
+    metadata: Record<string, unknown>;
+  }): Promise<void> {
+    const prismaAny = this.prisma as any;
+    if (!prismaAny.auditEvent?.create) {
+      return;
+    }
+
+    await prismaAny.auditEvent.create({
+      data: {
+        eventType: input.eventType,
+        message: input.message,
+        metadata: input.metadata as object,
+      },
+    });
   }
 
   private async loadExecutionLearningObservations(
@@ -2745,6 +3424,70 @@ export class DailyReviewJob {
     };
   }
 
+  private async loadRejectedDecisionQualityEvidence(
+    from: Date,
+    to: Date,
+  ): Promise<DailyDecisionQualityRejectedDecision[]> {
+    const prismaAny = this.prisma as any;
+    if (!prismaAny.auditEvent?.findMany) {
+      return [];
+    }
+
+    const events = (await prismaAny.auditEvent.findMany({
+      where: {
+        eventType: 'signal.execution_decision',
+        createdAt: {
+          gte: from,
+          lte: to,
+        },
+      },
+      orderBy: {
+        createdAt: 'asc',
+      },
+    })) as Array<Record<string, unknown>>;
+
+    return events
+      .map((event) => {
+        const metadata =
+          event.metadata && typeof event.metadata === 'object'
+            ? (event.metadata as Record<string, unknown>)
+            : {};
+        const admissionDecision =
+          metadata.admissionDecision && typeof metadata.admissionDecision === 'object'
+            ? (metadata.admissionDecision as Record<string, unknown>)
+            : null;
+        const finalGateDecision =
+          metadata.finalGateDecision && typeof metadata.finalGateDecision === 'object'
+            ? (metadata.finalGateDecision as Record<string, unknown>)
+            : null;
+        const admitted =
+          readBooleanRecordField(admissionDecision, 'admitted') ??
+          readBooleanRecordField(finalGateDecision, 'admitted') ??
+          false;
+        if (admitted) {
+          return null;
+        }
+        const reasons = [
+          ...readStringArrayRecordField(metadata, 'reasons'),
+          ...readStringArrayRecordField(metadata, 'noTradeReasonCodes'),
+          ...readStringArrayRecordField(admissionDecision, 'rejectionReasons'),
+          ...readStringArrayRecordField(finalGateDecision, 'rejectionReasons'),
+        ];
+        return {
+          timestamp: readDateStringField(event, 'createdAt') ?? to.toISOString(),
+          regime:
+            readStringRecordField(metadata, 'regimeLabel') ??
+            readNestedString(metadata, ['noTradeDecision', 'conditions', 'regimeLabel']) ??
+            null,
+          reasonCodes: Array.from(new Set(reasons.filter((value) => value.length > 0))),
+        };
+      })
+      .filter(
+        (value): value is DailyDecisionQualityRejectedDecision =>
+          value != null && value.reasonCodes.length > 0,
+      );
+  }
+
   private async runItemSevenBenchmarkRelativeSizingReview(input: {
     now: Date;
     baselineComparison: Awaited<ReturnType<CapitalGrowthReviewJob['run']>>['report']['baselineComparison'];
@@ -3466,6 +4209,64 @@ function readMetadata(value: unknown): Record<string, unknown> {
     : {};
 }
 
+function readStringRecordField(
+  value: Record<string, unknown> | null,
+  field: string,
+): string | null {
+  if (!value) {
+    return null;
+  }
+  return readString(value[field]);
+}
+
+function readBooleanRecordField(
+  value: Record<string, unknown> | null,
+  field: string,
+): boolean | null {
+  if (!value) {
+    return null;
+  }
+  return readBoolean(value[field]);
+}
+
+function readStringArrayRecordField(
+  value: Record<string, unknown> | null,
+  field: string,
+): string[] {
+  if (!value) {
+    return [];
+  }
+  const raw = value[field];
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0);
+}
+
+function readDateStringField(
+  value: Record<string, unknown> | null,
+  field: string,
+): string | null {
+  if (!value) {
+    return null;
+  }
+  return readDateString(value[field]);
+}
+
+function readNestedString(
+  value: Record<string, unknown> | null,
+  path: string[],
+): string | null {
+  let current: unknown = value;
+  for (const segment of path) {
+    if (!current || typeof current !== 'object') {
+      return null;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return readString(current);
+}
+
 function sanitizeReviewLabel(value: string): string {
   return value.replace(/[^a-zA-Z0-9_:-]+/g, '-');
 }
@@ -3501,6 +4302,41 @@ function readDateString(value: unknown): string | null {
 
 function inputToIsoString(value: Date): string {
   return value.toISOString();
+}
+
+function bpsToEv(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value / 10_000 : null;
+}
+
+function coalesceRealizedOutcome(
+  trade: ResolvedTradeRecord,
+  diagnostic: Record<string, unknown> | null,
+): number | null {
+  if (trade.netOutcome.realizedPnl != null && Number.isFinite(trade.netOutcome.realizedPnl)) {
+    return trade.netOutcome.realizedPnl > 0 ? 1 : 0;
+  }
+  if (trade.realizedNetEdgeBps != null && Number.isFinite(trade.realizedNetEdgeBps)) {
+    return trade.realizedNetEdgeBps > 0 ? 1 : 0;
+  }
+  const diagnosticRealizedEv = readNumber(diagnostic?.realizedEv, null);
+  if (diagnosticRealizedEv != null) {
+    return diagnosticRealizedEv > 0 ? 1 : 0;
+  }
+  return null;
+}
+
+async function safeUnlinkIfPresent(target: string): Promise<void> {
+  try {
+    await fs.unlink(target);
+  } catch (error) {
+    const code =
+      error && typeof error === 'object' && 'code' in error
+        ? String((error as { code?: unknown }).code)
+        : undefined;
+    if (code !== 'ENOENT') {
+      throw error;
+    }
+  }
 }
 
 function selectLatestDiagnosticsByOrder(

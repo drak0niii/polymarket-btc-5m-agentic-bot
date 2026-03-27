@@ -143,6 +143,7 @@ import { ReplayEngine } from '../runtime/replay-engine';
 import { DailyReviewJob } from '../jobs/dailyReview.job';
 import { LearningEventLog } from '../runtime/learning-event-log';
 import { LearningStateStore } from '../runtime/learning-state-store';
+import { ResolvedTradeLedger } from '../runtime/resolved-trade-ledger';
 import { StrategyDeploymentRegistry } from '../runtime/strategy-deployment-registry';
 import {
   buildStrategyVariantId,
@@ -150,6 +151,7 @@ import {
   createDefaultExecutionLearningState,
   createDefaultStrategyVariantState,
   createDefaultStrategyDeploymentRegistryState,
+  type ResolvedTradeRecord,
   type TradeQualityLabel,
   type TradeQualityScore,
 } from '@polymarket-btc-5m-agentic-bot/domain';
@@ -168,12 +170,30 @@ import { waveFiveLearningCycleIntegrationTests } from './learning-cycle.integrat
 import { waveFiveQuarantineIntegrationTests } from './quarantine-policy.integration.test';
 import { waveFiveVersionLineageIntegrationTests } from './version-lineage.integration.test';
 import { phaseOneAlphaAttributionTests } from './alpha-attribution.integration.test';
+import { phaseOneResolvedTradeLedgerTests } from './resolved-trade-ledger.integration.test';
+import { phaseTwoNetEdgeTruthPathTests } from './net-edge-truth-path.integration.test';
+import { phaseTenNetEdgeRealismTests } from './net-edge-realism.integration.test';
+import { phaseThreeFillRealismTests } from './fill-realism.integration.test';
+import { phaseTenFillRealismFeedbackTests } from './fill-realism-feedback.integration.test';
 import { phaseTwoFeatureEnrichmentTests } from './phase2-feature-enrichment.integration.test';
 import { phaseThreeToxicityTests } from './phase3-toxicity.integration.test';
+import { phaseFourNoTradeAuthorityTests } from './no-trade-classifier.integration.test';
 import { phaseFourLiveSizingFeedbackTests } from './phase4-live-sizing-feedback.integration.test';
 import { phaseFiveBaselineBenchmarkingTests } from './phase5-baseline-benchmarking.integration.test';
+import { phaseFiveEvidenceWeightedSizingTests } from './evidence-weighted-sizing.integration.test';
+import { phaseTenEvidenceQualitySizingTests } from './evidence-quality-sizing.integration.test';
+import { phaseSixPromotionGovernanceTests } from './live-promotion-governance.integration.test';
+import { phaseTenLivePromotionGateTests } from './live-promotion-gate.integration.test';
 import { phaseSixLiveProofTests } from './phase6-live-proof.integration.test';
 import { phaseSevenLivePathWiringTests } from './phase7-live-path-wiring.integration.test';
+import { phaseSevenExecutionStateHardeningTests } from './execution-state-hardening.integration.test';
+import { phaseTenExecutionWatchdogTests } from './execution-watchdog.integration.test';
+import { phaseEightDailyDecisionQualityTests } from './daily-decision-quality.integration.test';
+import { phaseNineReadinessEnforcementTests } from './phase9-readiness-enforcement.integration.test';
+import { phaseElevenLearningStateTypeTests } from './phase11-learning-state-types.integration.test';
+import { phaseElevenLearningEventLogTests } from './phase11-learning-event-log.integration.test';
+import { phaseElevenLearningCycleJobTests } from './phase11-learning-cycle-job.integration.test';
+import { phaseElevenLearningCycleRunnerTests } from './phase11-learning-cycle-runner.integration.test';
 import { itemOneLossAttributionClassifierTests } from './loss-attribution-classifier.integration.test';
 import { itemTwoRetentionContextTests } from './retention-context-report.integration.test';
 import { itemTwelveCalibrationDriftAlertTests } from './calibration-drift-alerts.integration.test';
@@ -8779,33 +8799,57 @@ async function testManageOpenOrdersSurfacesCancelFailure(): Promise<void> {
 
 async function testReconcileFillsCreatesExecutionDiagnosticSnapshot(): Promise<void> {
   let diagnosticCreateCalls = 0;
+  const fills: Array<Record<string, unknown>> = [];
 
   const prisma = {
     fill: {
       findUnique: async () => null,
-      create: async () => null,
+      create: async ({ data }: { data: Record<string, unknown> }) => {
+        fills.push(data);
+        return null;
+      },
+      findMany: async () => fills,
     },
     order: {
       findFirst: async () => ({
         id: 'o1',
+        venueOrderId: 'venue-o1',
         marketId: 'm1',
         tokenId: 'yes1',
+        signalId: 's1',
         strategyVersionId: 'sv1',
         side: 'BUY',
         size: 10,
         price: 0.5,
         expectedEv: 0.08,
         filledSize: 0,
+        remainingSize: 10,
         avgFillPrice: null,
+        lastVenueStatus: null,
+        lastVenueSyncAt: null,
+        createdAt: new Date('2026-03-27T10:00:00.000Z'),
+        postedAt: new Date('2026-03-27T10:00:05.000Z'),
         acknowledgedAt: null,
       }),
       findMany: async () => [],
       update: async () => null,
     },
+    signal: {
+      findUnique: async () => ({
+        id: 's1',
+        regime: 'balanced_rotation',
+        observedAt: new Date('2026-03-27T09:59:50.000Z'),
+        createdAt: new Date('2026-03-27T09:59:55.000Z'),
+      }),
+    },
     executionDiagnostic: {
       create: async () => {
         diagnosticCreateCalls += 1;
       },
+    },
+    auditEvent: {
+      findFirst: async () => null,
+      create: async () => null,
     },
   };
 
@@ -9564,11 +9608,12 @@ async function testDailyReviewUpdatesExecutionLearningAndVersionsPolicy(): Promi
   );
 }
 
-async function testDailyReviewRegistersChallengerAndStartsCanary(): Promise<void> {
+async function testDailyReviewRegistersChallengerAndStartsPaperFromLiveTruth(): Promise<void> {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'daily-review-wave2-'));
   const learningStateStore = new LearningStateStore(rootDir);
   const learningEventLog = new LearningEventLog(rootDir);
   const deploymentRegistry = new StrategyDeploymentRegistry(rootDir);
+  const resolvedTradeLedger = new ResolvedTradeLedger(rootDir);
   const state = createDefaultLearningState(new Date('2026-03-24T00:00:00.000Z'));
   state.strategyVariants['variant:strategy-live-1'] = {
     strategyVariantId: 'variant:strategy-live-1',
@@ -9735,6 +9780,30 @@ async function testDailyReviewRegistersChallengerAndStartsCanary(): Promise<void
     lastUpdatedAt: '2026-03-24T00:00:00.000Z',
   };
   await learningStateStore.save(state);
+  for (const record of buildGovernanceResolvedTrades({
+    count: 10,
+    strategyVariantId: 'variant:strategy-challenger-2',
+    strategyVersion: 'strategy-challenger-2',
+    regime: 'trend_burst',
+    realizedNetEdgeBps: 84,
+    expectedNetEdgeBps: 68,
+    benchmarkState: 'outperforming',
+    lifecycleState: 'economically_resolved_with_portfolio_truth',
+  })) {
+    await resolvedTradeLedger.append(record);
+  }
+  for (const record of buildGovernanceResolvedTrades({
+    count: 10,
+    strategyVariantId: 'variant:strategy-live-1',
+    strategyVersion: 'strategy-live-1',
+    regime: 'trend_burst',
+    realizedNetEdgeBps: 58,
+    expectedNetEdgeBps: 54,
+    benchmarkState: 'outperforming',
+    lifecycleState: 'economically_resolved_with_portfolio_truth',
+  })) {
+    await resolvedTradeLedger.append(record);
+  }
 
   const prisma = {
     strategyVersion: {
@@ -9771,6 +9840,9 @@ async function testDailyReviewRegistersChallengerAndStartsCanary(): Promise<void
     learningStateStore,
     learningEventLog,
     deploymentRegistry,
+    undefined,
+    undefined,
+    resolvedTradeLedger,
   );
   await job.run({
     force: true,
@@ -9783,11 +9855,7 @@ async function testDailyReviewRegistersChallengerAndStartsCanary(): Promise<void
     registryState.activeRollout?.challengerVariantId,
     'variant:strategy-challenger-2',
   );
-  assert.strictEqual(
-    registryState.activeRollout?.stage === 'canary_5pct' ||
-      registryState.activeRollout?.stage === 'canary_1pct',
-    true,
-  );
+  assert.strictEqual(registryState.activeRollout?.stage, 'paper');
 
   const events = await learningEventLog.readLatest(20);
   assert.strictEqual(
@@ -9798,6 +9866,105 @@ async function testDailyReviewRegistersChallengerAndStartsCanary(): Promise<void
     events.some((event) => event.type === 'strategy_rollout_changed'),
     true,
   );
+}
+
+function buildGovernanceResolvedTrades(input: {
+  count: number;
+  strategyVariantId: string;
+  strategyVersion: string;
+  regime: string;
+  realizedNetEdgeBps: number;
+  expectedNetEdgeBps: number;
+  benchmarkState: 'outperforming' | 'neutral' | 'underperforming' | 'context_missing';
+  lifecycleState:
+    | 'economically_resolved'
+    | 'economically_resolved_with_portfolio_truth';
+}): ResolvedTradeRecord[] {
+  return Array.from({ length: input.count }, (_, index) => {
+    const realizedNetEdgeBps = input.realizedNetEdgeBps - index;
+    return {
+      tradeId: `${input.strategyVariantId}:trade:${index + 1}`,
+      orderId: `${input.strategyVariantId}:order:${index + 1}`,
+      venueOrderId: `${input.strategyVariantId}:venue:${index + 1}`,
+      marketId: 'market-btc',
+      tokenId: 'token-up',
+      strategyVariantId: input.strategyVariantId,
+      strategyVersion: input.strategyVersion,
+      regime: input.regime,
+      archetype: 'trend_follow_through',
+      decisionTimestamp: new Date(Date.UTC(2026, 2, 20, 0, index)).toISOString(),
+      submissionTimestamp: new Date(Date.UTC(2026, 2, 20, 0, index, 1)).toISOString(),
+      firstFillTimestamp: new Date(Date.UTC(2026, 2, 20, 0, index, 2)).toISOString(),
+      finalizedTimestamp: new Date(Date.UTC(2026, 2, 20, 0, index, 10)).toISOString(),
+      side: 'BUY',
+      intendedPrice: 0.51,
+      averageFillPrice: 0.512,
+      size: 20,
+      notional: 10.24,
+      estimatedFeeAtDecision: 0.05,
+      realizedFee: 0.051,
+      estimatedSlippageBps: 14,
+      realizedSlippageBps: 16,
+      queueDelayMs: 4_000,
+      fillFraction: 1,
+      expectedNetEdgeBps: input.expectedNetEdgeBps,
+      realizedNetEdgeBps,
+      maxFavorableExcursionBps: 105,
+      maxAdverseExcursionBps: -22,
+      toxicityScoreAtDecision: 0.14,
+      benchmarkContext: {
+        benchmarkComparisonState: input.benchmarkState,
+        baselinePenaltyMultiplier: input.benchmarkState === 'outperforming' ? 1 : 0.8,
+        regimeBenchmarkGateState: input.benchmarkState === 'outperforming' ? 'passed' : 'blocked',
+        underperformedBenchmarkIds:
+          input.benchmarkState === 'underperforming' ? ['btc_follow_baseline'] : [],
+        outperformedBenchmarkIds:
+          input.benchmarkState === 'outperforming' ? ['btc_follow_baseline'] : [],
+        reasonCodes: ['fixture'],
+      },
+      lossAttributionCategory: 'mixed',
+      executionAttributionCategory: 'queue_decay',
+      lifecycleState: input.lifecycleState,
+      attribution: {
+        benchmarkContext: {
+          benchmarkComparisonState: input.benchmarkState,
+          baselinePenaltyMultiplier: input.benchmarkState === 'outperforming' ? 1 : 0.8,
+          regimeBenchmarkGateState:
+            input.benchmarkState === 'outperforming' ? 'passed' : 'blocked',
+          underperformedBenchmarkIds:
+            input.benchmarkState === 'underperforming' ? ['btc_follow_baseline'] : [],
+          outperformedBenchmarkIds:
+            input.benchmarkState === 'outperforming' ? ['btc_follow_baseline'] : [],
+          reasonCodes: ['fixture'],
+        },
+        lossAttributionCategory: 'mixed',
+        executionAttributionCategory: 'queue_decay',
+        primaryLeakageDriver: 'queue_delay',
+        secondaryLeakageDrivers: ['slippage'],
+        reasonCodes: ['fixture'],
+      },
+      executionQuality: {
+        intendedPrice: 0.51,
+        averageFillPrice: 0.512,
+        size: 20,
+        notional: 10.24,
+        estimatedFeeAtDecision: 0.05,
+        realizedFee: 0.051,
+        estimatedSlippageBps: 14,
+        realizedSlippageBps: 16,
+        queueDelayMs: 4_000,
+        fillFraction: 1,
+      },
+      netOutcome: {
+        expectedNetEdgeBps: input.expectedNetEdgeBps,
+        realizedNetEdgeBps,
+        maxFavorableExcursionBps: 105,
+        maxAdverseExcursionBps: -22,
+        realizedPnl: realizedNetEdgeBps / 100,
+      },
+      capturedAt: new Date(Date.UTC(2026, 2, 20, 0, index, 10)).toISOString(),
+    };
+  });
 }
 
 async function testEvaluateTradeOpportunitiesBlocksQuarantinedVariant(): Promise<void> {
@@ -10295,8 +10462,8 @@ async function run(): Promise<void> {
       fn: testDailyReviewUpdatesExecutionLearningAndVersionsPolicy,
     },
     {
-      name: 'daily review registers challenger and starts canary rollout',
-      fn: testDailyReviewRegistersChallengerAndStartsCanary,
+      name: 'daily review registers challenger and starts paper rollout from live truth',
+      fn: testDailyReviewRegistersChallengerAndStartsPaperFromLiveTruth,
     },
     {
       name: 'evaluate trade opportunities blocks quarantined variant',
@@ -10316,12 +10483,30 @@ async function run(): Promise<void> {
     ...waveFiveQuarantineIntegrationTests,
     ...waveFiveVersionLineageIntegrationTests,
     ...phaseOneAlphaAttributionTests,
+    ...phaseOneResolvedTradeLedgerTests,
+    ...phaseTwoNetEdgeTruthPathTests,
+    ...phaseTenNetEdgeRealismTests,
+    ...phaseThreeFillRealismTests,
+    ...phaseTenFillRealismFeedbackTests,
+    ...phaseFourNoTradeAuthorityTests,
     ...phaseTwoFeatureEnrichmentTests,
     ...phaseThreeToxicityTests,
     ...phaseFourLiveSizingFeedbackTests,
     ...phaseFiveBaselineBenchmarkingTests,
+    ...phaseFiveEvidenceWeightedSizingTests,
+    ...phaseTenEvidenceQualitySizingTests,
+    ...phaseSixPromotionGovernanceTests,
+    ...phaseTenLivePromotionGateTests,
     ...phaseSixLiveProofTests,
     ...phaseSevenLivePathWiringTests,
+    ...phaseSevenExecutionStateHardeningTests,
+    ...phaseTenExecutionWatchdogTests,
+    ...phaseEightDailyDecisionQualityTests,
+    ...phaseNineReadinessEnforcementTests,
+    ...phaseElevenLearningStateTypeTests,
+    ...phaseElevenLearningEventLogTests,
+    ...phaseElevenLearningCycleJobTests,
+    ...phaseElevenLearningCycleRunnerTests,
     ...itemOneLossAttributionClassifierTests,
     ...itemTwoRetentionContextTests,
     ...itemTwelveCalibrationDriftAlertTests,

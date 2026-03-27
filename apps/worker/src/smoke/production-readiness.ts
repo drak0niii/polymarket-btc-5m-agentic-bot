@@ -1,7 +1,10 @@
+import fs from 'fs/promises';
+import path from 'path';
 import { PrismaClient } from '@prisma/client';
 import { appEnv } from '@worker/config/env';
 import { ExternalPortfolioService } from '@worker/portfolio/external-portfolio.service';
 import { RuntimeControlRepository } from '@worker/runtime/runtime-control.repository';
+import { ExecutionStateWatchdog } from '@worker/runtime/execution-state-watchdog';
 import {
   buildCapitalExposureValidationReport,
   persistCapitalExposureValidationReport,
@@ -27,6 +30,15 @@ import {
   PolymarketSmokeResult,
   runPolymarketAuthenticatedSmoke,
 } from './polymarket-auth-smoke';
+import {
+  assessDeploymentTierEvidence,
+  getDeploymentTierEvidenceThresholds,
+} from '@worker/runtime/startup-runbook';
+import { readLatestDailyDecisionQualityReport } from '@worker/validation/daily-decision-quality-report';
+import { ResolvedTradeLedger } from '@worker/runtime/resolved-trade-ledger';
+import { StrategyDeploymentRegistry } from '@worker/runtime/strategy-deployment-registry';
+import { resolveRepositoryRoot } from '@worker/runtime/learning-state-store';
+import { LiveTrustScore } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 
 interface ActiveMarketRecord {
   id: string;
@@ -41,6 +53,11 @@ interface RuntimeControlLike {
     status: string;
     details?: Record<string, unknown>;
   }) => Promise<void>;
+  getLatestCheckpoint?: (source: string) => Promise<{
+    status: string;
+    processedAt: Date;
+    details: Record<string, unknown> | null;
+  } | null>;
 }
 
 interface PrismaLike {
@@ -101,6 +118,38 @@ export interface ProductionReadinessOptions {
   fetchImpl?: typeof fetch;
   executeAt?: string;
   connectPrisma?: boolean;
+  resolvedTradeLedger?: Pick<ResolvedTradeLedger, 'loadWindow' | 'getPath'>;
+  deploymentRegistry?: Pick<StrategyDeploymentRegistry, 'load'>;
+  artifactRootDir?: string;
+}
+
+export function getProductionReadinessArtifactPath(
+  rootDir = resolveRepositoryRoot(),
+): string {
+  return path.join(rootDir, 'artifacts/production-readiness/latest.json');
+}
+
+async function persistProductionReadinessArtifact(
+  result: ProductionReadinessResult,
+  rootDir = resolveRepositoryRoot(),
+): Promise<string> {
+  const latestPath = getProductionReadinessArtifactPath(rootDir);
+  const historyDir = path.join(rootDir, 'artifacts/production-readiness/history');
+  await fs.mkdir(historyDir, { recursive: true });
+  const serialized = `${JSON.stringify(result, null, 2)}\n`;
+  const snapshotPath = path.join(
+    historyDir,
+    `${result.executedAt.replace(/[:.]/g, '-')}.json`,
+  );
+  const tmpPath = `${latestPath}.tmp`;
+  await Promise.all([
+    fs.writeFile(snapshotPath, serialized, 'utf8'),
+    (async () => {
+      await fs.writeFile(tmpPath, serialized, 'utf8');
+      await fs.rename(tmpPath, latestPath);
+    })(),
+  ]);
+  return latestPath;
 }
 
 interface LifecycleObservation {
@@ -141,6 +190,16 @@ function ageMs(timestamp: string | null, now = Date.now()): number | null {
   }
 
   return Math.max(0, now - new Date(timestamp).getTime());
+}
+
+function average(values: Array<number | null>): number | null {
+  const usable = values.filter(
+    (value): value is number => value != null && Number.isFinite(value),
+  );
+  if (usable.length === 0) {
+    return null;
+  }
+  return usable.reduce((sum, value) => sum + value, 0) / usable.length;
 }
 
 async function waitForCondition<T>(
@@ -322,6 +381,219 @@ async function loadTrackedMarkets(
   }
 
   return [...activeMarkets, smokeMarket];
+}
+
+async function buildDeploymentTierEvidenceStep(input: {
+  resolvedTradeLedger: Pick<ResolvedTradeLedger, 'loadWindow' | 'getPath'>;
+  deploymentRegistry: Pick<StrategyDeploymentRegistry, 'load'>;
+  runtimeControl: RuntimeControlLike;
+  now: Date;
+}): Promise<ProductionReadinessStepResult> {
+  const thresholds = {
+    ...getDeploymentTierEvidenceThresholds(),
+    requireRecentReadinessPass: false,
+    requireRecentSmokePass: false,
+  };
+  const [registryState, recentResolvedTrades, latestDailyDecisionQualityReport, latestSmokeCheckpoint] =
+    await Promise.all([
+      input.deploymentRegistry.load(),
+      input.resolvedTradeLedger.loadWindow({
+        start: new Date(input.now.getTime() - 30 * 24 * 60 * 60 * 1000),
+        end: input.now,
+      }),
+      readLatestDailyDecisionQualityReport(
+        path.dirname(input.resolvedTradeLedger.getPath()),
+      ),
+      input.runtimeControl.getLatestCheckpoint?.('authenticated_venue_smoke_suite') ??
+        Promise.resolve(null),
+    ]);
+
+  const incumbentVariantId = registryState.incumbentVariantId;
+  const filteredTrades = recentResolvedTrades.filter((trade) =>
+    incumbentVariantId == null ? true : trade.strategyVariantId === incumbentVariantId,
+  );
+  const trustDecision = new LiveTrustScore().evaluate({
+    strategyVariantId: incumbentVariantId,
+    regime: null,
+    resolvedTrades: recentResolvedTrades,
+  });
+  const recentSmokePassAt =
+    latestSmokeCheckpoint?.status === 'completed' &&
+    input.now.getTime() - latestSmokeCheckpoint.processedAt.getTime() <=
+      thresholds.requiredCheckpointMaxAgeMs
+      ? latestSmokeCheckpoint.processedAt.toISOString()
+      : null;
+  const snapshot = {
+    tier: appEnv.BOT_DEPLOYMENT_TIER,
+    incumbentVariantId,
+    liveTradeCount: filteredTrades.length,
+    liveTrustScore: trustDecision.trustScore,
+    averageAbsoluteRealizedExpectedEdgeGapBps: average(
+      filteredTrades.map((trade) => {
+        const expected = trade.netOutcome.expectedNetEdgeBps ?? trade.expectedNetEdgeBps;
+        const realized = trade.netOutcome.realizedNetEdgeBps ?? trade.realizedNetEdgeBps;
+        if (
+          typeof expected !== 'number' ||
+          !Number.isFinite(expected) ||
+          typeof realized !== 'number' ||
+          !Number.isFinite(realized)
+        ) {
+          return null;
+        }
+        return Math.abs(realized - expected);
+      }),
+    ),
+    reconciliationDefectRate:
+      filteredTrades.length === 0
+        ? null
+        : filteredTrades.filter(
+            (trade) =>
+              trade.lifecycleState !== 'economically_resolved_with_portfolio_truth',
+          ).length / filteredTrades.length,
+    recentReadinessPassAt: null,
+    recentSmokePassAt,
+    dailyDecisionQualityReportAt:
+      latestDailyDecisionQualityReport != null &&
+      ageMs(latestDailyDecisionQualityReport.generatedAt, input.now.getTime()) != null &&
+      ageMs(latestDailyDecisionQualityReport.generatedAt, input.now.getTime())! <=
+        thresholds.dailyDecisionQualityMaxAgeMs
+        ? latestDailyDecisionQualityReport.generatedAt
+        : null,
+    shadowDecisionLoggingEnabled: appEnv.BOT_ENABLE_SHADOW_DECISION_LOGGING,
+  } as const;
+  const assessment = assessDeploymentTierEvidence(snapshot, thresholds);
+
+  return assessment.ok
+    ? passStep('deployment_tier_evidence_thresholds', {
+        assessment,
+        trustDecision,
+      })
+    : failStep(
+        'deployment_tier_evidence_thresholds',
+        assessment.reasonCodes[0] ?? 'deployment_tier_evidence_thresholds_not_met',
+        {
+          assessment,
+          trustDecision,
+        },
+      );
+}
+
+async function buildReconciliationDefectRateStep(input: {
+  resolvedTradeLedger: Pick<ResolvedTradeLedger, 'loadWindow'>;
+  now: Date;
+}): Promise<ProductionReadinessStepResult> {
+  if (!getDeploymentTierEvidenceThresholds().requireRecentReadinessPass) {
+    return passStep('reconciliation_defect_rate', {
+      tier: appEnv.BOT_DEPLOYMENT_TIER,
+      required: false,
+    });
+  }
+
+  const recentResolvedTrades = await input.resolvedTradeLedger.loadWindow({
+    start: new Date(input.now.getTime() - 30 * 24 * 60 * 60 * 1000),
+    end: input.now,
+  });
+  const defectRate =
+    recentResolvedTrades.length === 0
+      ? null
+      : recentResolvedTrades.filter(
+          (trade) =>
+            trade.lifecycleState !== 'economically_resolved_with_portfolio_truth',
+        ).length / recentResolvedTrades.length;
+
+  if (defectRate == null) {
+    return failStep(
+      'reconciliation_defect_rate',
+      'reconciliation_defect_rate_unavailable',
+      {
+        sampleCount: 0,
+        maxAllowedDefectRate: appEnv.BOT_MAX_ALLOWED_RECONCILIATION_DEFECT_RATE,
+      },
+    );
+  }
+
+  return defectRate <= appEnv.BOT_MAX_ALLOWED_RECONCILIATION_DEFECT_RATE
+    ? passStep('reconciliation_defect_rate', {
+        sampleCount: recentResolvedTrades.length,
+        defectRate,
+        maxAllowedDefectRate: appEnv.BOT_MAX_ALLOWED_RECONCILIATION_DEFECT_RATE,
+      })
+    : failStep('reconciliation_defect_rate', 'reconciliation_defect_rate_too_high', {
+        sampleCount: recentResolvedTrades.length,
+        defectRate,
+        maxAllowedDefectRate: appEnv.BOT_MAX_ALLOWED_RECONCILIATION_DEFECT_RATE,
+      });
+}
+
+async function buildDailyDecisionQualityStep(input: {
+  resolvedTradeLedger: Pick<ResolvedTradeLedger, 'getPath'>;
+  now: Date;
+}): Promise<ProductionReadinessStepResult> {
+  if (!getDeploymentTierEvidenceThresholds().requireDailyDecisionQualityReport) {
+    return passStep('daily_decision_quality_report', {
+      tier: appEnv.BOT_DEPLOYMENT_TIER,
+      required: false,
+    });
+  }
+
+  const report = await readLatestDailyDecisionQualityReport(
+    path.dirname(input.resolvedTradeLedger.getPath()),
+  );
+  const maxAgeMs = getDeploymentTierEvidenceThresholds().dailyDecisionQualityMaxAgeMs;
+  const reportAgeMs = report ? ageMs(report.generatedAt, input.now.getTime()) : null;
+
+  return report != null && reportAgeMs != null && reportAgeMs <= maxAgeMs
+    ? passStep('daily_decision_quality_report', {
+        generatedAt: report.generatedAt,
+        ageMs: reportAgeMs,
+        overall: report.overall,
+      })
+    : failStep('daily_decision_quality_report', 'daily_decision_quality_report_missing', {
+        generatedAt: report?.generatedAt ?? null,
+        ageMs: reportAgeMs,
+        maxAgeMs,
+      });
+}
+
+async function buildExecutionStateWatchdogHealthStep(input: {
+  runtimeControl: RuntimeControlLike;
+  now: Date;
+}): Promise<ProductionReadinessStepResult> {
+  const latestCheckpoint = await input.runtimeControl.getLatestCheckpoint?.(
+    'execution_state_watchdog',
+  );
+
+  if (!latestCheckpoint) {
+    return passStep('execution_state_watchdog_health', {
+      checkpointMissing: true,
+    });
+  }
+
+  const checkpointAgeMs = ageMs(
+    latestCheckpoint.processedAt.toISOString(),
+    input.now.getTime(),
+  );
+  const unhealthy =
+    latestCheckpoint.status !== 'completed' &&
+    (checkpointAgeMs == null ||
+      checkpointAgeMs <= getDeploymentTierEvidenceThresholds().requiredCheckpointMaxAgeMs);
+
+  return unhealthy
+    ? failStep(
+        'execution_state_watchdog_health',
+        'execution_state_watchdog_unhealthy',
+        {
+          status: latestCheckpoint.status,
+          processedAt: latestCheckpoint.processedAt.toISOString(),
+          checkpointAgeMs,
+          details: latestCheckpoint.details,
+        },
+      )
+    : passStep('execution_state_watchdog_health', {
+        status: latestCheckpoint.status,
+        processedAt: latestCheckpoint.processedAt.toISOString(),
+        checkpointAgeMs,
+      });
 }
 
 export function createForcedDisconnectWebSocketFactory(input?: {
@@ -748,6 +1020,129 @@ export async function probeStreamReconciliation(input: {
   }
 }
 
+export async function probeExecutionStateWatchdogDegradation(input: {
+  runtimeControl?: RuntimeControlLike;
+}): Promise<ProductionReadinessStepResult> {
+  const checkpoints: Array<Record<string, unknown>> = [];
+  const watchdog = new ExecutionStateWatchdog(
+    input.runtimeControl
+      ? {
+          recordReconciliationCheckpoint: async (value) => {
+            checkpoints.push(value as unknown as Record<string, unknown>);
+            await input.runtimeControl?.recordReconciliationCheckpoint(value);
+          },
+        }
+      : undefined,
+  );
+
+  const scenarios = await Promise.all([
+    watchdog.evaluate({
+      currentState: 'running',
+      anomalyInput: {
+        userStream: {
+          stale: true,
+          liveOrdersWhileStale: true,
+          connected: false,
+          reconnectAttempt: 2,
+          openOrders: 2,
+          lastTrafficAgeMs: 12_000,
+          divergenceDetected: false,
+        },
+        venueTruth: {
+          disagreementCount: 0,
+          unresolvedGhostMismatch: false,
+          lastVenueTruthAgeMs: 1_000,
+          workingOpenOrders: 2,
+          cancelPendingTooLongCount: 0,
+        },
+        lifecycle: {
+          retryingCount: 0,
+          failedCount: 0,
+          ghostExposureDetected: false,
+          unresolvedIntentCount: 0,
+          locallyFilledButAbsentCount: 0,
+          oldestLocallyFilledAbsentAgeMs: null,
+        },
+      },
+    }),
+    watchdog.evaluate({
+      currentState: 'running',
+      anomalyInput: {
+        userStream: {
+          stale: false,
+          liveOrdersWhileStale: false,
+          connected: true,
+          reconnectAttempt: 0,
+          openOrders: 3,
+          lastTrafficAgeMs: 200,
+          divergenceDetected: true,
+        },
+        venueTruth: {
+          disagreementCount: 3,
+          unresolvedGhostMismatch: true,
+          lastVenueTruthAgeMs: 3_000,
+          workingOpenOrders: 3,
+          cancelPendingTooLongCount: 0,
+        },
+        lifecycle: {
+          retryingCount: 0,
+          failedCount: 0,
+          ghostExposureDetected: false,
+          unresolvedIntentCount: 0,
+          locallyFilledButAbsentCount: 0,
+          oldestLocallyFilledAbsentAgeMs: null,
+        },
+      },
+    }),
+    watchdog.evaluate({
+      currentState: 'running',
+      anomalyInput: {
+        userStream: {
+          stale: false,
+          liveOrdersWhileStale: false,
+          connected: true,
+          reconnectAttempt: 0,
+          openOrders: 2,
+          lastTrafficAgeMs: 250,
+          divergenceDetected: false,
+        },
+        venueTruth: {
+          disagreementCount: 0,
+          unresolvedGhostMismatch: false,
+          lastVenueTruthAgeMs: 2_000,
+          workingOpenOrders: 2,
+          cancelPendingTooLongCount: 2,
+        },
+        lifecycle: {
+          retryingCount: 0,
+          failedCount: 0,
+          ghostExposureDetected: false,
+          unresolvedIntentCount: 0,
+          locallyFilledButAbsentCount: 0,
+          oldestLocallyFilledAbsentAgeMs: null,
+        },
+      },
+    }),
+  ]);
+
+  const ok = scenarios.every((scenario) => scenario.transitionRequest !== null);
+  const evidence = {
+    scenarios: scenarios.map((scenario, index) => ({
+      index,
+      nextState: scenario.transitionRequest?.nextState ?? null,
+      reasonCodes: scenario.reasonCodes,
+      degradeOrderPersistence: scenario.degradeOrderPersistence,
+      avoidBlindReposts: scenario.avoidBlindReposts,
+      forceCancelOnlyBehavior: scenario.forceCancelOnlyBehavior,
+    })),
+    checkpointCount: checkpoints.length,
+  };
+
+  return ok
+    ? passStep('execution_state_watchdog_degradation', evidence)
+    : failStep('execution_state_watchdog_degradation', 'watchdog_transition_missing', evidence);
+}
+
 function createDefaultTradingClient(): OfficialPolymarketTradingClient {
   return new OfficialPolymarketTradingClient({
     host: appEnv.POLY_CLOB_HOST,
@@ -805,7 +1200,8 @@ function createDefaultUserStreamService(
 export async function runProductionReadiness(
   options: ProductionReadinessOptions = {},
 ): Promise<ProductionReadinessResult> {
-  const executedAt = options.executeAt ?? new Date().toISOString();
+  const now = options.executeAt ? new Date(options.executeAt) : new Date();
+  const executedAt = now.toISOString();
   const fetchImpl = options.fetchImpl ?? fetch;
   const prisma =
     options.prisma ??
@@ -828,6 +1224,9 @@ export async function runProductionReadiness(
   const tradingClient = options.tradingClient ?? createDefaultTradingClient();
   const externalPortfolioService =
     options.externalPortfolioService ?? new ExternalPortfolioService(prisma as PrismaClient);
+  const resolvedTradeLedger = options.resolvedTradeLedger ?? new ResolvedTradeLedger();
+  const deploymentRegistry =
+    options.deploymentRegistry ?? new StrategyDeploymentRegistry();
   const smokeConfig = parsePolymarketSmokeEnv(process.env);
   const steps: ProductionReadinessStepResult[] = [];
   const cycleKey = `production-readiness:${Date.now()}`;
@@ -889,6 +1288,27 @@ export async function runProductionReadiness(
       tokenIds: normalizeTokenIds(market),
     }));
 
+    steps.push(
+      await buildDeploymentTierEvidenceStep({
+        resolvedTradeLedger,
+        deploymentRegistry,
+        runtimeControl,
+        now,
+      }),
+    );
+    steps.push(
+      await buildDailyDecisionQualityStep({
+        resolvedTradeLedger,
+        now,
+      }),
+    );
+    steps.push(
+      await buildReconciliationDefectRateStep({
+        resolvedTradeLedger,
+        now,
+      }),
+    );
+
     const liveMarketStep = await probeMarketStreamReadiness({
       service: marketStreamService,
       assetIds: marketAssetIds,
@@ -940,6 +1360,17 @@ export async function runProductionReadiness(
       }),
     );
     const streamReconciliationStep = steps[steps.length - 1];
+    steps.push(
+      await probeExecutionStateWatchdogDegradation({
+        runtimeControl,
+      }),
+    );
+    steps.push(
+      await buildExecutionStateWatchdogHealthStep({
+        runtimeControl,
+        now,
+      }),
+    );
 
     if (reconnectMarketProbe) {
       steps.push(
@@ -1055,6 +1486,10 @@ export async function runProductionReadiness(
       executedAt,
       steps,
     };
+    await persistProductionReadinessArtifact(
+      result,
+      options.artifactRootDir ?? resolveRepositoryRoot(),
+    );
 
     await runtimeControl.recordReconciliationCheckpoint({
       cycleKey,
@@ -1102,6 +1537,10 @@ export async function runProductionReadiness(
         }),
       ],
     };
+    await persistProductionReadinessArtifact(
+      result,
+      options.artifactRootDir ?? resolveRepositoryRoot(),
+    );
 
     await runtimeControl.recordReconciliationCheckpoint({
       cycleKey,

@@ -1,648 +1,576 @@
-# instruction.md
+# AGENTS.md
 
-## Objective
+## Repository mission
 
-Upgrade this repository from approximately **8.8/10** toward **9.2/10** by improving the following areas:
+This repository exists to become a **measurably trustworthy capital-growth bot** for live BTC 5-minute Polymarket trading.
 
-1. better attribution
-2. better toxicity awareness
-3. better live sizing discipline
-4. better benchmark rigor
-5. better evidence
-6. better alpha sophistication
+Its purpose is not to look sophisticated. Its purpose is to:
 
-This upgrade must build on top of the current architecture.
-Do not remove core runtime, risk, execution, reconciliation, validation, or learning functionality.
+- trade only when **net edge remains positive after fees, slippage, queue friction, and adverse selection**
+- survive live venue uncertainty without corrupting state
+- keep capital sizing bounded by **live evidence quality**
+- improve through **controlled, auditable, reversible** learning
+- earn higher deployment tiers only through **real operational proof**
 
----
+The target state is **8+/10 trustworthiness** only when the bot proves:
 
-## Repository context
-
-This repository is already strong in:
-
-- runtime lifecycle and orchestration
-- startup gates and crash recovery
-- risk/safety gating
-- order execution discipline
-- reconciliation and external truth checks
-- audit, lineage, diagnostics, validation, and review scaffolding
-
-This repository still needs improvement in:
-
-- stronger predictive alpha
-- decision-grade attribution
-- forward-looking toxicity logic
-- live capital discipline
-- benchmark rigor
-- evidence-to-action coupling
-
-All work must preserve strong areas and strengthen weak ones.
+- durable positive net expectancy after realized costs
+- execution quality stable enough to preserve edge
+- regime-aware selectivity, including explicit no-trade behavior
+- low reconciliation defect rates
+- promotion and scaling based on live evidence, not optimism
 
 ---
 
-## Global rules
+## What this repository is
 
-### Preserve current core behavior
-You must preserve the existing:
+It is:
 
-- runtime lifecycle
-- startup gates
-- safety-state and runtime-state gating
-- signal/evaluate/execute/reconcile/refresh pipeline
-- reconciliation and external truth checks
-- daily review / learning flow
-- decision log / lineage / diagnostics behavior
-- validation/report generation behavior
+- a live-oriented Polymarket BTC 5-minute directional trading system
+- a runtime-controlled, reconciliation-first execution platform
+- a system that must convert forecast edge into **realized post-cost edge**
+- a staged deployment system with shadow, paper, canary, cautious live, and scaled live tiers
+- an auditable learning system with bounded adaptation
 
-### Prefer additive changes
-Add new modules and integrate them.
-Refactor existing modules only where necessary for clarity, canonicalization, or reuse.
+It is not:
 
-### Keep logic inspectable
-New logic should be:
-
-- deterministic where feasible
-- bounded
-- explicit
-- replayable
-- diagnosable
-
-### Every new decision input must produce evidence
-If a new module influences:
-- posterior
-- regime
-- admission
-- sizing
-- execution style
-- capital allocation
-it must leave structured evidence.
-
-### No dead modules
-No module should be added without being integrated into:
-- live paths
-- review paths
-- validation paths
-or some combination of these.
-
-### No weakening of controls
-Do not weaken:
-- safety gates
-- runtime-state permissions
-- external portfolio truth checks
-- reconciliation freshness checks
-- execution viability checks
-- lineage and diagnostics emission
+- a generic LLM trading experiment
+- a self-rewriting autonomous trader
+- a backtest theater repo
+- a “just place more trades and learn” system
+- a strategy that gets trusted because its architecture is advanced
 
 ---
 
-## Existing files that matter most
+## Prime directive
 
-### Primary upgrade surfaces
-- `apps/worker/src/jobs/buildSignals.job.ts`
+**MAXIMIZE RISK-ADJUSTED LONG-TERM CAPITAL GROWTH WITHOUT LOSING CONTROL OF EXECUTION, STATE, OR CAPITAL CONTAINMENT**
+
+This prime directive has four mandatory sub-goals:
+
+1. preserve capital first
+2. trade only when net edge remains positive after realistic costs
+3. scale only when live evidence justifies scaling
+4. degrade safely when truth quality becomes uncertain
+
+---
+
+## Mandatory operating principles
+
+1. **Reconciliation beats assumption.**
+   External venue truth, account truth, and confirmed execution truth take priority over local intent.
+
+2. **Net edge beats raw signal.**
+   Gross predictive strength does not justify a trade unless net expectancy stays positive after realistic costs.
+
+3. **No-trade is a first-class action.**
+   The bot must explicitly refuse marginal or noisy conditions.
+
+4. **Evidence beats confidence.**
+   Forecast conviction cannot override weak live sample quality.
+
+5. **Bounded adaptation only.**
+   The live bot may tune parameters within narrow, audited bounds. It must not rewrite its own strategy logic broadly.
+
+6. **Promotion is earned, not inferred.**
+   No strategy variant moves up the rollout ladder without satisfying live promotion gates.
+
+7. **Execution truth is risk truth.**
+   Stale user streams, missing cancel confirmations, ghost exposure, or lifecycle ambiguity are direct risk inputs.
+
+8. **Capital protection outranks throughput.**
+   If there is tension between making more decisions and protecting capital, protect capital.
+
+---
+
+## Non-negotiable guardrails
+
+### 1) Secret and environment hygiene
+
+- Never commit real secrets.
+- Treat `.env`, `.env.smoke`, runtime artifacts, snapshots, and logs as non-source material.
+- In non-paper live tiers, missing required credentials must fail hard.
+- If secrets have ever been committed, assume compromise and rotate them.
+
+### 2) Deployment-tier discipline
+
+Valid rollout order:
+
+- `shadow`
+- `paper`
+- `canary`
+- `cautious_live`
+- `scaled_live`
+
+Rules:
+
+- no skipping tiers
+- no direct promotion from paper to scaled live
+- readiness artifacts are mandatory for live-executable tiers
+- each higher tier requires stronger evidence thresholds
+
+### 3) Reconciliation-first truth model
+
+- local fill assumptions are provisional
+- matched is not always final
+- reserve release must follow confirmed truth
+- portfolio truth, open-order truth, and trade truth must reconcile before the system trusts exposure
+- unresolved anomalies must downgrade runtime state automatically
+
+### 4) Learning boundaries
+
+Allowed live-adjustable surfaces:
+
+- entry threshold
+- aggressiveness band
+- max holding time
+- cancel/repost timing
+- regime confidence threshold
+- size multiplier band within evidence caps
+
+Not allowed for autonomous live rewriting:
+
+- replacing the strategy family wholesale
+- changing objective hierarchy
+- silently introducing new live features
+- changing safety gates or deployment-tier rules
+- bypassing promotion criteria
+
+### 5) Capital containment
+
+- sizing must be capped by evidence quality
+- regime caps must apply even when a local setup looks strong
+- benchmark underperformance must clamp size
+- kill-switches must be allowed to drive size to zero immediately
+- no strategy may scale because of backtests alone
+
+---
+
+## Canonical truth hierarchy
+
+When system views disagree, trust in this order:
+
+1. confirmed venue/account truth
+2. reconciled fill-state truth
+3. canonical resolved-trade ledger
+4. recent audited runtime snapshots
+5. local order-intent metadata
+6. forecast and planning assumptions
+
+This hierarchy applies to:
+
+- exposure
+- realized pnl
+- fee accounting
+- slippage attribution
+- strategy promotion evidence
+- capital scaling evidence
+
+---
+
+## Required architectural stance
+
+All major upgrades must preserve and extend the existing architecture instead of creating parallel systems.
+
+### Extend, do not fork, these subsystems
+
+#### Worker / runtime
 - `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
 - `apps/worker/src/jobs/executeOrders.job.ts`
+- `apps/worker/src/jobs/reconcileFills.job.ts`
 - `apps/worker/src/jobs/dailyReview.job.ts`
-- `apps/worker/src/validation/p23-validation.ts`
+- `apps/worker/src/runtime/learning-state-store.ts`
+- `apps/worker/src/runtime/strategy-deployment-registry.ts`
+- `apps/worker/src/runtime/strategy-rollout-controller.ts`
+- `apps/worker/src/runtime/runtime-state-machine.ts`
+- `apps/worker/src/runtime/startup-gate.service.ts`
+- `apps/worker/src/runtime/venue-open-order-heartbeat.service.ts`
+- `apps/worker/src/runtime/user-websocket-state.service.ts`
 
-### Core signal files
-- `packages/signal-engine/src/feature-builder.ts`
-- `packages/signal-engine/src/prior/prior-model.ts`
-- `packages/signal-engine/src/posterior/posterior-update.ts`
+#### Signal / edge / calibration
+- `packages/signal-engine/src/net-edge-estimator.ts`
+- `packages/signal-engine/src/executable-ev-model.ts`
+- `packages/signal-engine/src/live-calibration-store.ts`
+- `packages/signal-engine/src/live-calibration-updater.ts`
 - `packages/signal-engine/src/regime-classifier.ts`
-- `packages/signal-engine/src/edge/*`
-- `packages/signal-engine/src/ev/*`
-- `packages/signal-engine/src/walk-forward-validator.ts`
+- `packages/signal-engine/src/regime-conditioned-edge-model.ts`
+- `packages/signal-engine/src/no-trade-zone-policy.ts`
+- `packages/signal-engine/src/trade-admission-gate.ts`
+- `packages/signal-engine/src/benchmarks/*`
+- `packages/signal-engine/src/champion-challenger-manager.ts`
+- `packages/signal-engine/src/promotion-decision-engine.ts`
+- `packages/signal-engine/src/strategy-quarantine-policy.ts`
 
-### Runtime/evidence files
-- `apps/worker/src/runtime/decision-log.service.ts`
-- `apps/worker/src/runtime/version-lineage-registry.ts`
-- `apps/worker/src/runtime/learning-state-store.ts`
+#### Execution
+- `packages/execution-engine/src/fill-probability-estimator.ts`
+- `packages/execution-engine/src/slippage-estimator.ts`
+- `packages/execution-engine/src/realized-cost-model.ts`
+- `packages/execution-engine/src/execution-cost-calibrator.ts`
+- `packages/execution-engine/src/order-planner.ts`
+- `packages/execution-engine/src/marketable-limit.ts`
+- `packages/execution-engine/src/fill-state-service.ts`
+- `packages/execution-engine/src/execution-diagnostics.ts`
+- `packages/execution-engine/src/fee-accounting-service.ts`
+- `packages/execution-engine/src/queue-position-estimator.ts`
 
-### Supporting execution/risk files
-- `packages/risk-engine/*`
-- `packages/execution-engine/*`
-- `packages/polymarket-adapter/*`
-
----
-
-## High-impact implementation list
-
-These are the concrete implementations to execute one at a time.
-
-1. loss attribution classifier
-2. retention by regime/archetype/toxicity
-3. toxicity momentum / shock / persistence
-4. passive-only / aggression lockout under toxic flow
-5. fast-down / slow-up live sizing policy
-6. regime-local size multipliers
-7. benchmark-relative size penalties
-8. rolling benchmark scorecards
-9. regime-specific benchmark gating
-10. BTC-to-Polymarket transmission features
-11. flow persistence / reversal features
-12. calibration drift alerts by regime and archetype
-
-Each item must be implemented, tested, and reviewed independently before moving to the next.
-
----
-
-# Item 1 — Loss attribution classifier
-
-## Goal
-Classify retained-edge loss into actionable buckets.
-
-## Files to add
-- `packages/signal-engine/src/edge/loss-attribution-classifier.ts`
-
-## Files to update
-- `apps/worker/src/jobs/executeOrders.job.ts`
-- `apps/worker/src/jobs/dailyReview.job.ts`
-- `apps/worker/src/runtime/decision-log.service.ts`
-- `apps/worker/src/runtime/version-lineage-registry.ts`
-
-## Required outputs
-At minimum:
-- `lossCategory`
-- `lossReasonCodes`
-- `forecastQualityAssessment`
-- `executionQualityAssessment`
-- `primaryLeakageDriver`
-- `secondaryLeakageDrivers`
-
-## Required categories
-Support at least:
-- alpha_wrong
-- slippage_excess
-- fill_quality_failure
-- latency_decay
-- toxicity_damage
-- over_sizing
-- regime_drift
-- mixed
-
-## Integration requirements
-- execution must classify post-trade outcomes
-- daily review must aggregate categories
-- evidence/logging must include the classification
-
-## Definition of done
-- classifier exists
-- execution emits loss attribution
-- daily review summarizes loss buckets
-- tests cover category assignment edge cases
-
----
-
-# Item 2 — Retention by regime/archetype/toxicity
-
-## Goal
-Make retention observable by context.
-
-## Files to add
-- `apps/worker/src/validation/retention-context-report.ts`
-
-## Files to update
-- `apps/worker/src/jobs/dailyReview.job.ts`
-- `apps/worker/src/validation/p23-validation.ts`
-- `apps/worker/src/runtime/learning-state-store.ts`
-
-## Required outputs
-At minimum:
-- retention by regime
-- retention by archetype
-- retention by toxicity state
-- top degrading contexts
-- top improving contexts
-
-## Integration requirements
-- daily review stores these summaries
-- validation artifacts include them
-- learning state stores lightweight summaries only
-
-## Definition of done
-- report exists
-- daily review uses it
-- p23 validation can emit it
-- tests cover grouping and summary logic
-
----
-
-# Item 3 — Toxicity momentum / shock / persistence
-
-## Goal
-Make toxicity forward-looking, not only point-in-time.
-
-## Files to add
-- `packages/signal-engine/src/toxicity/toxicity-trend.ts`
-
-## Files to update
-- `packages/signal-engine/src/toxicity/toxicity-policy.ts`
-- `apps/worker/src/jobs/buildSignals.job.ts`
-- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
-- `apps/worker/src/jobs/dailyReview.job.ts`
-
-## Required outputs
-At minimum:
-- `toxicityMomentum`
-- `toxicityShock`
-- `toxicityPersistence`
-
-## Integration requirements
-- buildSignals attaches these to signal evidence
-- evaluation uses them to tighten thresholds or shrink size
-- daily review tracks how persistent toxicity affects retention
-
-## Definition of done
-- trend module exists
-- toxicity policy consumes it
-- evaluation behavior changes under rising or persistent toxicity
-- tests cover rising/falling/shock/persistent cases
-
----
-
-# Item 4 — Passive-only / aggression lockout under toxic flow
-
-## Goal
-Force defensive execution behavior when toxicity is high.
-
-## Files to update
-- `apps/worker/src/jobs/executeOrders.job.ts`
-- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
-- existing toxicity policy files as needed
-
-## Required outputs
-At minimum:
-- `executionAggressionLock`
-- `passiveOnly`
-- `aggressionReasonCodes`
-
-## Integration requirements
-- evaluation can reject or downgrade aggression
-- execution must respect lockouts
-- diagnostics must show when and why aggression was reduced
-
-## Definition of done
-- toxic conditions can enforce passive-only behavior
-- execution respects the restriction
-- tests cover lockout behavior
-
----
-
-# Item 5 — Fast-down / slow-up live sizing policy
-
-## Goal
-Shrink size quickly under degradation and restore slowly under recovery.
-
-## Files to add or update
+#### Risk / capital / kill-switches
+- `packages/risk-engine/src/live-trade-guard.ts`
 - `packages/risk-engine/src/live-sizing-feedback-policy.ts`
-
-## Files to update
-- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
-- `apps/worker/src/jobs/executeOrders.job.ts`
-- `apps/worker/src/jobs/dailyReview.job.ts`
-
-## Required behavior
-- size down aggressively under retention failure or high toxicity
-- size up only after stable evidence over multiple windows
-- do not let one good window restore full size immediately
-
-## Required outputs
-At minimum:
-- `downshiftMultiplier`
-- `upshiftEligibility`
-- `recoveryProbationState`
-- `sizingReasonCodes`
-
-## Definition of done
-- policy supports asymmetric response
-- evaluation uses it
-- tests cover fast-down / slow-up scenarios
-
----
-
-# Item 6 — Regime-local size multipliers
-
-## Goal
-Allow size to differ by regime and archetype, not only globally.
-
-## Files to add
+- `packages/risk-engine/src/regime-capital-policy.ts`
 - `packages/risk-engine/src/regime-local-sizing.ts`
-
-## Files to update
-- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
-- `apps/worker/src/jobs/dailyReview.job.ts`
-- `apps/worker/src/runtime/learning-state-store.ts`
-
-## Required outputs
-At minimum:
-- `regimeSizeMultiplier`
-- `archetypeSizeMultiplier`
-- `regimeSizingReasonCodes`
-
-## Integration requirements
-- evaluation applies regime-local sizing
-- daily review updates regime-local sizing evidence
-
-## Definition of done
-- regime-local size logic exists
-- evaluation consumes it
-- tests cover different regime states
+- `packages/risk-engine/src/execution-quality-kill-switches.ts`
+- `packages/risk-engine/src/expected-vs-realized-ev-guard.ts`
+- `packages/risk-engine/src/consecutive-loss-kill-switch.ts`
+- `packages/risk-engine/src/capital-ramp-policy-service.ts`
+- `packages/risk-engine/src/trade-quality-history-store.ts`
+- `packages/risk-engine/src/portfolio-kill-switch-service.ts`
 
 ---
 
-# Item 7 — Benchmark-relative size penalties
+## Required new truth surfaces
 
-## Goal
-Reduce size when the strategy is not outperforming simple baselines in a context.
+The implementation plan must establish and keep authoritative the following surfaces:
 
-## Files to add
-- `packages/risk-engine/src/benchmark-relative-sizing.ts`
+### 1) Canonical resolved-trade ledger
 
-## Files to update
-- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
-- `apps/worker/src/jobs/dailyReview.job.ts`
-- benchmark report files as needed
+Every economically resolved trade must generate exactly one canonical resolved record with:
 
-## Required outputs
-At minimum:
-- `baselinePenaltyMultiplier`
-- `benchmarkComparisonState`
-- `benchmarkPenaltyReasonCodes`
+- decision-time assumptions
+- execution path facts
+- realized costs
+- regime/archetype context
+- realized net outcome
+- attribution labels
 
-## Integration requirements
-- daily review computes relevant benchmark status
-- evaluation can shrink size when strategy underperforms baseline in a context
+This ledger is the source of truth for:
 
-## Definition of done
-- benchmark-relative penalty exists
-- evaluation uses it
-- tests cover outperform / underperform cases
+- daily review
+- promotion/demotion
+- evidence-quality sizing
+- realized-vs-expected edge analysis
+- benchmark-relative validation
 
----
+### 2) Net-edge decomposition
 
-# Item 8 — Rolling benchmark scorecards
+Every tradable decision must have a persisted decomposition including:
 
-## Goal
-Track benchmark superiority across rolling windows.
+- gross edge
+- fee cost
+- slippage cost
+- adverse-selection penalty
+- queue penalty
+- uncertainty penalty
+- final net edge
 
-## Files to add
-- `apps/worker/src/validation/rolling-benchmark-scorecard.ts`
+The system must be able to explain both:
 
-## Files to update
-- `apps/worker/src/validation/p23-validation.ts`
-- `apps/worker/src/jobs/dailyReview.job.ts`
-- `apps/worker/src/jobs/capitalGrowthReview.job.ts`
+- why a trade was approved
+- why a trade was rejected
 
-## Required windows
-At minimum:
-- 1 day
-- 3 day
-- 7 day
-- 30 day or best available equivalent in historical context
+### 3) Empirical execution realism
 
-## Required outputs
-At minimum:
-- outperformance by window
-- retained-edge vs benchmark by window
-- stability of outperformance
+Planner assumptions must be grounded in recent live evidence by bucket, including:
 
-## Definition of done
-- rolling scorecard exists
-- daily review and validation can emit it
-- tests cover rolling aggregation logic
+- fill probability
+- fill fraction
+- queue delay
+- cancel latency
+- slippage
+- post-fill toxicity
 
----
+### 4) Regime/no-trade context
 
-# Item 9 — Regime-specific benchmark gating
+Every candidate signal must carry:
 
-## Goal
-Do not scale up regimes that fail against simple baselines.
+- regime label
+- regime confidence
+- transition risk
+- no-trade allow/block status
+- no-trade reason codes
 
-## Files to update
-- `apps/worker/src/jobs/dailyReview.job.ts`
-- `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
-- benchmark comparison modules as needed
+### 5) Evidence-weighted sizing decomposition
 
-## Required outputs
-At minimum:
-- `regimeBenchmarkGateState`
-- `promotionBlockedByBenchmark`
-- `regimeBenchmarkReasonCodes`
+Every order must have a sizing breakdown showing:
 
-## Integration requirements
-- daily review computes benchmark gate states by regime
-- evaluation respects benchmark-based restrictions
-- capital scale-up is blocked where strategy underperforms simple baselines
-
-## Definition of done
-- gate exists
-- review produces it
-- evaluation uses it
-- tests cover pass/fail regimes
+- base risk
+- edge factor
+- regime factor
+- evidence factor
+- deployment-tier factor
+- kill-switch factor
 
 ---
 
-# Item 10 — BTC-to-Polymarket transmission features
+## Trading approval doctrine
 
-## Goal
-Improve alpha sophistication through better modeling of how BTC moves translate into market probability moves.
+A trade is allowed only when all conditions hold:
 
-## Files to add
-- `packages/signal-engine/src/alpha/btc-polymarket-transmission-v2.ts`
+1. runtime state permits new exposure
+2. authenticated venue and user-state truth are healthy enough
+3. regime classifier identifies a tradable regime with sufficient confidence
+4. no-trade classifier does not block the setup
+5. net edge remains positive after realistic costs
+6. execution realism does not predict unacceptable fill degradation
+7. capital sizing is allowed by evidence quality and tier rules
+8. no kill-switch or anomaly detector is active
 
-## Files to update
-- `packages/signal-engine/src/feature-builder.ts`
-- `packages/signal-engine/src/prior/prior-model.ts`
-- `packages/signal-engine/src/posterior/posterior-update.ts`
-- `apps/worker/src/jobs/buildSignals.job.ts`
-
-## Required features
-At minimum:
-- lagged BTC move transmission
-- nonlinear BTC move sensitivity
-- divergence between BTC path and market probability response
-- recent transmission consistency or inconsistency
-
-## Definition of done
-- features exist
-- prior/posterior consume them
-- signal evidence includes them
-- tests cover feature computation and model usage
+If any one of these fails, the correct behavior is reject, degrade, cancel-only, or reconciliation-only depending on severity.
 
 ---
 
-# Item 11 — Flow persistence / reversal features
+## Strategy governance doctrine
 
-## Goal
-Improve alpha sophistication through richer short-horizon flow behavior.
+### Promotion requirements
 
-## Files to add
-- `packages/signal-engine/src/alpha/flow-persistence-reversal.ts`
+A strategy variant may be promoted only if it demonstrates:
 
-## Files to update
-- `packages/signal-engine/src/feature-builder.ts`
-- `packages/signal-engine/src/prior/prior-model.ts`
-- `packages/signal-engine/src/posterior/posterior-update.ts`
-- `apps/worker/src/jobs/buildSignals.job.ts`
+- minimum live trade count
+- positive net expectancy after realized costs
+- benchmark-relative outperformance
+- acceptable drawdown behavior
+- acceptable execution variance
+- acceptable reconciliation cleanliness
+- no unresolved anomaly pattern
 
-## Required features
-At minimum:
-- imbalance persistence
-- imbalance reversal probability
-- quote instability before move
-- depth depletion asymmetry
+### Demotion / quarantine triggers
 
-## Definition of done
-- features exist
-- models consume them
-- signal job persists them
-- tests cover persistence and reversal logic
+A strategy variant must be demoted, clamped, or quarantined when it exhibits:
 
----
+- persistent realized-vs-expected edge underperformance
+- benchmark-relative underperformance
+- unstable regime behavior
+- repeated adverse-selection spikes
+- repeated execution-quality failures
+- unresolved lifecycle or reconciliation defects
 
-# Item 12 — Calibration drift alerts by regime and archetype
+### Rollout discipline
 
-## Goal
-Detect when calibration is breaking in specific contexts.
-
-## Files to add
-- `apps/worker/src/validation/calibration-drift-alerts.ts`
-
-## Files to update
-- `apps/worker/src/jobs/dailyReview.job.ts`
-- `apps/worker/src/validation/p23-validation.ts`
-- `apps/worker/src/runtime/learning-state-store.ts`
-
-## Required outputs
-At minimum:
-- `calibrationDriftState`
-- `regimeCalibrationAlert`
-- `archetypeCalibrationAlert`
-- `driftReasonCodes`
-
-## Integration requirements
-- daily review emits alerts
-- learning state stores lightweight alert summaries
-- evaluation and/or sizing can consume drift state later if needed
-
-## Definition of done
-- alerts exist
-- review emits them
-- validation can surface them
-- tests cover alert threshold behavior
+All rollout must follow the registry and rollout controller. No manual shortcut that bypasses gating logic is acceptable.
 
 ---
 
-## Work policy
+## Runtime degradation doctrine
 
-Implement these items **one at a time**.
+The system must be able to move deterministically among:
 
-For each item, the workflow must be:
+- `bootstrapping`
+- `running`
+- `degraded`
+- `reconciliation_only`
+- `cancel_only`
+- `halted_hard`
+- `stopped`
 
-1. Audit current relevant files.
-2. List exact files to add or update.
-3. Implement the item only.
-4. Add unit tests for pure modules.
-5. Add or update integration tests where needed.
-6. Run relevant tests and typecheck.
-7. Stop and report results before moving to the next item.
+### Mandatory degradation triggers
 
-Do not stack multiple items in one change unless explicitly instructed.
+The system must request downgrade when it detects:
 
----
+- stale user stream while orders are live
+- venue/local open-order disagreement
+- repeated retry/fail lifecycle states
+- abnormal cancel latency
+- ghost exposure after reconnect
+- filled-locally vs absent-from-venue inconsistency
+- realized-vs-expected cost blowout
+- repeated partial-fill toxicity deterioration
+- reconciliation defect rate above policy threshold
 
-## Test policy
+### Escalation logic
 
-Every item must include tests.
-
-### Required test classes
-- unit tests for pure calculators/policies
-- integration tests for changed job logic
-- validation/report tests where applicable
-
-### Minimum expectations
-- all new modules have direct unit coverage
-- each modified major job has integration coverage adjusted where needed
-- validation commands remain runnable and more informative than before
-
----
-
-## Validation commands
-
-Prefer existing repo commands.
-Preserve or extend support for commands equivalent to:
-
-- `pnpm test`
-- `pnpm typecheck`
-- `pnpm --filter @polymarket-btc-5m-agentic-bot/worker validate:p23`
-- `pnpm --filter @polymarket-btc-5m-agentic-bot/worker validate:dataset-quality`
-
-If exact scripts differ, update safely and document them.
+- mild execution quality drift → `degraded`
+- state truth uncertainty → `reconciliation_only`
+- cancel-path urgency with live orders → `cancel_only`
+- severe unresolved exposure or truth corruption → `halted_hard`
 
 ---
 
-## Rollback and failure handling
+## Daily review doctrine
 
-If an item causes:
-- failed typecheck
-- failed tests
-- broken validation
-- degraded evidence quality
-- broken runtime integration
+A valid daily review must answer:
 
-stop and repair before proceeding.
+- did the bot make money after costs
+- which regimes helped or hurt
+- whether losses came from forecast, execution, sizing, regime selection, or fee/slippage underestimation
+- whether realized edge matched expected edge
+- whether the bot is beating simple baselines after costs
+- whether promotion or demotion evidence changed materially
+- whether any anomaly blocks tier advancement
 
-Do not continue on a broken base.
-
----
-
-## Success criteria
-
-This program is successful only if the repository can more clearly answer:
-
-- Where does forecast edge come from?
-- Does forecast edge survive execution?
-- What causes retained-edge loss?
-- Which regimes and archetypes really work?
-- Which toxicity states damage retention?
-- Which baselines are being beaten?
-- When should live size shrink, hold, or recover?
-- When should aggression be restricted?
-- Which regimes should be gated, penalized, or scaled up?
-
-And only if:
-- existing core functionality still works
-- risk and runtime protections remain intact
-- evidence quality improves materially
+The daily report is not optional bookkeeping. It is a control system input.
 
 ---
 
-## Short checklist for contributors
+## Code-change priorities
 
-Before considering any item complete, verify:
+Implementation work must follow this order unless a security issue forces reordering.
 
-- [ ] Existing runtime and safety behavior preserved
-- [ ] New module added and integrated
-- [ ] Evidence emitted where relevant
-- [ ] Tests added
-- [ ] Existing commands still work or were safely extended
-- [ ] No dead modules left unintegrated
+### Priority 0 — before all live trust work
+1. secret hygiene and environment hardening
+2. canonical resolved-trade ledger
+3. net-edge-after-costs truth path
+4. live-calibrated fill realism
+5. regime-aware no-trade authority
+
+### Priority 1 — before 8+/10 is realistic
+6. evidence-quality sizing
+7. live promotion/demotion gates
+8. execution-state anomaly handling and kill-switch tightening
+9. daily decision-quality pack
+10. readiness and rollout enforcement
+
+### Priority 2 — only after Priority 0/1
+11. better review UX / CLI summaries
+12. secondary model upgrades
+13. broader benchmark families
+
+No work on cosmetic dashboards or non-essential abstractions may delay Priority 0 items.
 
 ---
 
-## Final implementation intent
+## File-by-file intent map
 
-Do not treat this as cosmetic refactoring.
+### Worker layer
 
-Treat it as a focused upgrade program to move the system from:
+#### `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
+Must become the canonical point where:
 
-- strong execution-and-control platform with improved evidence
+- net-edge decomposition is consumed
+- regime/no-trade admission is enforced
+- evidence-weighted sizing is applied
+- full decision metadata is persisted
 
-to:
+#### `apps/worker/src/jobs/executeOrders.job.ts`
+Must persist planner assumptions, expected fill realism, and order-style rationale so later reconciliation can judge whether execution matched expectation.
 
-- strong execution-and-control platform with sharper alpha
-- stronger attribution
-- more actionable toxicity
-- smarter capital discipline
-- harder benchmark proof
-- stronger evidence-driven live behavior
+#### `apps/worker/src/jobs/reconcileFills.job.ts`
+Must write canonical resolved-trade records, update empirical fill realism, compute realized-vs-expected edge gaps, and emit auditable resolution events.
+
+#### `apps/worker/src/jobs/refreshPortfolio.job.ts`
+Must backfill final economic truth for recently resolved trades after external portfolio truth refresh.
+
+#### `apps/worker/src/jobs/dailyReview.job.ts`
+Must consume the resolved-trade ledger and produce daily decision-quality, promotion, demotion, and readiness evidence.
+
+#### `apps/worker/src/runtime/*`
+Must preserve deterministic rollout, startup gates, runtime transitions, and anomaly-triggered degradation.
+
+### Signal layer
+
+#### `packages/signal-engine/src/net-edge-estimator.ts`
+Must return a decomposed cost-aware edge structure, not a black-box scalar only.
+
+#### `packages/signal-engine/src/executable-ev-model.ts`
+Must use empirical execution realism rather than optimistic static assumptions.
+
+#### `packages/signal-engine/src/regime-classifier.ts`
+Must produce regime confidence and transition-risk output that materially affects approval behavior.
+
+#### `packages/signal-engine/src/trade-admission-gate.ts`
+Must reject trades lacking sufficient regime confidence, live evidence quality, or net edge.
+
+#### `packages/signal-engine/src/champion-challenger-manager.ts`
+Must treat live promotion gates as mandatory.
+
+### Execution layer
+
+#### `packages/execution-engine/src/order-planner.ts`
+Must output expected fill probability, fill fraction, queue delay, realized-cost estimate, adverse-selection penalty, and style rationale.
+
+#### `packages/execution-engine/src/fill-probability-estimator.ts`
+Must become empirical and bucket-based.
+
+#### `packages/execution-engine/src/slippage-estimator.ts`
+Must be calibrated from real fills.
+
+#### `packages/execution-engine/src/realized-cost-model.ts`
+Must produce a realized breakdown matching the estimator’s decomposition.
+
+#### `packages/execution-engine/src/fill-state-service.ts`
+Must distinguish provisional, matched, partial, retrying, failed, and finalized truth carefully.
+
+### Risk layer
+
+#### `packages/risk-engine/src/live-sizing-feedback-policy.ts`
+Must blend execution quality with evidence quality.
+
+#### `packages/risk-engine/src/regime-capital-policy.ts`
+Must cap risk by regime trust, not regime label alone.
+
+#### `packages/risk-engine/src/capital-ramp-policy-service.ts`
+Must require evidence thresholds by deployment tier.
+
+#### `packages/risk-engine/src/execution-quality-kill-switches.ts`
+Must include realized-vs-expected edge gap and lifecycle anomaly triggers.
+
+#### `packages/risk-engine/src/portfolio-kill-switch-service.ts`
+Must drive deterministic runtime downgrades when truth becomes unsafe.
+
+---
+
+## Testing doctrine
+
+Every new truth-affecting feature must ship with matching integration coverage.
+
+Minimum required coverage includes:
+
+1. resolved trade written once and only once
+2. expected vs realized edge decomposition matches ledger truth
+3. empirical execution realism updates future planner output
+4. no-trade logic blocks high-toxicity or marginal setups
+5. evidence-quality sizing caps under-sampled strategies
+6. promotion gate rejects benchmark-underperforming strategies
+7. execution watchdog triggers correct runtime degradation
+8. daily decision-quality report attributes losses correctly
+
+No merge that changes live trading behavior is complete without tests for the new control path.
+
+---
+
+## Review and acceptance doctrine
+
+A code change is acceptable only if it:
+
+- preserves or strengthens safety controls
+- improves truth quality or decision quality in a measurable way
+- leaves structured evidence for future review
+- does not create parallel shadow logic that bypasses canonical systems
+- is auditable and reversible
+
+Reject any change that:
+
+- weakens runtime or reconciliation safeguards
+- increases live autonomy without increasing proof requirements
+- hides cost components inside opaque scores
+- scales capital without evidence-based gating
+- confuses provisional and final execution truth
+
+---
+
+## Hard no-go conditions for scaled capital
+
+Do not advance beyond canary if any of the following is false:
+
+1. resolved-trade ledger is complete and internally consistent
+2. net edge remains positive after realized costs over a meaningful live window
+3. strategy beats simple baselines after costs
+4. realized-vs-expected edge gap stays within tolerance
+5. reconciliation defect rate stays below policy threshold
+6. no unresolved execution-state anomalies remain active
+7. recent daily decision-quality reports are available and healthy
+8. readiness and smoke gates pass mechanically for the target tier
+
+---
+
+## Final instruction to all contributors and agents
+
+When modifying this repository, act as though the bot is one good week away from earning trust and one sloppy assumption away from losing it.
+
+That means:
+
+- prefer explicit truth over convenience
+- prefer smaller, auditable improvements over broad rewrites
+- prefer capital containment over trade frequency
+- prefer live evidence over theoretical confidence
+- prefer deterministic downgrade over hopeful continuation
+
+The repository becomes trustworthy not when it looks advanced, but when it repeatedly proves that it can preserve edge, preserve capital, and preserve control under live conditions.

@@ -736,13 +736,41 @@ async function testExecuteOrdersProducesRealizedRetentionDiagnostics(): Promise<
     assert.strictEqual(submittedMetadata.alphaAttribution != null, true);
     assert.strictEqual(submittedMetadata.retainedEdgeExpectation != null, true);
     assert.strictEqual(submittedMetadata.upstreamEvaluationEvidence != null, true);
+    assert.strictEqual(submittedMetadata.executionPlannerAssumptions != null, true);
     const retained =
       submittedMetadata.retainedEdgeExpectation &&
       typeof submittedMetadata.retainedEdgeExpectation === 'object'
         ? (submittedMetadata.retainedEdgeExpectation as Record<string, unknown>)
         : null;
+    const plannerAssumptions =
+      submittedMetadata.executionPlannerAssumptions &&
+      typeof submittedMetadata.executionPlannerAssumptions === 'object'
+        ? (submittedMetadata.executionPlannerAssumptions as Record<string, unknown>)
+        : null;
     assert.ok(retained);
+    assert.ok(plannerAssumptions);
     assert.strictEqual(retained?.marketArchetype, 'balanced_rotation');
+    assert.strictEqual(
+      typeof plannerAssumptions?.expectedFillProbability === 'number',
+      true,
+    );
+    assert.strictEqual(
+      typeof plannerAssumptions?.expectedFillFraction === 'number',
+      true,
+    );
+    assert.strictEqual(
+      typeof plannerAssumptions?.expectedQueueDelayMs === 'number',
+      true,
+    );
+    assert.strictEqual(
+      typeof plannerAssumptions?.expectedAdverseSelectionPenaltyBps === 'number',
+      true,
+    );
+    assert.strictEqual(
+      Array.isArray(plannerAssumptions?.recommendedOrderStyleRationale),
+      true,
+    );
+    assert.strictEqual(plannerAssumptions?.executionBucketContext != null, true);
   } else {
     assert.strictEqual(
       createdSignalDecisions.some(

@@ -1,5 +1,9 @@
 import { CanonicalAccountState } from '@polymarket-btc-5m-agentic-bot/domain';
 import { ExecutionQualityKillSwitches } from './execution-quality-kill-switches';
+import {
+  type ExecutionStateAnomaly,
+  type ExecutionAnomalyRuntimeState,
+} from './execution-state-anomaly-detector';
 import { KillSwitchTrigger } from './kill-switch';
 import { SafetyState, maxSafetyState } from './safety-state';
 
@@ -11,6 +15,10 @@ export interface PortfolioKillSwitchVenueInstabilityInput {
   divergenceStatus: 'none' | 'warning' | 'critical';
   staleBookRejectCount: number;
   totalRecentDecisions: number;
+  abnormalCancelLatencyCount?: number;
+  repeatedPartialFillToxicityCount?: number;
+  fillQualityDriftCount?: number;
+  realizedVsExpectedCostBlowoutCount?: number;
 }
 
 export interface PortfolioKillSwitchInput {
@@ -23,6 +31,7 @@ export interface PortfolioKillSwitchInput {
     staleOrder: boolean;
   }>;
   venueInstability: PortfolioKillSwitchVenueInstabilityInput;
+  executionStateAnomalies?: ExecutionStateAnomaly[];
   limits?: {
     maxIntradayDrawdownPct?: number;
     maxHourlyDrawdownPct?: number;
@@ -37,6 +46,8 @@ export interface PortfolioKillSwitchResult {
   blockNewEntries: boolean;
   forceReduction: boolean;
   recommendedState: SafetyState;
+  recommendedRuntimeState: ExecutionAnomalyRuntimeState;
+  runtimeReasonChain: string[];
   reasonCodes: string[];
 }
 
@@ -172,12 +183,83 @@ export class PortfolioKillSwitchService {
       recommendedState = maxSafetyState(recommendedState, trigger.recommendedState);
     }
 
+    const anomalyRuntimeState = deriveRuntimeStateFromAnomalies(
+      input.executionStateAnomalies ?? [],
+    );
+    const triggerRuntimeState = deriveRuntimeStateFromTriggers(triggers);
+    const recommendedRuntimeState = maxRuntimeState(anomalyRuntimeState, triggerRuntimeState);
+
     return {
       triggers,
-      blockNewEntries: triggers.some((trigger) => trigger.blockNewEntries),
-      forceReduction: triggers.some((trigger) => trigger.forceReduction),
+      blockNewEntries:
+        triggers.some((trigger) => trigger.blockNewEntries) ||
+        recommendedRuntimeState !== 'running',
+      forceReduction:
+        triggers.some((trigger) => trigger.forceReduction) ||
+        recommendedRuntimeState === 'cancel_only' ||
+        recommendedRuntimeState === 'halted_hard',
       recommendedState,
-      reasonCodes: [...new Set(triggers.map((trigger) => trigger.reasonCode))],
+      recommendedRuntimeState,
+      runtimeReasonChain: [
+        ...new Set([
+          ...(input.executionStateAnomalies ?? []).map((anomaly) => anomaly.reasonCode),
+          ...triggers.map((trigger) => trigger.reasonCode),
+        ]),
+      ],
+      reasonCodes: [
+        ...new Set([
+          ...(input.executionStateAnomalies ?? []).map((anomaly) => anomaly.reasonCode),
+          ...triggers.map((trigger) => trigger.reasonCode),
+        ]),
+      ],
     };
   }
+}
+
+function deriveRuntimeStateFromAnomalies(
+  anomalies: ExecutionStateAnomaly[],
+): ExecutionAnomalyRuntimeState {
+  if (anomalies.length === 0) {
+    return 'running';
+  }
+  if (anomalies.some((anomaly) => anomaly.recommendedRuntimeState === 'halted_hard')) {
+    return 'halted_hard';
+  }
+  if (anomalies.some((anomaly) => anomaly.recommendedRuntimeState === 'cancel_only')) {
+    return 'cancel_only';
+  }
+  if (anomalies.some((anomaly) => anomaly.recommendedRuntimeState === 'reconciliation_only')) {
+    return 'reconciliation_only';
+  }
+  return 'degraded';
+}
+
+function deriveRuntimeStateFromTriggers(
+  triggers: KillSwitchTrigger[],
+): ExecutionAnomalyRuntimeState {
+  const highestSeverity = Math.max(0, ...triggers.map((trigger) => trigger.severity));
+  if (highestSeverity >= 5) {
+    return 'halted_hard';
+  }
+  if (highestSeverity >= 4) {
+    return 'cancel_only';
+  }
+  if (highestSeverity >= 3) {
+    return 'reconciliation_only';
+  }
+  return triggers.length > 0 ? 'degraded' : 'running';
+}
+
+function maxRuntimeState(
+  left: ExecutionAnomalyRuntimeState,
+  right: ExecutionAnomalyRuntimeState,
+): ExecutionAnomalyRuntimeState {
+  const priority: Record<ExecutionAnomalyRuntimeState, number> = {
+    running: 0,
+    degraded: 1,
+    reconciliation_only: 2,
+    cancel_only: 3,
+    halted_hard: 4,
+  };
+  return priority[left] >= priority[right] ? left : right;
 }

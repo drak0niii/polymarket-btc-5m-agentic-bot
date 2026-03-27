@@ -6,19 +6,22 @@ import {
   createDefaultExecutionLearningState,
   createDefaultLearningState,
   createDefaultStrategyDeploymentRegistryState,
+  type ResolvedTradeRecord,
 } from '@polymarket-btc-5m-agentic-bot/domain';
 import { DailyReviewJob } from '../jobs/dailyReview.job';
 import { LearningEventLog } from '../runtime/learning-event-log';
 import { LearningStateStore } from '../runtime/learning-state-store';
+import { ResolvedTradeLedger } from '../runtime/resolved-trade-ledger';
 import { RollbackController } from '../runtime/rollback-controller';
 import { StrategyDeploymentRegistry } from '../runtime/strategy-deployment-registry';
 import { StrategyRolloutController } from '../runtime/strategy-rollout-controller';
 
-async function testChampionChallengerPromotionStartsBoundedCanary(): Promise<void> {
+async function testChampionChallengerPromotionRequiresLiveGateAndStartsPaperRollout(): Promise<void> {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wave5-champion-'));
   const learningStateStore = new LearningStateStore(rootDir);
   const learningEventLog = new LearningEventLog(rootDir);
   const deploymentRegistry = new StrategyDeploymentRegistry(rootDir);
+  const resolvedTradeLedger = new ResolvedTradeLedger(rootDir);
   const state = createDefaultLearningState(new Date('2026-03-24T00:00:00.000Z'));
 
   state.strategyVariants['variant:strategy-live-1'] = {
@@ -154,6 +157,30 @@ async function testChampionChallengerPromotionStartsBoundedCanary(): Promise<voi
     lastUpdatedAt: '2026-03-24T00:00:00.000Z',
   };
   await learningStateStore.save(state);
+  for (const record of buildResolvedTrades({
+    count: 10,
+    strategyVariantId: 'variant:strategy-challenger-2',
+    strategyVersion: 'strategy-challenger-2',
+    regime: 'trend_burst',
+    realizedNetEdgeBps: 84,
+    expectedNetEdgeBps: 68,
+    benchmarkState: 'outperforming',
+    lifecycleState: 'economically_resolved_with_portfolio_truth',
+  })) {
+    await resolvedTradeLedger.append(record);
+  }
+  for (const record of buildResolvedTrades({
+    count: 10,
+    strategyVariantId: 'variant:strategy-live-1',
+    strategyVersion: 'strategy-live-1',
+    regime: 'trend_burst',
+    realizedNetEdgeBps: 58,
+    expectedNetEdgeBps: 54,
+    benchmarkState: 'outperforming',
+    lifecycleState: 'economically_resolved_with_portfolio_truth',
+  })) {
+    await resolvedTradeLedger.append(record);
+  }
 
   const prisma = {
     strategyVersion: {
@@ -196,6 +223,9 @@ async function testChampionChallengerPromotionStartsBoundedCanary(): Promise<voi
     learningStateStore,
     learningEventLog,
     deploymentRegistry,
+    undefined,
+    undefined,
+    resolvedTradeLedger,
   );
   await job.run({
     force: true,
@@ -208,11 +238,108 @@ async function testChampionChallengerPromotionStartsBoundedCanary(): Promise<voi
     registryState.activeRollout?.challengerVariantId,
     'variant:strategy-challenger-2',
   );
+  assert.strictEqual(registryState.activeRollout?.stage, 'paper');
   assert.strictEqual(
-    registryState.activeRollout?.stage === 'canary_5pct' ||
-      registryState.activeRollout?.stage === 'canary_1pct',
+    (registryState.variants['variant:strategy-challenger-2']?.liveTrustScore ?? 0) > 0,
     true,
   );
+  const reviewedState = await learningStateStore.load();
+  const evidence =
+    reviewedState.strategyVariants['variant:strategy-challenger-2']?.lastPromotionDecision
+      .evidence ?? null;
+  assert.ok(evidence);
+  assert.strictEqual(
+    ((evidence as { liveEvidencePacket?: { tradeCount?: number } }).liveEvidencePacket?.tradeCount ??
+      0) >= 8,
+    true,
+  );
+}
+
+async function testChampionChallengerFlowBlocksPromotionWithoutLiveTruth(): Promise<void> {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'phase6-live-gate-block-'));
+  const learningStateStore = new LearningStateStore(rootDir);
+  const learningEventLog = new LearningEventLog(rootDir);
+  const deploymentRegistry = new StrategyDeploymentRegistry(rootDir);
+  const resolvedTradeLedger = new ResolvedTradeLedger(rootDir);
+  const state = createDefaultLearningState(new Date('2026-03-24T00:00:00.000Z'));
+
+  state.strategyVariants['variant:strategy-live-1'] = {
+    strategyVariantId: 'variant:strategy-live-1',
+    health: 'healthy',
+    lastLearningAt: '2026-03-24T00:00:00.000Z',
+    regimeSnapshots: {},
+    calibrationContexts: ['strategy:variant:strategy-live-1|regime:all'],
+    executionLearning: {
+      ...createDefaultExecutionLearningState(),
+      updatedAt: '2026-03-24T00:00:00.000Z',
+    },
+    lastPromotionDecision: { decision: 'not_evaluated', reasons: [], evidence: {}, decidedAt: null },
+    lastQuarantineDecision: { status: 'none', severity: 'none', reasons: [], scope: {}, decidedAt: null },
+    lastCapitalAllocationDecision: { status: 'unchanged', targetMultiplier: 1, reasons: [], decidedAt: null },
+  };
+  state.strategyVariants['variant:strategy-challenger-2'] = {
+    strategyVariantId: 'variant:strategy-challenger-2',
+    health: 'healthy',
+    lastLearningAt: '2026-03-24T00:00:00.000Z',
+    regimeSnapshots: {},
+    calibrationContexts: ['strategy:variant:strategy-challenger-2|regime:all'],
+    executionLearning: {
+      ...createDefaultExecutionLearningState(),
+      updatedAt: '2026-03-24T00:00:00.000Z',
+    },
+    lastPromotionDecision: { decision: 'not_evaluated', reasons: [], evidence: {}, decidedAt: null },
+    lastQuarantineDecision: { status: 'none', severity: 'none', reasons: [], scope: {}, decidedAt: null },
+    lastCapitalAllocationDecision: { status: 'unchanged', targetMultiplier: 1, reasons: [], decidedAt: null },
+  };
+  await learningStateStore.save(state);
+
+  const prisma = {
+    strategyVersion: {
+      findMany: async () => [
+        {
+          id: 'strategy-live-1',
+          name: 'live',
+          isActive: true,
+          createdAt: new Date('2026-03-20T00:00:00.000Z'),
+          updatedAt: new Date('2026-03-24T00:00:00.000Z'),
+        },
+        {
+          id: 'strategy-challenger-2',
+          name: 'challenger',
+          isActive: false,
+          createdAt: new Date('2026-03-21T00:00:00.000Z'),
+          updatedAt: new Date('2026-03-24T00:05:00.000Z'),
+        },
+      ],
+    },
+    executionDiagnostic: { findMany: async () => [] },
+    order: { findMany: async () => [] },
+    orderbook: { findFirst: async () => null },
+    fill: { findMany: async () => [] },
+    auditEvent: { findMany: async () => [] },
+  };
+
+  const job = new DailyReviewJob(
+    prisma as never,
+    learningStateStore,
+    learningEventLog,
+    deploymentRegistry,
+    undefined,
+    undefined,
+    resolvedTradeLedger,
+  );
+  await job.run({
+    force: true,
+    now: new Date('2026-03-24T00:10:00.000Z'),
+  });
+
+  const registryState = await deploymentRegistry.load();
+  assert.strictEqual(registryState.activeRollout, null);
+  const reviewedState = await learningStateStore.load();
+  const reasons =
+    reviewedState.strategyVariants['variant:strategy-challenger-2']?.lastPromotionDecision
+      .reasons ?? [];
+  assert.strictEqual(reasons.includes('minimum_live_trade_count_not_met'), true);
 }
 
 async function testRollbackControllerReversesUnsafeChallenger(): Promise<void> {
@@ -336,11 +463,110 @@ async function testRollbackControllerReversesUnsafeChallenger(): Promise<void> {
 
 export const waveFiveChampionChallengerIntegrationTests = [
   {
-    name: 'wave5 champion challenger starts bounded canary rollout',
-    fn: testChampionChallengerPromotionStartsBoundedCanary,
+    name: 'phase6 champion challenger promotion requires live gate and starts paper rollout',
+    fn: testChampionChallengerPromotionRequiresLiveGateAndStartsPaperRollout,
+  },
+  {
+    name: 'phase6 champion challenger flow blocks promotion without live truth',
+    fn: testChampionChallengerFlowBlocksPromotionWithoutLiveTruth,
   },
   {
     name: 'wave5 rollback controller reverses unsafe challenger rollout',
     fn: testRollbackControllerReversesUnsafeChallenger,
   },
 ];
+
+function buildResolvedTrades(input: {
+  count: number;
+  strategyVariantId: string;
+  strategyVersion: string;
+  regime: string;
+  realizedNetEdgeBps: number;
+  expectedNetEdgeBps: number;
+  benchmarkState: 'outperforming' | 'neutral' | 'underperforming' | 'context_missing';
+  lifecycleState:
+    | 'economically_resolved'
+    | 'economically_resolved_with_portfolio_truth';
+}): ResolvedTradeRecord[] {
+  return Array.from({ length: input.count }, (_, index) => ({
+    tradeId: `${input.strategyVariantId}:trade:${index + 1}`,
+    orderId: `${input.strategyVariantId}:order:${index + 1}`,
+    venueOrderId: `${input.strategyVariantId}:venue:${index + 1}`,
+    marketId: 'market-btc',
+    tokenId: 'token-up',
+    strategyVariantId: input.strategyVariantId,
+    strategyVersion: input.strategyVersion,
+    regime: input.regime,
+    archetype: 'trend_follow_through',
+    decisionTimestamp: new Date(Date.UTC(2026, 2, 20, 0, index)).toISOString(),
+    submissionTimestamp: new Date(Date.UTC(2026, 2, 20, 0, index, 1)).toISOString(),
+    firstFillTimestamp: new Date(Date.UTC(2026, 2, 20, 0, index, 2)).toISOString(),
+    finalizedTimestamp: new Date(Date.UTC(2026, 2, 20, 0, index, 10)).toISOString(),
+    side: 'BUY',
+    intendedPrice: 0.51,
+    averageFillPrice: 0.512,
+    size: 20,
+    notional: 10.24,
+    estimatedFeeAtDecision: 0.05,
+    realizedFee: 0.051,
+    estimatedSlippageBps: 14,
+    realizedSlippageBps: 16,
+    queueDelayMs: 4_000,
+    fillFraction: 1,
+    expectedNetEdgeBps: input.expectedNetEdgeBps,
+    realizedNetEdgeBps: input.realizedNetEdgeBps - index,
+    maxFavorableExcursionBps: 105,
+    maxAdverseExcursionBps: -22,
+    toxicityScoreAtDecision: 0.14,
+    benchmarkContext: {
+      benchmarkComparisonState: input.benchmarkState,
+      baselinePenaltyMultiplier: input.benchmarkState === 'outperforming' ? 1 : 0.8,
+      regimeBenchmarkGateState: input.benchmarkState === 'outperforming' ? 'passed' : 'blocked',
+      underperformedBenchmarkIds:
+        input.benchmarkState === 'underperforming' ? ['btc_follow_baseline'] : [],
+      outperformedBenchmarkIds:
+        input.benchmarkState === 'outperforming' ? ['btc_follow_baseline'] : [],
+      reasonCodes: ['fixture'],
+    },
+    lossAttributionCategory: 'mixed',
+    executionAttributionCategory: 'queue_decay',
+    lifecycleState: input.lifecycleState,
+    attribution: {
+      benchmarkContext: {
+        benchmarkComparisonState: input.benchmarkState,
+        baselinePenaltyMultiplier: input.benchmarkState === 'outperforming' ? 1 : 0.8,
+        regimeBenchmarkGateState: input.benchmarkState === 'outperforming' ? 'passed' : 'blocked',
+        underperformedBenchmarkIds:
+          input.benchmarkState === 'underperforming' ? ['btc_follow_baseline'] : [],
+        outperformedBenchmarkIds:
+          input.benchmarkState === 'outperforming' ? ['btc_follow_baseline'] : [],
+        reasonCodes: ['fixture'],
+      },
+      lossAttributionCategory: 'mixed',
+      executionAttributionCategory: 'queue_decay',
+      primaryLeakageDriver: 'queue_delay',
+      secondaryLeakageDrivers: ['slippage'],
+      reasonCodes: ['fixture'],
+    },
+    executionQuality: {
+      intendedPrice: 0.51,
+      averageFillPrice: 0.512,
+      size: 20,
+      notional: 10.24,
+      estimatedFeeAtDecision: 0.05,
+      realizedFee: 0.051,
+      estimatedSlippageBps: 14,
+      realizedSlippageBps: 16,
+      queueDelayMs: 4_000,
+      fillFraction: 1,
+    },
+    netOutcome: {
+      expectedNetEdgeBps: input.expectedNetEdgeBps,
+      realizedNetEdgeBps: input.realizedNetEdgeBps - index,
+      maxFavorableExcursionBps: 105,
+      maxAdverseExcursionBps: -22,
+      realizedPnl: 0.9,
+    },
+    capturedAt: new Date(Date.UTC(2026, 2, 20, 0, index, 10)).toISOString(),
+  }));
+}

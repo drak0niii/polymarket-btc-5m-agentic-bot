@@ -55,19 +55,14 @@ export class LearningCycleRunner {
     const warnings: string[] = [];
     const errors: string[] = [];
     const events: LearningEvent[] = [];
-    const nextState: LearningState = {
-      ...input.priorState,
-      strategyVariants: {
-        ...input.priorState.strategyVariants,
-      },
-      calibration: {
-        ...input.priorState.calibration,
-      },
-    };
+    const nextState: LearningState = cloneLearningState(input.priorState);
+    const samples = normalizeLearningCycleSamples(input.samples);
 
     let attributedSnapshots: ReturnType<RegimeEdgeAttribution['attribute']> = [];
     try {
-      attributedSnapshots = this.attribution.attribute(input.samples);
+      attributedSnapshots = this.attribution
+        .attribute(samples)
+        .sort((left, right) => left.key.localeCompare(right.key));
     } catch (error) {
       errors.push(`regime_edge_attribution_failed:${errorMessage(error)}`);
     }
@@ -77,7 +72,9 @@ export class LearningCycleRunner {
       decayReasons: [] as string[],
     }));
     try {
-      assessedSnapshots = this.edgeDecayDetector.assessAll(attributedSnapshots);
+      assessedSnapshots = this.edgeDecayDetector
+        .assessAll(attributedSnapshots)
+        .sort((left, right) => left.key.localeCompare(right.key));
     } catch (error) {
       errors.push(`edge_decay_detection_failed:${errorMessage(error)}`);
     }
@@ -112,7 +109,7 @@ export class LearningCycleRunner {
     let degradedContexts: string[] = [];
     try {
       const calibrationResult = await this.calibrationUpdater.update(
-        input.samples.map(
+        samples.map(
           (sample): CalibrationObservation => ({
             strategyVariantId: sample.strategyVariantId,
             regime: sample.regime,
@@ -126,7 +123,7 @@ export class LearningCycleRunner {
       );
       nextState.calibration = calibrationResult.calibration;
       calibrationUpdates = calibrationResult.updates;
-      degradedContexts = calibrationResult.degradedContexts;
+      degradedContexts = dedupeAndSortStrings(calibrationResult.degradedContexts);
       events.push(...calibrationResult.events);
     } catch (error) {
       errors.push(`live_calibration_update_failed:${errorMessage(error)}`);
@@ -138,7 +135,7 @@ export class LearningCycleRunner {
       (calibration) => calibration.shrinkageFactor < 0.999,
     ).length;
 
-    if (input.samples.length === 0) {
+    if (samples.length === 0) {
       warnings.push('no_realized_outcomes_in_window');
     }
     if (assessedSnapshots.length === 0) {
@@ -163,13 +160,13 @@ export class LearningCycleRunner {
         from: input.analyzedWindow.from.toISOString(),
         to: input.analyzedWindow.to.toISOString(),
       },
-      realizedOutcomeCount: input.samples.length,
+      realizedOutcomeCount: samples.length,
       attributionSliceCount: assessedSnapshots.length,
       calibrationUpdates,
       shrinkageActions,
       degradedContexts,
-      warnings,
-      errors,
+      warnings: dedupeAndSortStrings(warnings),
+      errors: dedupeAndSortStrings(errors),
     };
 
     nextState.lastCycleStartedAt = summary.startedAt;
@@ -195,7 +192,7 @@ export class LearningCycleRunner {
     return {
       nextState,
       summary,
-      events,
+      events: sortLearningEvents(events),
     };
   }
 
@@ -274,4 +271,149 @@ function worstHealth(healths: HealthLabel[]): HealthLabel {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function normalizeLearningCycleSamples(
+  samples: LearningCycleSample[],
+): LearningCycleSample[] {
+  return [...samples]
+    .map((sample) => ({
+      ...sample,
+      strategyVariantId: normalizeString(sample.strategyVariantId, 'unknown_strategy_variant'),
+      regime: normalizeNullableString(sample.regime),
+      side: sample.side ?? 'unknown',
+      expectedEv: finiteOrZero(sample.expectedEv),
+      realizedEv: finiteOrZero(sample.realizedEv),
+      fillRate: finiteOrNull(sample.fillRate),
+      realizedSlippage: finiteOrNull(sample.realizedSlippage),
+      liquidityDepth: finiteOrNull(sample.liquidityDepth),
+      spread: finiteOrNull(sample.spread),
+      timeToExpirySeconds: finiteOrNull(sample.timeToExpirySeconds),
+      entryDelayMs: finiteOrNull(sample.entryDelayMs),
+      executionStyle: sample.executionStyle ?? 'unknown',
+      observedAt: normalizeString(sample.observedAt, new Date(0).toISOString()),
+      predictedProbability: clampProbability(sample.predictedProbability),
+      realizedOutcome: sample.realizedOutcome > 0 ? 1 : 0,
+    }))
+    .sort(compareLearningCycleSamples);
+}
+
+function compareLearningCycleSamples(
+  left: LearningCycleSample,
+  right: LearningCycleSample,
+): number {
+  return (
+    compareStrings(left.strategyVariantId, right.strategyVariantId) ||
+    compareNullableStrings(left.regime, right.regime) ||
+    compareStrings(left.observedAt, right.observedAt) ||
+    compareStrings(left.side, right.side) ||
+    compareStrings(left.executionStyle, right.executionStyle) ||
+    compareNumbers(left.expectedEv, right.expectedEv) ||
+    compareNumbers(left.realizedEv, right.realizedEv) ||
+    compareNullableNumbers(left.fillRate, right.fillRate) ||
+    compareNullableNumbers(left.realizedSlippage, right.realizedSlippage) ||
+    compareNullableNumbers(left.liquidityDepth, right.liquidityDepth) ||
+    compareNullableNumbers(left.spread, right.spread) ||
+    compareNullableNumbers(left.timeToExpirySeconds, right.timeToExpirySeconds) ||
+    compareNullableNumbers(left.entryDelayMs, right.entryDelayMs) ||
+    compareNumbers(left.predictedProbability, right.predictedProbability) ||
+    compareNumbers(left.realizedOutcome, right.realizedOutcome)
+  );
+}
+
+function sortLearningEvents(events: LearningEvent[]): LearningEvent[] {
+  return [...events].sort((left, right) => {
+    return (
+      compareStrings(left.createdAt, right.createdAt) ||
+      compareNumbers(eventTypePriority(left.type), eventTypePriority(right.type)) ||
+      compareNullableStrings(left.strategyVariantId, right.strategyVariantId) ||
+      compareNullableStrings(left.contextKey, right.contextKey) ||
+      compareStrings(left.id, right.id)
+    );
+  });
+}
+
+function eventTypePriority(type: LearningEvent['type']): number {
+  switch (type) {
+    case 'edge_decay_detected':
+      return 10;
+    case 'calibration_updated':
+      return 20;
+    case 'confidence_shrinkage_changed':
+      return 30;
+    case 'learning_cycle_completed':
+      return 90;
+    case 'learning_cycle_failed':
+      return 100;
+    default:
+      return 50;
+  }
+}
+
+function cloneLearningState(state: LearningState): LearningState {
+  return JSON.parse(JSON.stringify(state)) as LearningState;
+}
+
+function dedupeAndSortStrings(values: string[]): string[] {
+  return [...new Set(values)].sort((left, right) => left.localeCompare(right));
+}
+
+function normalizeString(value: string | null | undefined, fallback: string): string {
+  return typeof value === 'string' && value.trim().length > 0 ? value : fallback;
+}
+
+function normalizeNullableString(value: string | null | undefined): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value : null;
+}
+
+function compareStrings(left: string, right: string): number {
+  return left.localeCompare(right);
+}
+
+function compareNullableStrings(left: string | null, right: string | null): number {
+  if (left == null && right == null) {
+    return 0;
+  }
+  if (left == null) {
+    return -1;
+  }
+  if (right == null) {
+    return 1;
+  }
+  return left.localeCompare(right);
+}
+
+function compareNumbers(left: number, right: number): number {
+  if (left === right) {
+    return 0;
+  }
+  return left < right ? -1 : 1;
+}
+
+function compareNullableNumbers(left: number | null, right: number | null): number {
+  if (left == null && right == null) {
+    return 0;
+  }
+  if (left == null) {
+    return -1;
+  }
+  if (right == null) {
+    return 1;
+  }
+  return compareNumbers(left, right);
+}
+
+function finiteOrZero(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function finiteOrNull(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function clampProbability(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0.5;
+  }
+  return Math.max(0.0001, Math.min(0.9999, value));
 }

@@ -21,4 +21,8 @@ export interface CapitalRampVerdict {
   allowScaling: boolean;
   capitalMultiplier: number;
   reasons: string[];
+  currentTrustLevel?: number | null;
+  evidenceThresholdsMet?: string[];
+  evidenceThresholdsUnmet?: string[];
+  promotionAllowed?: boolean;
 }

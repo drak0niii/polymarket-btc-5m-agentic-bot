@@ -37,9 +37,14 @@ export interface UserWebSocketHealth {
   healthy: boolean;
   reasonCode: string | null;
   connectionStatus: 'idle' | 'connecting' | 'connected' | 'disconnected' | 'failed';
+  connected: boolean;
+  stale: boolean;
   lastEventAt: string | null;
   lastTrafficAt: string | null;
+  lastEventAgeMs: number | null;
+  lastTrafficAgeMs: number | null;
   openOrders: number;
+  liveOrdersWhileStale: boolean;
   recentTrades: number;
   divergenceDetected: boolean;
   lastReconciliationAt: string | null;
@@ -315,6 +320,13 @@ export class UserWebSocketStateService {
     const trafficStale =
       !this.lastTrafficAt ||
       now - new Date(this.lastTrafficAt).getTime() > this.staleAfterMs;
+    const eventAgeMs =
+      this.lastEventAt == null ? null : Math.max(0, now - new Date(this.lastEventAt).getTime());
+    const trafficAgeMs =
+      this.lastTrafficAt == null
+        ? null
+        : Math.max(0, now - new Date(this.lastTrafficAt).getTime());
+    const liveOrdersWhileStale = trafficStale && this.openOrders.size > 0;
 
     return {
       healthy:
@@ -336,9 +348,14 @@ export class UserWebSocketStateService {
                   ? 'user_stream_stale'
                   : null,
       connectionStatus: this.connectionStatus,
+      connected: this.connectionStatus === 'connected',
+      stale: trafficStale,
       lastEventAt: this.lastEventAt,
       lastTrafficAt: this.lastTrafficAt,
+      lastEventAgeMs: eventAgeMs,
+      lastTrafficAgeMs: trafficAgeMs,
       openOrders: this.openOrders.size,
+      liveOrdersWhileStale,
       recentTrades: this.recentTrades.size,
       divergenceDetected: this.divergenceDetected,
       lastReconciliationAt: this.lastReconciliationAt,

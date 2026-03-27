@@ -24,6 +24,7 @@ export interface CapitalLeakReviewResult {
   report: CapitalLeakReport;
   warnings: string[];
   tradeQualityCount: number;
+  splitLeakSummary: Record<string, number>;
   reportPath: string;
 }
 
@@ -83,6 +84,7 @@ export class CapitalLeakReviewJob {
       to: input.to.toISOString(),
       attributions,
     });
+    const splitLeakSummary = summarizeLeakFamilies(report);
     await this.persistReport(report);
 
     const warnings =
@@ -99,6 +101,7 @@ export class CapitalLeakReviewJob {
       summary: `Capital leak review computed for ${input.from.toISOString()} to ${input.to.toISOString()}.`,
       payload: {
         report,
+        splitLeakSummary,
         warnings,
         tradeQualityCount: tradeQualityScores.length,
       },
@@ -117,6 +120,7 @@ export class CapitalLeakReviewJob {
       report,
       warnings,
       tradeQualityCount: tradeQualityScores.length,
+      splitLeakSummary,
       reportPath: this.latestReportPath,
     };
   }
@@ -622,6 +626,48 @@ export function createDefaultTradeQualityHistoryStore(
 interface CapitalLeakObservation {
   capitalLeakInput: CapitalLeakAttributionInput;
   tradeQualityInput: Parameters<TradeQualityScorer['score']>[0];
+}
+
+function summarizeLeakFamilies(report: CapitalLeakReport): Record<string, number> {
+  const summary = {
+    alpha_wrong: 0,
+    execution_wrong: 0,
+    size_too_large: 0,
+    regime_wrong: 0,
+    adverse_selection: 0,
+    fee_slippage_underestimation: 0,
+  };
+
+  for (const [category, totalLeak] of Object.entries(report.categoryTotals)) {
+    if (typeof totalLeak !== 'number' || !Number.isFinite(totalLeak)) {
+      continue;
+    }
+    switch (category) {
+      case 'false_positive_forecast':
+      case 'calibration_error':
+      case 'overtrading':
+        summary.alpha_wrong += totalLeak;
+        break;
+      case 'missed_fills':
+      case 'venue_degradation_cost':
+        summary.execution_wrong += totalLeak;
+        break;
+      case 'poor_sizing':
+        summary.size_too_large += totalLeak;
+        break;
+      case 'degraded_regime_trading':
+        summary.regime_wrong += totalLeak;
+        break;
+      case 'adverse_selection':
+        summary.adverse_selection += totalLeak;
+        break;
+      case 'slippage':
+        summary.fee_slippage_underestimation += totalLeak;
+        break;
+    }
+  }
+
+  return summary;
 }
 
 function isNotFound(error: unknown): boolean {

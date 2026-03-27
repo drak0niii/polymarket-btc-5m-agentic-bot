@@ -5,6 +5,7 @@ import type {
 } from '@polymarket-btc-5m-agentic-bot/domain';
 import type { EventMicrostructureFeatures } from './event-microstructure-model';
 import type { NetEdgeThresholdDecision } from './net-edge-threshold-policy';
+import type { NoTradeReasonCode } from './no-trade/no-trade-classifier';
 
 export type NoTradeZoneReason =
   | 'near_expiry'
@@ -25,6 +26,11 @@ export type NoTradeZoneReason =
 export interface NoTradeZoneVerdict {
   blocked: boolean;
   reasons: NoTradeZoneReason[];
+  evidenceSummary: {
+    empiricalBlockRate: number | null;
+    empiricalSampleCount: number | null;
+    dominantReasonCodes: NoTradeReasonCode[];
+  };
 }
 
 export class NoTradeZonePolicy {
@@ -44,8 +50,19 @@ export class NoTradeZonePolicy {
     regimeHealth?: HealthLabel | null;
     executionContextHealthy?: boolean;
     venueUncertaintyLabel?: NetEdgeVenueUncertaintyLabel | null;
+    regimeTransitionRisk?: number | null;
+    empiricalEvidence?: {
+      blockRate?: number | null;
+      sampleCount?: number | null;
+      dominantReasonCodes?: NoTradeReasonCode[];
+    } | null;
   }): NoTradeZoneVerdict {
     const reasons: NoTradeZoneReason[] = [];
+    const empiricalBlockRate = finiteOrNull(input.empiricalEvidence?.blockRate);
+    const empiricalSampleCount = finiteOrNull(input.empiricalEvidence?.sampleCount);
+    const dominantReasonCodes = [
+      ...new Set(input.empiricalEvidence?.dominantReasonCodes ?? []),
+    ];
 
     if (
       input.timeToExpirySeconds != null &&
@@ -108,7 +125,9 @@ export class NoTradeZonePolicy {
     if (
       input.regimeHealth === 'quarantine_candidate' ||
       (input.regimeHealth === 'degraded' &&
-        (input.thresholdDecision?.marginAboveThreshold ?? -1) < 0.002)
+        (input.thresholdDecision?.marginAboveThreshold ?? -1) < 0.002) ||
+      ((input.regimeTransitionRisk ?? 0) >= 0.62 &&
+        (empiricalBlockRate == null || empiricalBlockRate >= 0.45))
     ) {
       reasons.push('poor_regime_health');
     }
@@ -125,9 +144,50 @@ export class NoTradeZonePolicy {
       reasons.push('venue_instability');
     }
 
+    if (
+      empiricalSampleCount != null &&
+      empiricalSampleCount >= 6 &&
+      empiricalBlockRate != null &&
+      empiricalBlockRate >= 0.6
+    ) {
+      if (
+        dominantReasonCodes.includes('spread_too_wide') &&
+        input.spread > 0.04
+      ) {
+        reasons.push('spread_blowout');
+      }
+      if (
+        dominantReasonCodes.includes('low_depth') &&
+        input.topLevelDepth < 28
+      ) {
+        reasons.push('thin_depth');
+      }
+      if (
+        dominantReasonCodes.includes('high_toxicity') &&
+        input.microstructure.decayPressure >= 0.6
+      ) {
+        reasons.push('microstructure_chaos');
+      }
+      if (
+        dominantReasonCodes.includes('venue_uncertainty_elevated') &&
+        input.venueUncertaintyLabel === 'degraded'
+      ) {
+        reasons.push('venue_instability');
+      }
+    }
+
     return {
       blocked: reasons.length > 0,
-      reasons,
+      reasons: [...new Set(reasons)],
+      evidenceSummary: {
+        empiricalBlockRate,
+        empiricalSampleCount,
+        dominantReasonCodes,
+      },
     };
   }
+}
+
+function finiteOrNull(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }

@@ -20,6 +20,14 @@ interface VenueOpenOrder {
   tokenId: string;
 }
 
+interface ExecutionWatchdogDirective {
+  runtimeState: BotRuntimeState | null;
+  degradeOrderPersistence: boolean;
+  avoidBlindReposts: boolean;
+  forceCancelOnlyBehavior: boolean;
+  reasonCodes: string[];
+}
+
 export class ManageOpenOrdersJob {
   private readonly logger = new AppLogger('ManageOpenOrdersJob');
   private readonly cancelReplacePolicy = new CancelReplacePolicy();
@@ -69,6 +77,7 @@ export class ManageOpenOrdersJob {
     await this.recordCheckpoint(cycleKey, 'processing', {
       forceCancelAll,
     });
+    const watchdogDirective = await this.loadExecutionWatchdogDirective();
 
     const localOpenOrders = await this.prisma.order.findMany({
       where: {
@@ -285,12 +294,18 @@ export class ManageOpenOrdersJob {
           signalAgeMs,
           maxSignalAgeMs: Math.max(appEnv.BOT_ORDER_STALE_AFTER_MS * 2, 45_000),
           ageMs,
-          waitingBeforeReplaceMs: Math.max(2_000, Math.floor(appEnv.BOT_ORDER_STALE_AFTER_MS / 2)),
-          maxRestingAgeMs: appEnv.BOT_ORDER_STALE_AFTER_MS,
+          waitingBeforeReplaceMs: watchdogDirective.degradeOrderPersistence
+            ? Math.max(1_000, Math.floor(appEnv.BOT_ORDER_STALE_AFTER_MS / 4))
+            : Math.max(2_000, Math.floor(appEnv.BOT_ORDER_STALE_AFTER_MS / 2)),
+          maxRestingAgeMs: watchdogDirective.degradeOrderPersistence
+            ? Math.max(2_000, Math.floor(appEnv.BOT_ORDER_STALE_AFTER_MS / 2))
+            : appEnv.BOT_ORDER_STALE_AFTER_MS,
           repricesUsed,
-          maxRepricesPerSignal: 2,
+          maxRepricesPerSignal: watchdogDirective.avoidBlindReposts ? 0 : 2,
           fillProbability: fillProbability.fillProbability,
-          minimumFillProbability: orderIntent === 'ENTER' ? 0.35 : 0.2,
+          minimumFillProbability:
+            (orderIntent === 'ENTER' ? 0.35 : 0.2) +
+            (watchdogDirective.degradeOrderPersistence ? 0.1 : 0),
           priceDriftBps: this.computePriceDriftBps(order.price, currentPassivePrice),
           adverseMoveBps: this.computeAdverseMoveBps(orderSide, order.price, marketableReference),
           maxAllowedPriceDriftBps: orderIntent === 'ENTER' ? 10 : 20,
@@ -310,14 +325,27 @@ export class ManageOpenOrdersJob {
         });
         const forcedCancelReason = !eligibility.eligible
           ? eligibility.reasonMessage ?? eligibility.reasonCode
-          : null;
+          : watchdogDirective.forceCancelOnlyBehavior
+            ? watchdogDirective.reasonCodes[0] ?? 'execution_state_watchdog_cancel_only'
+            : null;
+        const normalizedPolicyAction =
+          watchdogDirective.avoidBlindReposts && policy.action === 'replace'
+            ? 'cancel'
+            : policy.action;
 
-        if (!forcedCancelReason && (policy.action === 'keep' || residualDecision === 'keep')) {
+        if (
+          !forcedCancelReason &&
+          (normalizedPolicyAction === 'keep' || residualDecision === 'keep')
+        ) {
           await this.prisma.order.update({
             where: { id: order.id },
             data: {
               lastError:
-                residualDecision === 'keep' ? 'residual_keep' : policy.reasonCode,
+                residualDecision === 'keep'
+                  ? 'residual_keep'
+                  : normalizedPolicyAction === 'cancel' && policy.action === 'replace'
+                    ? 'execution_state_watchdog_avoids_blind_repost'
+                    : policy.reasonCode,
               lastVenueSyncAt: new Date(),
             },
           });
@@ -372,15 +400,17 @@ export class ManageOpenOrdersJob {
             eventType:
               forcedCancelReason
                 ? 'order.market_ineligible'
-                : policy.action === 'replace'
+                : normalizedPolicyAction === 'replace'
                   ? 'order.replace_requested'
                   : 'order.cancel_requested',
             message:
               forcedCancelReason
                 ? 'Working order cancel was requested because the market became ineligible.'
-                : policy.action === 'replace'
-                ? 'Passive order cancel was requested to allow deterministic repost.'
-                : 'Passive order cancel was requested by deterministic execution policy.',
+                : normalizedPolicyAction === 'replace'
+                  ? 'Passive order cancel was requested to allow deterministic repost.'
+                  : watchdogDirective.forceCancelOnlyBehavior
+                    ? 'Passive order cancel was requested because execution truth degraded into cancel-only behavior.'
+                    : 'Passive order cancel was requested by deterministic execution policy.',
             metadata: {
               lifecycleState: policy.lifecycleState,
               reasonCode: forcedCancelReason ?? policy.reasonCode,
@@ -388,11 +418,12 @@ export class ManageOpenOrdersJob {
               residualDecision,
               eligibility,
               scoringActive: scoringStatusByOrderId.get(venueOrder.venueOrderId) ?? false,
+              watchdogDirective,
             } as object,
           },
         });
         if (
-          (forcedCancelReason || policy.action === 'cancel') &&
+          (forcedCancelReason || normalizedPolicyAction === 'cancel') &&
           orderIntent === 'ENTER' &&
           order.signalId
         ) {
@@ -462,6 +493,7 @@ export class ManageOpenOrdersJob {
       canceled,
       venueOpenOrders: venueSync.orders.length,
       forceCancelAll,
+      watchdogDirective,
     });
 
     await this.recordCheckpoint(cycleKey, 'completed', {
@@ -469,6 +501,7 @@ export class ManageOpenOrdersJob {
       canceled,
       venueOpenOrders: venueSync.orders.length,
       forceCancelAll,
+      watchdogDirective,
     });
 
     return {
@@ -569,6 +602,46 @@ export class ManageOpenOrdersJob {
         lastError: 'fill_probability_too_low',
       },
     });
+  }
+
+  private async loadExecutionWatchdogDirective(): Promise<ExecutionWatchdogDirective> {
+    if (!this.runtimeControl) {
+      return {
+        runtimeState: null,
+        degradeOrderPersistence: false,
+        avoidBlindReposts: false,
+        forceCancelOnlyBehavior: false,
+        reasonCodes: [],
+      };
+    }
+
+    const checkpoint = await this.runtimeControl.getLatestCheckpoint('execution_state_watchdog');
+    const details =
+      checkpoint?.details && typeof checkpoint.details === 'object'
+        ? (checkpoint.details as Record<string, unknown>)
+        : {};
+    const transitionRequest =
+      details.transitionRequest && typeof details.transitionRequest === 'object'
+        ? (details.transitionRequest as Record<string, unknown>)
+        : null;
+    const degradeOrderPersistence = Boolean(details.degradeOrderPersistence);
+    const avoidBlindReposts = Boolean(details.avoidBlindReposts);
+    const forceCancelOnlyBehavior = Boolean(details.forceCancelOnlyBehavior);
+    const reasonCodes = Array.isArray(details.reasonCodes)
+      ? details.reasonCodes.filter((value): value is string => typeof value === 'string')
+      : [];
+    const runtimeState =
+      transitionRequest && typeof transitionRequest.nextState === 'string'
+        ? (transitionRequest.nextState as BotRuntimeState)
+        : null;
+
+    return {
+      runtimeState,
+      degradeOrderPersistence,
+      avoidBlindReposts,
+      forceCancelOnlyBehavior,
+      reasonCodes,
+    };
   }
 
   private computePriceDriftBps(orderPrice: number, currentPassivePrice: number | null): number {

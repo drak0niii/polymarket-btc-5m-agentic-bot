@@ -4,18 +4,34 @@ import path from 'path';
 import type {
   CalibrationState,
   ExecutionLearningState,
+  LearningCycleStatus,
+  LearningDecisionEvidence,
+  LearningEvidenceReference,
+  LearningMetricSnapshot,
   LearningState,
+  LearningReviewOutputs,
+  LearningRollbackCriterion,
+  LearningParameterChange,
   PortfolioLearningState,
   StrategyVariantState,
 } from '@polymarket-btc-5m-agentic-bot/domain';
 import {
   createDefaultExecutionLearningContext,
   createDefaultExecutionLearningState,
+  createDefaultLearningDecisionEvidence,
   createDefaultLearningState,
   createDefaultPortfolioLearningState,
   createDefaultStrategyVariantState,
 } from '@polymarket-btc-5m-agentic-bot/domain';
 import { AppLogger } from '@worker/common/logger';
+
+const LEARNING_STATE_SCHEMA_VERSION = 2;
+
+export interface ResolvedTradeLedgerPointer {
+  resolvedTradeLedgerPath: string;
+  lastResolvedTradeAt: string | null;
+  lastResolvedTradeId: string | null;
+}
 
 export class LearningStateStore {
   private readonly logger = new AppLogger('LearningStateStore');
@@ -23,12 +39,14 @@ export class LearningStateStore {
   private readonly statePath: string;
   private readonly snapshotDir: string;
   private readonly corruptDir: string;
+  private readonly resolvedTradePointerPath: string;
 
   constructor(rootDir = path.join(resolveRepositoryRoot(), 'artifacts/learning')) {
     this.rootDir = rootDir;
     this.statePath = path.join(rootDir, 'learning-state.json');
     this.snapshotDir = path.join(rootDir, 'snapshots');
     this.corruptDir = path.join(rootDir, 'corrupt');
+    this.resolvedTradePointerPath = path.join(rootDir, 'resolved-trade-ledger.pointer.json');
   }
 
   async load(): Promise<LearningState> {
@@ -64,6 +82,12 @@ export class LearningStateStore {
     await this.ensureDirectories();
     const normalized = normalizeLearningState({
       ...state,
+      schemaVersion: Math.max(
+        typeof state.schemaVersion === 'number' && Number.isFinite(state.schemaVersion)
+          ? state.schemaVersion
+          : LEARNING_STATE_SCHEMA_VERSION,
+        LEARNING_STATE_SCHEMA_VERSION,
+      ),
       updatedAt: new Date().toISOString(),
     });
     const serialized = `${JSON.stringify(normalized, null, 2)}\n`;
@@ -85,13 +109,47 @@ export class LearningStateStore {
     statePath: string;
     snapshotDir: string;
     corruptDir: string;
+    resolvedTradePointerPath: string;
   } {
     return {
       rootDir: this.rootDir,
       statePath: this.statePath,
       snapshotDir: this.snapshotDir,
       corruptDir: this.corruptDir,
+      resolvedTradePointerPath: this.resolvedTradePointerPath,
     };
+  }
+
+  async loadResolvedTradePointer(): Promise<ResolvedTradeLedgerPointer | null> {
+    await this.ensureDirectories();
+    try {
+      const content = await fs.readFile(this.resolvedTradePointerPath, 'utf8');
+      return normalizeResolvedTradeLedgerPointer(JSON.parse(content));
+    } catch (error) {
+      if (readErrorCode(error) === 'ENOENT') {
+        return null;
+      }
+
+      this.logger.warn('Resolved-trade ledger pointer could not be read.', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  async saveResolvedTradePointer(pointer: ResolvedTradeLedgerPointer): Promise<void> {
+    await this.ensureDirectories();
+    const normalized = normalizeResolvedTradeLedgerPointer(pointer);
+    const serialized = `${JSON.stringify(normalized, null, 2)}\n`;
+    const tmpPath = `${this.resolvedTradePointerPath}.tmp`;
+
+    try {
+      await fs.writeFile(tmpPath, serialized, 'utf8');
+      await fs.rename(tmpPath, this.resolvedTradePointerPath);
+    } catch (error) {
+      await safeUnlink(tmpPath);
+      throw error;
+    }
   }
 
   private async ensureDirectories(): Promise<void> {
@@ -214,7 +272,7 @@ function normalizeLearningState(raw: unknown): LearningState {
     schemaVersion:
       typeof record.schemaVersion === 'number' && Number.isFinite(record.schemaVersion)
         ? record.schemaVersion
-        : base.schemaVersion,
+        : LEARNING_STATE_SCHEMA_VERSION,
     updatedAt: readString(record.updatedAt) ?? base.updatedAt,
     lastCycleStartedAt: readString(record.lastCycleStartedAt),
     lastCycleCompletedAt: readString(record.lastCycleCompletedAt),
@@ -231,19 +289,35 @@ function normalizeLearningCycleSummary(raw: unknown): LearningState['lastCycleSu
     return null;
   }
 
-  const summary = raw as LearningState['lastCycleSummary'] & Record<string, unknown>;
+  const summary = raw as Record<string, unknown>;
+  const startedAt = readString(summary.startedAt) ?? new Date(0).toISOString();
+  const completedAt = readString(summary.completedAt);
   return {
-    ...summary,
+    cycleId: readString(summary.cycleId) ?? 'unknown_cycle',
+    startedAt,
+    completedAt,
+    status: readLearningCycleStatus(summary.status) ?? 'completed',
+    analyzedWindow: normalizeAnalyzedWindow(summary.analyzedWindow, {
+      from: startedAt,
+      to: completedAt ?? startedAt,
+    }),
+    realizedOutcomeCount: readNumber(summary.realizedOutcomeCount),
+    attributionSliceCount: readNumber(summary.attributionSliceCount),
+    calibrationUpdates: readNumber(summary.calibrationUpdates),
+    shrinkageActions: readNumber(summary.shrinkageActions),
+    degradedContexts: normalizeStringArray(summary.degradedContexts),
+    warnings: normalizeStringArray(summary.warnings),
+    errors: normalizeStringArray(summary.errors),
     reviewOutputs: normalizeReviewOutputs(summary.reviewOutputs),
   };
 }
 
-function normalizeReviewOutputs(raw: unknown): Record<string, unknown> | null {
+function normalizeReviewOutputs(raw: unknown): LearningReviewOutputs | null {
   if (!raw || typeof raw !== 'object') {
     return null;
   }
 
-  const reviewOutputs = { ...(raw as Record<string, unknown>) };
+  const reviewOutputs = normalizeUnknownRecord(raw);
   if (
     reviewOutputs.retentionContext &&
     typeof reviewOutputs.retentionContext === 'object'
@@ -271,10 +345,30 @@ function normalizeReviewOutputs(raw: unknown): Record<string, unknown> | null {
   return reviewOutputs;
 }
 
+function normalizeResolvedTradeLedgerPointer(
+  raw: unknown,
+): ResolvedTradeLedgerPointer {
+  if (!raw || typeof raw !== 'object') {
+    return {
+      resolvedTradeLedgerPath: '',
+      lastResolvedTradeAt: null,
+      lastResolvedTradeId: null,
+    };
+  }
+
+  const record = raw as Record<string, unknown>;
+  return {
+    resolvedTradeLedgerPath: readString(record.resolvedTradeLedgerPath) ?? '',
+    lastResolvedTradeAt: readString(record.lastResolvedTradeAt),
+    lastResolvedTradeId: readString(record.lastResolvedTradeId),
+  };
+}
+
 function normalizeRetentionContextSummary(
   raw: Record<string, unknown>,
 ): Record<string, unknown> {
   return {
+    ...normalizeUnknownRecord(raw),
     generatedAt: readString(raw.generatedAt),
     sampleCount: readFiniteNumber(raw.sampleCount) ?? 0,
     retentionByRegime: normalizeContextEntries(raw.retentionByRegime, 12),
@@ -289,6 +383,7 @@ function normalizeCalibrationDriftAlertsSummary(
   raw: Record<string, unknown>,
 ): Record<string, unknown> {
   return {
+    ...normalizeUnknownRecord(raw),
     generatedAt: readString(raw.generatedAt),
     sampleCount: readFiniteNumber(raw.sampleCount) ?? 0,
     calibrationDriftState: readString(raw.calibrationDriftState) ?? 'stable',
@@ -312,6 +407,7 @@ function normalizeRegimeLocalSizingSummary(
   raw: Record<string, unknown>,
 ): Record<string, unknown> {
   return {
+    ...normalizeUnknownRecord(raw),
     generatedAt: readString(raw.generatedAt),
     sampleCount: readFiniteNumber(raw.sampleCount) ?? 0,
     byRegime: normalizeSizingEntries(raw.byRegime, 12),
@@ -329,6 +425,7 @@ function normalizeContextEntries(raw: unknown, limit: number): Array<Record<stri
     .filter((entry): entry is Record<string, unknown> => entry != null && typeof entry === 'object')
     .slice(0, limit)
     .map((entry) => ({
+      ...normalizeUnknownRecord(entry),
       contextType: readString(entry.contextType),
       contextValue: readString(entry.contextValue),
       sampleCount: readFiniteNumber(entry.sampleCount) ?? 0,
@@ -349,6 +446,7 @@ function normalizeSizingEntries(raw: unknown, limit: number): Array<Record<strin
     .filter((entry): entry is Record<string, unknown> => entry != null && typeof entry === 'object')
     .slice(0, limit)
     .map((entry) => ({
+      ...normalizeUnknownRecord(entry),
       contextType: readString(entry.contextType),
       contextValue: readString(entry.contextValue),
       sampleCount: readFiniteNumber(entry.sampleCount) ?? 0,
@@ -374,6 +472,7 @@ function normalizeCalibrationDriftEntries(
     .filter((entry): entry is Record<string, unknown> => entry != null && typeof entry === 'object')
     .slice(0, limit)
     .map((entry) => ({
+      ...normalizeUnknownRecord(entry),
       contextType: readString(entry.contextType),
       contextValue: readString(entry.contextValue),
       sampleCount: readFiniteNumber(entry.sampleCount) ?? 0,
@@ -414,19 +513,11 @@ function normalizeStrategyVariants(raw: unknown): Record<string, StrategyVariant
           : [],
         executionLearning:
           normalizeExecutionLearning(record.executionLearning),
-        lastPromotionDecision:
-          record.lastPromotionDecision && typeof record.lastPromotionDecision === 'object'
-            ? (record.lastPromotionDecision as StrategyVariantState['lastPromotionDecision'])
-            : variant.lastPromotionDecision,
-        lastQuarantineDecision:
-          record.lastQuarantineDecision && typeof record.lastQuarantineDecision === 'object'
-            ? (record.lastQuarantineDecision as StrategyVariantState['lastQuarantineDecision'])
-            : variant.lastQuarantineDecision,
-        lastCapitalAllocationDecision:
-          record.lastCapitalAllocationDecision &&
-          typeof record.lastCapitalAllocationDecision === 'object'
-            ? (record.lastCapitalAllocationDecision as StrategyVariantState['lastCapitalAllocationDecision'])
-            : variant.lastCapitalAllocationDecision,
+        lastPromotionDecision: normalizePromotionDecision(record.lastPromotionDecision),
+        lastQuarantineDecision: normalizeQuarantineDecision(record.lastQuarantineDecision),
+        lastCapitalAllocationDecision: normalizeCapitalAllocationDecision(
+          record.lastCapitalAllocationDecision,
+        ),
       };
       continue;
     }
@@ -713,14 +804,312 @@ function normalizeAllocationDecisions(
       reasons: Array.isArray(record.reasons)
         ? record.reasons.filter((item): item is string => typeof item === 'string')
         : [],
-      evidence:
-        record.evidence && typeof record.evidence === 'object'
-          ? (record.evidence as Record<string, unknown>)
-          : {},
+      evidence: normalizeLearningDecisionEvidence(record.evidence),
       decidedAt: readString(record.decidedAt),
     };
   }
   return next;
+}
+
+function normalizePromotionDecision(
+  raw: unknown,
+): StrategyVariantState['lastPromotionDecision'] {
+  const fallback = createDefaultStrategyVariantState('fallback').lastPromotionDecision;
+  if (!raw || typeof raw !== 'object') {
+    return fallback;
+  }
+
+  const record = raw as Record<string, unknown>;
+  return {
+    decision:
+      record.decision === 'not_evaluated' ||
+      record.decision === 'reject' ||
+      record.decision === 'shadow_only' ||
+      record.decision === 'canary' ||
+      record.decision === 'promote' ||
+      record.decision === 'rollback'
+        ? record.decision
+        : fallback.decision,
+    reasons: normalizeStringArray(record.reasons),
+    evidence: normalizeLearningDecisionEvidence(record.evidence),
+    rollbackCriteria: normalizeRollbackCriteria(record.rollbackCriteria),
+    decidedAt: readString(record.decidedAt),
+  };
+}
+
+function normalizeQuarantineDecision(
+  raw: unknown,
+): StrategyVariantState['lastQuarantineDecision'] {
+  const fallback = createDefaultStrategyVariantState('fallback').lastQuarantineDecision;
+  if (!raw || typeof raw !== 'object') {
+    return fallback;
+  }
+
+  const record = raw as Record<string, unknown>;
+  const scopeRecord =
+    record.scope && typeof record.scope === 'object'
+      ? (record.scope as Record<string, unknown>)
+      : {};
+
+  return {
+    status:
+      record.status === 'none' ||
+      record.status === 'watch' ||
+      record.status === 'probation' ||
+      record.status === 'quarantine_recommended' ||
+      record.status === 'quarantined'
+        ? record.status
+        : fallback.status,
+    severity:
+      record.severity === 'none' ||
+      record.severity === 'low' ||
+      record.severity === 'medium' ||
+      record.severity === 'high'
+        ? record.severity
+        : fallback.severity,
+    reasons: normalizeStringArray(record.reasons),
+    evidence: normalizeLearningDecisionEvidence(record.evidence),
+    scope: {
+      strategyVariantId: readString(scopeRecord.strategyVariantId),
+      regime: readString(scopeRecord.regime),
+      marketContext: readString(scopeRecord.marketContext),
+    },
+    decidedAt: readString(record.decidedAt),
+    until: readString(record.until),
+    rollbackCriteria: normalizeRollbackCriteria(record.rollbackCriteria),
+  };
+}
+
+function normalizeCapitalAllocationDecision(
+  raw: unknown,
+): StrategyVariantState['lastCapitalAllocationDecision'] {
+  const fallback = createDefaultStrategyVariantState('fallback').lastCapitalAllocationDecision;
+  if (!raw || typeof raw !== 'object') {
+    return fallback;
+  }
+
+  const record = raw as Record<string, unknown>;
+  return {
+    status:
+      record.status === 'unchanged' ||
+      record.status === 'reduce' ||
+      record.status === 'hold' ||
+      record.status === 'increase'
+        ? record.status
+        : fallback.status,
+    targetMultiplier: readNumber(record.targetMultiplier, fallback.targetMultiplier),
+    reasons: normalizeStringArray(record.reasons),
+    evidence: normalizeLearningDecisionEvidence(record.evidence),
+    decidedAt: readString(record.decidedAt),
+    rollbackCriteria: normalizeRollbackCriteria(record.rollbackCriteria),
+  };
+}
+
+function normalizeLearningDecisionEvidence(raw: unknown): LearningDecisionEvidence {
+  const fallback = createDefaultLearningDecisionEvidence();
+  if (!raw || typeof raw !== 'object') {
+    return fallback;
+  }
+
+  const record = raw as Record<string, unknown>;
+  const normalized = normalizeUnknownRecord(record);
+  return {
+    ...normalized,
+    summary: readString(record.summary),
+    evidenceRefs: normalizeEvidenceReferences(record.evidenceRefs),
+    metricSnapshot: normalizeMetricSnapshot(record.metricSnapshot),
+    changeSet: normalizeParameterChanges(record.changeSet),
+    warnings: normalizeStringArray(record.warnings),
+    payload: normalizeUnknownRecord(record.payload),
+  };
+}
+
+function normalizeEvidenceReferences(raw: unknown): LearningEvidenceReference[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  return raw
+    .filter((entry): entry is Record<string, unknown> => entry != null && typeof entry === 'object')
+    .map((entry) => ({
+      ...normalizeUnknownRecord(entry),
+      source:
+        entry.source === 'resolved_trade_ledger' ||
+        entry.source === 'learning_event_log' ||
+        entry.source === 'audit_event' ||
+        entry.source === 'validation_artifact' ||
+        entry.source === 'runtime_checkpoint' ||
+        entry.source === 'manual_review' ||
+        entry.source === 'unknown'
+          ? entry.source
+          : undefined,
+      sourceId: readString(entry.sourceId),
+      artifactPath: readString(entry.artifactPath),
+      strategyVariantId: readString(entry.strategyVariantId),
+      regime: readString(entry.regime),
+      marketId: readString(entry.marketId),
+      window:
+        entry.window && typeof entry.window === 'object'
+          ? normalizeEvidenceWindow(entry.window as Record<string, unknown>)
+          : null,
+      metricSnapshot: normalizeMetricSnapshot(entry.metricSnapshot),
+      notes: normalizeStringArray(entry.notes),
+    }));
+}
+
+function normalizeEvidenceWindow(
+  raw: Record<string, unknown>,
+): NonNullable<LearningEvidenceReference['window']> {
+  return {
+    ...normalizeUnknownRecord(raw),
+    from: readString(raw.from),
+    to: readString(raw.to),
+    sampleCount: readFiniteNumber(raw.sampleCount),
+  };
+}
+
+function normalizeMetricSnapshot(raw: unknown): LearningMetricSnapshot {
+  if (!raw || typeof raw !== 'object') {
+    return {};
+  }
+
+  const next: LearningMetricSnapshot = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean' ||
+      value === null
+    ) {
+      next[key] = value;
+    }
+  }
+  return next;
+}
+
+function normalizeParameterChanges(raw: unknown): LearningParameterChange[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  return raw
+    .filter((entry): entry is Record<string, unknown> => entry != null && typeof entry === 'object')
+    .map((entry) => {
+      const scope =
+        entry.scope && typeof entry.scope === 'object'
+          ? (entry.scope as Record<string, unknown>)
+          : {};
+      return {
+        ...normalizeUnknownRecord(entry),
+        parameter: readString(entry.parameter) ?? 'unknown_parameter',
+        previousValue: normalizeParameterValue(entry.previousValue),
+        nextValue: normalizeParameterValue(entry.nextValue),
+        scope: {
+          strategyVariantId: readString(scope.strategyVariantId),
+          regime: readString(scope.regime),
+          marketContext: readString(scope.marketContext),
+        },
+        rationale: normalizeStringArray(entry.rationale),
+        boundedBy: normalizeStringArray(entry.boundedBy),
+        evidenceRefs: normalizeEvidenceReferences(entry.evidenceRefs),
+        rollbackCriteria: normalizeRollbackCriteria(entry.rollbackCriteria),
+        changedAt: readString(entry.changedAt),
+      };
+    });
+}
+
+function normalizeRollbackCriteria(raw: unknown): LearningRollbackCriterion[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  return raw
+    .filter((entry): entry is Record<string, unknown> => entry != null && typeof entry === 'object')
+    .map((entry) => ({
+      ...normalizeUnknownRecord(entry),
+      trigger: readString(entry.trigger) ?? 'unknown_trigger',
+      comparator:
+        entry.comparator === 'lte' ||
+        entry.comparator === 'gte' ||
+        entry.comparator === 'eq' ||
+        entry.comparator === 'contains' ||
+        entry.comparator === 'exists'
+          ? entry.comparator
+          : undefined,
+      threshold: normalizeParameterValue(entry.threshold),
+      rationale: readString(entry.rationale) ?? undefined,
+    }));
+}
+
+function normalizeParameterValue(
+  value: unknown,
+): string | number | boolean | null | undefined {
+  if (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    value === null
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function normalizeAnalyzedWindow(
+  raw: unknown,
+  fallback: { from: string; to: string },
+): { from: string; to: string } {
+  if (!raw || typeof raw !== 'object') {
+    return fallback;
+  }
+  const record = raw as Record<string, unknown>;
+  return {
+    from: readString(record.from) ?? fallback.from,
+    to: readString(record.to) ?? fallback.to,
+  };
+}
+
+function normalizeStringArray(raw: unknown): string[] {
+  return Array.isArray(raw)
+    ? raw.filter((item): item is string => typeof item === 'string')
+    : [];
+}
+
+function normalizeUnknownRecord(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+
+  const next: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    next[key] = normalizeUnknownValue(value);
+  }
+  return next;
+}
+
+function normalizeUnknownValue(value: unknown, depth = 0): unknown {
+  if (depth > 6) {
+    return null;
+  }
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean'
+  ) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeUnknownValue(entry, depth + 1));
+  }
+  if (value && typeof value === 'object') {
+    const next: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      next[key] = normalizeUnknownValue(entry, depth + 1);
+    }
+    return next;
+  }
+  return null;
 }
 
 function readErrorCode(error: unknown): string | undefined {
@@ -768,6 +1157,14 @@ function readAllocationDecisionStatus(
     value === 'hold' ||
     value === 'reduce' ||
     value === 'block_scale'
+    ? value
+    : null;
+}
+
+function readLearningCycleStatus(value: unknown): LearningCycleStatus | null {
+  return value === 'completed' ||
+    value === 'completed_with_warnings' ||
+    value === 'failed'
     ? value
     : null;
 }

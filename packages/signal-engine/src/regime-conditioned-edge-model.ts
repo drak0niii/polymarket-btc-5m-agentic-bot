@@ -1,6 +1,8 @@
 import type { SignalFeatures } from './feature-builder';
 import type { RegimeClassification } from './regime-classifier';
 
+export type RegimeFamily = 'stable' | 'transitional' | 'hostile';
+
 export interface RegimeConditionedEdgeInput {
   priorProbability: number;
   posteriorProbability: number;
@@ -15,6 +17,10 @@ export interface RegimeConditionedEdgeOutput {
   confidence: number;
   allowed: boolean;
   reasonCode: string;
+  regimeFamily: RegimeFamily;
+  regimeRequiredConfidence: number;
+  regimeEdgeMultiplier: number;
+  regimeTransitionPenalty: number;
   capturedAt: string;
 }
 
@@ -27,17 +33,27 @@ export class RegimeConditionedEdgeModel {
       Math.sign(input.features.rollingReturnPct || 0)
         ? 1
         : 0.7;
+    const regimeFamily = classifyRegimeFamily(input.regime);
+    const regimeTransitionPenalty = clamp(
+      1 - input.regime.regimeTransitionRisk * 0.35,
+      0.45,
+      1,
+    );
+    const regimeRequiredConfidence =
+      regimeFamily === 'hostile' ? 0.82 : regimeFamily === 'transitional' ? 0.68 : 0.58;
 
     const confidence = clamp01(
       posteriorConfidence *
-        input.regime.confidence *
+        input.regime.regimeConfidence *
         input.regime.executionConfidenceMultiplier *
-        directionalAgreement,
+        directionalAgreement *
+        regimeTransitionPenalty,
     );
 
     const calibratedEdge =
       rawEdge *
       input.regime.edgeMultiplier *
+      regimeTransitionPenalty *
       (0.55 + confidence * 0.45) *
       this.sampleSufficiencyMultiplier(input.features.sampleCount);
 
@@ -47,6 +63,10 @@ export class RegimeConditionedEdgeModel {
       confidence,
       allowed: input.regime.tradingAllowed,
       reasonCode: input.regime.tradingAllowed ? 'passed' : input.regime.rejectionReasonCode,
+      regimeFamily,
+      regimeRequiredConfidence,
+      regimeEdgeMultiplier: input.regime.edgeMultiplier,
+      regimeTransitionPenalty,
       capturedAt: new Date().toISOString(),
     };
   }
@@ -66,4 +86,27 @@ function clamp01(value: number): number {
   }
 
   return Math.max(0, Math.min(1, value));
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+  return Math.max(min, Math.min(max, value));
+}
+
+function classifyRegimeFamily(regime: RegimeClassification): RegimeFamily {
+  if (
+    regime.regimeLabel === 'illiquid_noisy_book' ||
+    regime.regimeLabel === 'near_resolution_microstructure_chaos'
+  ) {
+    return 'hostile';
+  }
+  if (
+    regime.regimeLabel === 'spike_and_revert' ||
+    regime.regimeTransitionRisk >= 0.55
+  ) {
+    return 'transitional';
+  }
+  return 'stable';
 }

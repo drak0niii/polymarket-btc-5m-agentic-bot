@@ -7,6 +7,7 @@ export * from './learning-state';
 export * from './net-edge';
 export * from './readiness';
 export * from './research';
+export * from './resolved-trade';
 export * from './signal';
 export * from './strategy';
 export * from './strategy-variant';

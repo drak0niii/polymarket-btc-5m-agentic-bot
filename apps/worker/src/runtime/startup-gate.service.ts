@@ -4,6 +4,8 @@ import { SignerHealth } from '@polymarket-btc-5m-agentic-bot/signing-engine';
 import {
   StartupRunbook,
   StartupRunbookResult,
+  getDeploymentTierEvidenceThresholds,
+  isLiveExecutableDeploymentTier,
 } from './startup-runbook';
 import {
   CrashRecoveryResult,
@@ -86,6 +88,26 @@ export class StartupGateService {
 
     const runbook = await this.startupRunbook.run();
     checks.push(this.asCheck('startup_runbook', runbook.passed, runbook.reasonCode, runbook));
+    const liveTierHardGateRequired =
+      mode === 'live' &&
+      isLiveExecutableDeploymentTier(appEnv.BOT_DEPLOYMENT_TIER) &&
+      appEnv.BOT_REQUIRE_PRODUCTION_READINESS_PASS;
+    checks.push({
+      name: 'live_deployment_tier_enforcement',
+      passed: !liveTierHardGateRequired || runbook.passed,
+      blocking: liveTierHardGateRequired,
+      checkedAt: timestamp,
+      reasonCode:
+        !liveTierHardGateRequired || runbook.passed
+          ? null
+          : runbook.reasonCode ?? 'live_deployment_tier_requirements_not_met',
+      evidence: {
+        tier: appEnv.BOT_DEPLOYMENT_TIER,
+        requireProductionReadinessPass: appEnv.BOT_REQUIRE_PRODUCTION_READINESS_PASS,
+        thresholds: getDeploymentTierEvidenceThresholds(),
+        runbookPassed: runbook.passed,
+      },
+    });
 
     if (this.marketStreamService) {
       const marketStreamHealth = this.marketStreamService.evaluateHealth();

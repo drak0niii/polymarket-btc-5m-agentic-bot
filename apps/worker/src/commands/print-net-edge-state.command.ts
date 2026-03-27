@@ -1,9 +1,11 @@
+import { RealizedVsExpectedEdgeStore } from '@polymarket-btc-5m-agentic-bot/execution-engine';
 import {
   VenueHealthLearningStore,
   VenueModePolicy,
   VenueUncertaintyDetector,
 } from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
 import { LearningStateStore } from '@worker/runtime/learning-state-store';
+import { ResolvedTradeLedger } from '@worker/runtime/resolved-trade-ledger';
 import { VersionLineageRegistry } from '@worker/runtime/version-lineage-registry';
 
 async function main(): Promise<void> {
@@ -12,11 +14,15 @@ async function main(): Promise<void> {
   const venueHealthLearningStore = new VenueHealthLearningStore();
   const venueUncertaintyDetector = new VenueUncertaintyDetector();
   const venueModePolicy = new VenueModePolicy();
+  const resolvedTradeLedger = new ResolvedTradeLedger();
+  const realizedVsExpectedEdgeStore = new RealizedVsExpectedEdgeStore(resolvedTradeLedger);
 
-  const [learningState, venueHealth, recentLineage] = await Promise.all([
+  const [learningState, venueHealth, recentLineage, recentResolvedEdgeComparisons] =
+    await Promise.all([
     learningStateStore.load(),
     venueHealthLearningStore.getCurrentMetrics(),
     versionLineageRegistry.getLatestDecisions(200),
+    realizedVsExpectedEdgeStore.loadRecent(20),
   ]);
   const venueAssessment = venueUncertaintyDetector.evaluate(venueHealth);
   const venueMode = venueModePolicy.decide(venueAssessment);
@@ -38,8 +44,19 @@ async function main(): Promise<void> {
         tags: decision.tags,
         venueMode: decision.replay.venueMode,
         venueUncertainty: decision.replay.venueUncertainty,
+        feeModeling: bundle['feeModeling'] ?? null,
+        netRealismContext: bundle['netRealismContext'] ?? null,
         netEdgeDecision: bundle['netEdgeDecision'] ?? null,
+        netEdgeBreakdown:
+          bundle['netEdgeDecision'] &&
+          typeof bundle['netEdgeDecision'] === 'object' &&
+          bundle['netEdgeDecision'] !== null &&
+          'breakdown' in (bundle['netEdgeDecision'] as Record<string, unknown>)
+            ? (bundle['netEdgeDecision'] as Record<string, unknown>)['breakdown']
+            : null,
         netEdgeThreshold: bundle['netEdgeThreshold'] ?? null,
+        executionCostCalibration: bundle['executionCostCalibration'] ?? null,
+        executionCostAssessment: bundle['executionCostAssessment'] ?? null,
         noTradeZone: bundle['noTradeZone'] ?? null,
         uncertaintySizing: bundle['uncertaintySizing'] ?? null,
         sizePenalty: bundle['sizePenalty'] ?? null,
@@ -56,6 +73,7 @@ async function main(): Promise<void> {
         venueAssessment,
         venueMode,
         recentNetEdgeDecisions,
+        recentResolvedEdgeComparisons,
       },
       null,
       2,

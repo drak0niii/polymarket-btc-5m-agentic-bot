@@ -120,6 +120,10 @@ async function testP23ValidationProducesPhaseSixReports(): Promise<void> {
       payload.liveProofScorecard.summary.length > 0,
     true,
   );
+  assert.strictEqual(
+    payload.liveProofScorecard.blockers.includes('benchmark_underperformance_dominant'),
+    true,
+  );
 }
 
 async function testCapitalGrowthReviewPersistsActionableProofEvents(): Promise<void> {

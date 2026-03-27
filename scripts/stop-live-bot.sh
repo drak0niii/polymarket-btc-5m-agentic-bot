@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-curl -X POST http://127.0.0.1:3000/api/v1/bot-control/stop \
+BOT_CONTROL_BASE_URL="${BOT_CONTROL_BASE_URL:-http://127.0.0.1:${API_PORT:-3000}}"
+
+curl -X POST "${BOT_CONTROL_BASE_URL}/api/v1/bot-control/stop" \
   -H "Content-Type: application/json" \
   -d '{
     "reason": "stop requested from script",

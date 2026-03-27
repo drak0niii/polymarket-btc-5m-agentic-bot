@@ -4,6 +4,7 @@ export type StrategyVariantLifecycleStatus =
   | 'incumbent'
   | 'shadow'
   | 'canary'
+  | 'probation'
   | 'quarantined'
   | 'retired';
 
@@ -15,6 +16,10 @@ export type StrategyVariantEvaluationMode =
 
 export type StrategyRolloutStage =
   | 'shadow_only'
+  | 'paper'
+  | 'canary'
+  | 'cautious_live'
+  | 'scaled_live'
   | 'canary_1pct'
   | 'canary_5pct'
   | 'partial'
@@ -52,6 +57,12 @@ export interface StrategyVariantRecord {
   lineage: StrategyVariantLineage;
   capitalAllocationPct: number;
   lastShadowEvaluatedAt: string | null;
+  liveTrustScore?: number | null;
+  evidenceWindowStart?: string | null;
+  evidenceWindowEnd?: string | null;
+  promotionReasonCodes?: string[];
+  demotionReasonCodes?: string[];
+  quarantineUntil?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -93,6 +104,11 @@ export interface StrategyPromotionDecision {
     compoundingEfficiencyScore?: number | null;
     promotionGate?: Record<string, unknown>;
     stabilityCheck?: Record<string, unknown>;
+    livePromotionGate?: unknown | null;
+    liveDemotionGate?: unknown | null;
+    liveEvidencePacket?: unknown | null;
+    promotionOrDemotionDecision?: StrategyPromotionVerdict | null;
+    reasonCodes?: string[];
   };
   rollbackCriteria: StrategyRollbackTriggerCode[];
   decidedAt: string;
@@ -177,6 +193,12 @@ export function createStrategyVariantRecord(input: {
     },
     capitalAllocationPct: input.capitalAllocationPct ?? 0,
     lastShadowEvaluatedAt: null,
+    liveTrustScore: null,
+    evidenceWindowStart: null,
+    evidenceWindowEnd: null,
+    promotionReasonCodes: [],
+    demotionReasonCodes: [],
+    quarantineUntil: null,
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
   };

@@ -1,7 +1,9 @@
 import { AppLogger } from '@worker/common/logger';
-import { appEnv } from '@worker/config/env';
+import path from 'path';
+import { appEnv, type AppEnv } from '@worker/config/env';
 import { SignerHealth } from '@polymarket-btc-5m-agentic-bot/signing-engine';
 import { OfficialPolymarketTradingClient } from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
+import { LiveTrustScore } from '@polymarket-btc-5m-agentic-bot/risk-engine';
 import {
   ExternalPortfolioService,
   ExternalPortfolioSnapshot,
@@ -11,6 +13,9 @@ import {
   PolymarketSmokeResult,
   runPolymarketAuthenticatedSmoke,
 } from '@worker/smoke/polymarket-auth-smoke';
+import { readLatestDailyDecisionQualityReport } from '@worker/validation/daily-decision-quality-report';
+import { ResolvedTradeLedger } from './resolved-trade-ledger';
+import { StrategyDeploymentRegistry } from './strategy-deployment-registry';
 
 export type StartupRunbookStepName =
   | 'geoblock_clear'
@@ -22,7 +27,10 @@ export type StartupRunbookStepName =
   | 'dry_authenticated_read_path_tested'
   | 'heartbeat_path_tested'
   | 'cancel_path_tested'
-  | 'authenticated_venue_smoke_gate';
+  | 'authenticated_venue_smoke_gate'
+  | 'recent_smoke_test_timestamp'
+  | 'recent_production_readiness_pass'
+  | 'deployment_tier_live_evidence';
 
 export interface StartupRunbookStepResult {
   step: StartupRunbookStepName;
@@ -41,9 +49,194 @@ export interface StartupRunbookResult {
   externalSnapshot: ExternalPortfolioSnapshot | null;
 }
 
+type LiveExecutableDeploymentTier = Extract<
+  AppEnv['BOT_DEPLOYMENT_TIER'],
+  'canary' | 'cautious_live' | 'scaled_live'
+>;
+
+export interface DeploymentTierEvidenceThresholds {
+  tier: AppEnv['BOT_DEPLOYMENT_TIER'];
+  minLiveTrades: number;
+  minLiveTrustScore: number;
+  maxAllowedRealizedExpectedEdgeGapBps: number;
+  maxAllowedReconciliationDefectRate: number;
+  requireRecentReadinessPass: boolean;
+  requireRecentSmokePass: boolean;
+  requireDailyDecisionQualityReport: boolean;
+  requireShadowDecisionLogging: boolean;
+  requiredCheckpointMaxAgeMs: number;
+  dailyDecisionQualityMaxAgeMs: number;
+}
+
+export interface DeploymentTierEvidenceSnapshot {
+  tier: AppEnv['BOT_DEPLOYMENT_TIER'];
+  incumbentVariantId: string | null;
+  liveTradeCount: number;
+  liveTrustScore: number | null;
+  averageAbsoluteRealizedExpectedEdgeGapBps: number | null;
+  reconciliationDefectRate: number | null;
+  recentReadinessPassAt: string | null;
+  recentSmokePassAt: string | null;
+  dailyDecisionQualityReportAt: string | null;
+  shadowDecisionLoggingEnabled: boolean;
+}
+
+export interface DeploymentTierEvidenceAssessment {
+  ok: boolean;
+  reasonCodes: string[];
+  thresholds: DeploymentTierEvidenceThresholds;
+  summary: DeploymentTierEvidenceSnapshot;
+}
+
+export function isLiveExecutableDeploymentTier(
+  tier: AppEnv['BOT_DEPLOYMENT_TIER'],
+): tier is LiveExecutableDeploymentTier {
+  return tier === 'canary' || tier === 'cautious_live' || tier === 'scaled_live';
+}
+
+export function getDeploymentTierEvidenceThresholds(
+  env: Pick<
+    AppEnv,
+    | 'BOT_DEPLOYMENT_TIER'
+    | 'BOT_MIN_LIVE_TRADES_FOR_CANARY'
+    | 'BOT_MIN_LIVE_TRADES_FOR_CAUTIOUS_LIVE'
+    | 'BOT_MIN_LIVE_TRADES_FOR_SCALED_LIVE'
+    | 'BOT_MAX_ALLOWED_REALIZED_EXPECTED_EDGE_GAP_BPS'
+    | 'BOT_MAX_ALLOWED_RECONCILIATION_DEFECT_RATE'
+    | 'BOT_ENABLE_SHADOW_DECISION_LOGGING'
+    | 'BOT_REQUIRE_PRODUCTION_READINESS_PASS'
+    | 'BOT_MAX_VENUE_SMOKE_AGE_MS'
+  > = appEnv,
+): DeploymentTierEvidenceThresholds {
+  const liveTier = isLiveExecutableDeploymentTier(env.BOT_DEPLOYMENT_TIER);
+  const minLiveTrades =
+    env.BOT_DEPLOYMENT_TIER === 'scaled_live'
+      ? env.BOT_MIN_LIVE_TRADES_FOR_SCALED_LIVE
+      : env.BOT_DEPLOYMENT_TIER === 'cautious_live'
+        ? env.BOT_MIN_LIVE_TRADES_FOR_CAUTIOUS_LIVE
+        : env.BOT_DEPLOYMENT_TIER === 'canary'
+          ? env.BOT_MIN_LIVE_TRADES_FOR_CANARY
+          : 0;
+  const minLiveTrustScore =
+    env.BOT_DEPLOYMENT_TIER === 'scaled_live'
+      ? 0.8
+      : env.BOT_DEPLOYMENT_TIER === 'cautious_live'
+        ? 0.65
+        : env.BOT_DEPLOYMENT_TIER === 'canary'
+          ? 0.45
+          : 0;
+
+  return {
+    tier: env.BOT_DEPLOYMENT_TIER,
+    minLiveTrades,
+    minLiveTrustScore,
+    maxAllowedRealizedExpectedEdgeGapBps:
+      env.BOT_MAX_ALLOWED_REALIZED_EXPECTED_EDGE_GAP_BPS,
+    maxAllowedReconciliationDefectRate:
+      env.BOT_MAX_ALLOWED_RECONCILIATION_DEFECT_RATE,
+    requireRecentReadinessPass:
+      liveTier && env.BOT_REQUIRE_PRODUCTION_READINESS_PASS,
+    requireRecentSmokePass: liveTier,
+    requireDailyDecisionQualityReport: liveTier,
+    requireShadowDecisionLogging: liveTier,
+    requiredCheckpointMaxAgeMs: env.BOT_MAX_VENUE_SMOKE_AGE_MS,
+    dailyDecisionQualityMaxAgeMs: 36 * 60 * 60 * 1000,
+  };
+}
+
+export function assessDeploymentTierEvidence(
+  snapshot: DeploymentTierEvidenceSnapshot,
+  thresholds = getDeploymentTierEvidenceThresholds(),
+): DeploymentTierEvidenceAssessment {
+  if (!isLiveExecutableDeploymentTier(snapshot.tier)) {
+    return {
+      ok: true,
+      reasonCodes: [],
+      thresholds,
+      summary: snapshot,
+    };
+  }
+
+  const reasonCodes: string[] = [];
+  if (!snapshot.incumbentVariantId) {
+    reasonCodes.push('incumbent_variant_missing_for_live_tier');
+  }
+  if (snapshot.liveTradeCount < thresholds.minLiveTrades) {
+    reasonCodes.push('live_trade_evidence_below_tier_threshold');
+  }
+  if ((snapshot.liveTrustScore ?? 0) < thresholds.minLiveTrustScore) {
+    reasonCodes.push('live_trust_score_below_tier_threshold');
+  }
+  if (
+    snapshot.averageAbsoluteRealizedExpectedEdgeGapBps == null &&
+    snapshot.liveTradeCount > 0 &&
+    snapshot.liveTradeCount >= thresholds.minLiveTrades
+  ) {
+    reasonCodes.push('realized_expected_edge_gap_unavailable');
+  } else if (
+    snapshot.averageAbsoluteRealizedExpectedEdgeGapBps != null &&
+    snapshot.averageAbsoluteRealizedExpectedEdgeGapBps >
+      thresholds.maxAllowedRealizedExpectedEdgeGapBps
+  ) {
+    reasonCodes.push('realized_expected_edge_gap_above_limit');
+  }
+  if (
+    snapshot.reconciliationDefectRate == null &&
+    snapshot.liveTradeCount > 0 &&
+    snapshot.liveTradeCount >= thresholds.minLiveTrades
+  ) {
+    reasonCodes.push('reconciliation_defect_rate_unavailable');
+  } else if (
+    snapshot.reconciliationDefectRate != null &&
+    snapshot.reconciliationDefectRate >
+      thresholds.maxAllowedReconciliationDefectRate
+  ) {
+    reasonCodes.push('reconciliation_defect_rate_above_limit');
+  }
+  if (
+    thresholds.requireRecentReadinessPass &&
+    snapshot.recentReadinessPassAt == null
+  ) {
+    reasonCodes.push('recent_production_readiness_pass_missing');
+  }
+  if (thresholds.requireRecentSmokePass && snapshot.recentSmokePassAt == null) {
+    reasonCodes.push('recent_smoke_test_missing');
+  }
+  if (
+    thresholds.requireDailyDecisionQualityReport &&
+    snapshot.dailyDecisionQualityReportAt == null
+  ) {
+    reasonCodes.push('daily_decision_quality_report_missing');
+  }
+  if (
+    thresholds.requireShadowDecisionLogging &&
+    !snapshot.shadowDecisionLoggingEnabled
+  ) {
+    reasonCodes.push('shadow_decision_logging_disabled');
+  }
+
+  return {
+    ok: reasonCodes.length === 0,
+    reasonCodes,
+    thresholds,
+    summary: snapshot,
+  };
+}
+
+function average(values: Array<number | null>): number | null {
+  const usable = values.filter(
+    (value): value is number => value != null && Number.isFinite(value),
+  );
+  if (usable.length === 0) {
+    return null;
+  }
+  return usable.reduce((sum, value) => sum + value, 0) / usable.length;
+}
+
 export class StartupRunbook {
   private readonly logger = new AppLogger('StartupRunbook');
   private readonly signerHealth = new SignerHealth();
+  private readonly liveTrustScore = new LiveTrustScore();
 
   constructor(
     private readonly runtimeControl: RuntimeControlRepository,
@@ -53,6 +246,8 @@ export class StartupRunbook {
       env?: NodeJS.ProcessEnv,
       clientOverride?: OfficialPolymarketTradingClient,
     ) => Promise<PolymarketSmokeResult> = runPolymarketAuthenticatedSmoke,
+    private readonly resolvedTradeLedger = new ResolvedTradeLedger(),
+    private readonly deploymentRegistry = new StrategyDeploymentRegistry(),
   ) {}
 
   async run(): Promise<StartupRunbookResult> {
@@ -274,6 +469,31 @@ export class StartupRunbook {
     }
 
     const effectiveSmokeSuccess = smoke?.success ?? recentSmokePassed;
+    const recentSmokePassAt = smoke?.success
+      ? smoke.executedAt
+      : recentSmokePassed
+        ? latestSmokeCheckpoint?.processedAt?.toISOString() ?? null
+        : null;
+    steps.push({
+      step: 'recent_smoke_test_timestamp',
+      ok:
+        recentSmokePassAt != null ||
+        !isLiveExecutableDeploymentTier(appEnv.BOT_DEPLOYMENT_TIER),
+      checkedAt: new Date().toISOString(),
+      reasonCode:
+        recentSmokePassAt != null
+          ? 'passed'
+          : isLiveExecutableDeploymentTier(appEnv.BOT_DEPLOYMENT_TIER)
+            ? 'recent_smoke_test_missing'
+            : 'not_required_for_tier',
+      evidence: {
+        tier: appEnv.BOT_DEPLOYMENT_TIER,
+        recentSmokePassAt,
+        maxAllowedAgeMs: appEnv.BOT_MAX_VENUE_SMOKE_AGE_MS,
+        checkpointAt: latestSmokeCheckpoint?.processedAt?.toISOString() ?? null,
+        checkpointStatus: latestSmokeCheckpoint?.status ?? null,
+      },
+    });
     steps.push({
       step: 'authenticated_venue_smoke_gate',
       ok: effectiveSmokeSuccess,
@@ -308,6 +528,109 @@ export class StartupRunbook {
       reasonCode: cancelStep?.reasonCode ?? (recentSmokePassed ? 'passed' : 'smoke_not_recent'),
       evidence: cancelStep?.evidence ?? {
         smokeCheckpointAt: latestSmokeCheckpoint?.processedAt?.toISOString() ?? null,
+      },
+    });
+
+    const latestReadinessCheckpoint = await this.runtimeControl.getLatestCheckpoint(
+      'production_readiness_suite',
+    );
+    const recentReadinessPassed =
+      latestReadinessCheckpoint?.status === 'completed' &&
+      Date.now() - latestReadinessCheckpoint.processedAt.getTime() <=
+        appEnv.BOT_MAX_VENUE_SMOKE_AGE_MS;
+    const recentReadinessPassAt = recentReadinessPassed
+      ? latestReadinessCheckpoint?.processedAt?.toISOString() ?? null
+      : null;
+    steps.push({
+      step: 'recent_production_readiness_pass',
+      ok:
+        recentReadinessPassAt != null ||
+        !getDeploymentTierEvidenceThresholds().requireRecentReadinessPass,
+      checkedAt: new Date().toISOString(),
+      reasonCode:
+        recentReadinessPassAt != null
+          ? 'passed'
+          : getDeploymentTierEvidenceThresholds().requireRecentReadinessPass
+            ? 'recent_production_readiness_pass_missing'
+            : 'not_required_for_tier',
+      evidence: {
+        tier: appEnv.BOT_DEPLOYMENT_TIER,
+        recentReadinessPassAt,
+        checkpointAt: latestReadinessCheckpoint?.processedAt?.toISOString() ?? null,
+        checkpointStatus: latestReadinessCheckpoint?.status ?? null,
+        maxAllowedAgeMs: appEnv.BOT_MAX_VENUE_SMOKE_AGE_MS,
+      },
+    });
+
+    const [deploymentRegistryState, recentResolvedTrades, latestDecisionQualityReport] =
+      await Promise.all([
+        this.deploymentRegistry.load(),
+        this.resolvedTradeLedger.loadWindow({
+          start: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+          end: new Date(),
+        }),
+        readLatestDailyDecisionQualityReport(
+          path.dirname(this.resolvedTradeLedger.getPath()),
+        ),
+      ]);
+    const incumbentVariantId = deploymentRegistryState.incumbentVariantId;
+    const liveTrustDecision = this.liveTrustScore.evaluate({
+      strategyVariantId: incumbentVariantId,
+      regime: null,
+      resolvedTrades: recentResolvedTrades,
+    });
+    const filteredTrades = recentResolvedTrades.filter((trade) =>
+      incumbentVariantId == null ? true : trade.strategyVariantId === incumbentVariantId,
+    );
+    const averageAbsoluteRealizedExpectedEdgeGapBps = average(
+      filteredTrades.map((trade) => {
+        const expected = trade.netOutcome.expectedNetEdgeBps ?? trade.expectedNetEdgeBps;
+        const realized = trade.netOutcome.realizedNetEdgeBps ?? trade.realizedNetEdgeBps;
+        if (
+          typeof expected !== 'number' ||
+          !Number.isFinite(expected) ||
+          typeof realized !== 'number' ||
+          !Number.isFinite(realized)
+        ) {
+          return null;
+        }
+        return Math.abs(realized - expected);
+      }),
+    );
+    const reconciliationDefectRate =
+      filteredTrades.length === 0
+        ? null
+        : filteredTrades.filter(
+            (trade) =>
+              trade.lifecycleState !== 'economically_resolved_with_portfolio_truth',
+          ).length / filteredTrades.length;
+    const tierEvidenceAssessment = assessDeploymentTierEvidence({
+      tier: appEnv.BOT_DEPLOYMENT_TIER,
+      incumbentVariantId,
+      liveTradeCount: filteredTrades.length,
+      liveTrustScore: liveTrustDecision.trustScore,
+      averageAbsoluteRealizedExpectedEdgeGapBps,
+      reconciliationDefectRate,
+      recentReadinessPassAt,
+      recentSmokePassAt,
+      dailyDecisionQualityReportAt:
+        latestDecisionQualityReport?.generatedAt ?? null,
+      shadowDecisionLoggingEnabled: appEnv.BOT_ENABLE_SHADOW_DECISION_LOGGING,
+    });
+    steps.push({
+      step: 'deployment_tier_live_evidence',
+      ok: tierEvidenceAssessment.ok,
+      checkedAt: new Date().toISOString(),
+      reasonCode: tierEvidenceAssessment.ok
+        ? 'passed'
+        : tierEvidenceAssessment.reasonCodes[0] ?? 'deployment_tier_live_evidence_failed',
+      evidence: {
+        ...tierEvidenceAssessment,
+        registryTrustScore:
+          incumbentVariantId != null
+            ? deploymentRegistryState.variants[incumbentVariantId]?.liveTrustScore ?? null
+            : null,
+        liveTrustDecision,
       },
     });
 

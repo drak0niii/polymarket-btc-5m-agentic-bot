@@ -7,6 +7,23 @@ export type BotRuntimeState =
   | 'halted_hard'
   | 'stopped';
 
+export type RuntimeTransitionReasonFamily =
+  | 'operator'
+  | 'startup'
+  | 'execution_anomaly'
+  | 'venue_operational'
+  | 'portfolio_risk'
+  | 'recovery';
+
+export interface RuntimeTransitionRequest {
+  currentState: BotRuntimeState;
+  nextState: BotRuntimeState;
+  family: RuntimeTransitionReasonFamily;
+  reasonCode: string;
+  rationale: string[];
+  requestedAt: string;
+}
+
 export interface RuntimeSubsystemPermissions {
   allowMarketDataReads: boolean;
   allowStrategyEvaluation: boolean;
@@ -145,6 +162,32 @@ export function canTransitionRuntimeState(
   }
 
   return LEGAL_TRANSITIONS[current]?.includes(next) ?? false;
+}
+
+export function buildRuntimeTransitionRequest(input: {
+  currentState: BotRuntimeState;
+  nextState: BotRuntimeState;
+  family: RuntimeTransitionReasonFamily;
+  reasonCode: string;
+  rationale?: string[];
+  requestedAt?: string;
+}): RuntimeTransitionRequest | null {
+  if (input.currentState === input.nextState) {
+    return null;
+  }
+  if (!canTransitionRuntimeState(input.currentState, input.nextState)) {
+    throw new Error(
+      `Illegal runtime transition request from ${input.currentState} to ${input.nextState}.`,
+    );
+  }
+  return {
+    currentState: input.currentState,
+    nextState: input.nextState,
+    family: input.family,
+    reasonCode: input.reasonCode,
+    rationale: input.rationale ?? [],
+    requestedAt: input.requestedAt ?? new Date().toISOString(),
+  };
 }
 
 export function normalizePersistedRuntimeState(value: string | null | undefined): BotRuntimeState {

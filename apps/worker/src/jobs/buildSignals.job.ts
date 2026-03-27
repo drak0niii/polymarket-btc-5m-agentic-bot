@@ -32,6 +32,10 @@ import { EdgeDefinitionService } from '@polymarket-btc-5m-agentic-bot/signal-eng
 import { EventMicrostructureModel } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { StrategyFamilyPolicy } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { NoTradeZonePolicy } from '@polymarket-btc-5m-agentic-bot/signal-engine';
+import {
+  NoTradeClassifier,
+  NoTradeReasonStore,
+} from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { EdgeHalfLifePolicy } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { ResearchGovernancePolicy } from '@polymarket-btc-5m-agentic-bot/signal-engine';
 import { RobustnessSuite } from '@polymarket-btc-5m-agentic-bot/signal-engine';
@@ -104,6 +108,7 @@ export class BuildSignalsJob {
   private readonly microstructureModel = new EventMicrostructureModel();
   private readonly strategyFamilyPolicy = new StrategyFamilyPolicy();
   private readonly noTradeZonePolicy = new NoTradeZonePolicy();
+  private readonly noTradeClassifier = new NoTradeClassifier();
   private readonly edgeHalfLifePolicy = new EdgeHalfLifePolicy();
   private readonly researchGovernancePolicy = new ResearchGovernancePolicy();
   private readonly robustnessSuite = new RobustnessSuite();
@@ -122,12 +127,14 @@ export class BuildSignalsJob {
   private readonly strategyRolloutController = new StrategyRolloutController();
   private readonly learningStateStore: LearningStateStore;
   private readonly versionLineageRegistry: VersionLineageRegistry;
+  private readonly noTradeReasonStore: NoTradeReasonStore;
 
   constructor(
     private readonly prisma: PrismaClient,
     strategyDeploymentRegistry?: StrategyDeploymentRegistry,
     learningStateStore?: LearningStateStore,
     versionLineageRegistry?: VersionLineageRegistry,
+    noTradeReasonStore?: NoTradeReasonStore,
   ) {
     this.decisionLogService = new DecisionLogService(prisma);
     this.strategyDeploymentRegistry =
@@ -135,6 +142,7 @@ export class BuildSignalsJob {
     this.learningStateStore = learningStateStore ?? new LearningStateStore();
     this.versionLineageRegistry =
       versionLineageRegistry ?? new VersionLineageRegistry();
+    this.noTradeReasonStore = noTradeReasonStore ?? new NoTradeReasonStore();
   }
 
   async run(
@@ -464,6 +472,13 @@ export class BuildSignalsJob {
           edgeDefinition.admissionThresholdPolicy.minimumNetEdge * toxicity.thresholdMultiplier,
       });
       const signalDirectionSign = edge.edge < 0 ? -1 : 1;
+      const strategyVariantId =
+        strategyAssignment.variantId ?? buildStrategyVariantId(selectedStrategyVersion.id);
+      const empiricalNoTradeSummary = await this.noTradeReasonStore.summarizeRecent({
+        limit: 120,
+        regimeLabel: regime.regimeLabel,
+        strategyVariantId,
+      });
       const phaseTwoContext = {
         flowImbalanceProxy: features.flowImbalanceProxy,
         flowIntensity: features.flowIntensity,
@@ -486,7 +501,35 @@ export class BuildSignalsJob {
         prior,
         posterior,
         regimeReasonCodes: regime.reasonCodes,
+        regimeFamily: edge.regimeFamily,
+        regimeRequiredConfidence: edge.regimeRequiredConfidence,
       };
+      const noTradePrecheck = this.noTradeClassifier.classify({
+        spread: features.spread,
+        spreadLimit: MAX_SIGNAL_SPREAD,
+        orderbookFresh: freshnessCheck.passed,
+        orderbookAgeMs:
+          now.getTime() - new Date(latestOrderbook.observedAt).getTime(),
+        topLevelDepth: features.topLevelDepth,
+        minimumTopLevelDepth: MIN_TOP_LEVEL_DEPTH,
+        toxicityScore: toxicity.toxicityScore,
+        toxicityState: toxicity.toxicityState,
+        venueUncertaintyLabel:
+          universeDecision.admitted && eligibility.eligible ? 'healthy' : 'degraded',
+        regimeLabel: regime.regimeLabel,
+        regimeConfidence: regime.regimeConfidence,
+        regimeTransitionRisk: regime.regimeTransitionRisk,
+        expectedNetEdgeBps:
+          executableEdge.finalNetEdge != null ? executableEdge.finalNetEdge * 10_000 : null,
+        minimumNetEdgeBps: executableEdge.threshold * 10_000,
+        timeToExpirySeconds: features.timeToExpirySeconds,
+        noTradeWindowSeconds: appEnv.NO_TRADE_WINDOW_SECONDS,
+        empiricalEvidence: {
+          blockRate: empiricalNoTradeSummary.blockRate,
+          sampleCount: empiricalNoTradeSummary.totalCount,
+          dominantReasonCodes: empiricalNoTradeSummary.dominantReasonCodes,
+        },
+      });
       const alphaAttribution = createAlphaAttribution({
         rawForecastProbability: posterior.posteriorProbability,
         marketImpliedProbability: marketImpliedProb,
@@ -519,6 +562,12 @@ export class BuildSignalsJob {
         microstructure,
         governanceHealthy: researchGovernance.promotionEligible,
         edgeHalfLifeHealthy: !halfLife.expired,
+        regimeTransitionRisk: regime.regimeTransitionRisk,
+        empiricalEvidence: {
+          blockRate: empiricalNoTradeSummary.blockRate,
+          sampleCount: empiricalNoTradeSummary.totalCount,
+          dominantReasonCodes: empiricalNoTradeSummary.dominantReasonCodes,
+        },
       });
       const promotion = this.promotionScore.evaluate({
         governanceConfidence: researchGovernance.confidence,
@@ -557,6 +606,7 @@ export class BuildSignalsJob {
           expiryCheck.passed && lateWindowCheck.passed && volatilityCheck.passed,
         regimeAllowed: regime.tradingAllowed && !toxicity.temporarilyBlockRegime,
         noTradeZoneBlocked: noTradeZone.blocked,
+        noTradeClassifier: noTradePrecheck,
         halfLifeExpired: halfLife.expired,
         paperEdgeDetected:
           (executableEdge.rawModelEdge ?? 0) > executableEdge.threshold &&
@@ -564,6 +614,33 @@ export class BuildSignalsJob {
         admissionThreshold: executableEdge.threshold,
         executableEdge,
         minimumConfidence: edgeDefinition.admissionThresholdPolicy.minimumConfidence,
+        regimeLabel: regime.regimeLabel,
+        regimeConfidence: regime.regimeConfidence,
+        regimeTransitionRisk: regime.regimeTransitionRisk,
+      });
+
+      await this.noTradeReasonStore.append({
+        timestamp: now.toISOString(),
+        marketId: market.id,
+        tokenId: null,
+        strategyVariantId,
+        regimeLabel: regime.regimeLabel,
+        regimeConfidence: regime.regimeConfidence,
+        regimeTransitionRisk: regime.regimeTransitionRisk,
+        allowTrade: noTradePrecheck.allowTrade,
+        reasonCodes: noTradePrecheck.reasonCodes,
+        conditions: noTradePrecheck.conditions,
+        expectedNetEdgeBps:
+          executableEdge.finalNetEdge != null ? executableEdge.finalNetEdge * 10_000 : null,
+        evidenceSummary: {
+          source: 'build_signals',
+          signalId: null,
+          signalDecisionId: null,
+          regimeEvidenceQuality: admission.evidenceQualitySummary.regimeEvidenceQuality,
+          empiricalBlockRate: empiricalNoTradeSummary.blockRate,
+          sampleCount: empiricalNoTradeSummary.totalCount,
+          notes: admission.rejectionReasons,
+        },
       });
 
       await this.persistResearchGovernance(selectedStrategyVersion.id, {
@@ -583,6 +660,12 @@ export class BuildSignalsJob {
           toxicity,
           alphaAttribution,
           regime,
+          regimeContext: {
+            regimeLabel: regime.regimeLabel,
+            regimeConfidence: regime.regimeConfidence,
+            regimeTransitionRisk: regime.regimeTransitionRisk,
+          },
+          noTradePrecheck,
           strategyFamily,
           microstructure,
           halfLife,
@@ -631,14 +714,11 @@ export class BuildSignalsJob {
           signalDecisionId: noTradeDecision.signalDecisionId,
           marketId: market.id,
           strategyVariantId:
-            strategyAssignment.variantId ??
-            buildStrategyVariantId(selectedStrategyVersion.id),
+            strategyVariantId,
           lineage: {
             strategyVersion: buildStrategyVersionLineage({
               strategyVersionId: selectedStrategyVersion.id,
-              strategyVariantId:
-                strategyAssignment.variantId ??
-                buildStrategyVariantId(selectedStrategyVersion.id),
+              strategyVariantId,
             }),
             featureSetVersion: buildFeatureSetVersionLineage({
               featureSetId: 'btc-five-minute-core',
@@ -666,6 +746,10 @@ export class BuildSignalsJob {
                 admission,
                 noTradeWindowSeconds: appEnv.NO_TRADE_WINDOW_SECONDS,
                 toxicity,
+                regimeLabel: regime.regimeLabel,
+                regimeConfidence: regime.regimeConfidence,
+                regimeTransitionRisk: regime.regimeTransitionRisk,
+                noTradePrecheck,
               },
             }),
             allocationPolicyVersion: null,
@@ -700,6 +784,7 @@ export class BuildSignalsJob {
               toxicity,
               alphaAttribution,
               admission,
+              noTradePrecheck,
               researchGovernance,
               robustness,
               promotion,
@@ -719,12 +804,16 @@ export class BuildSignalsJob {
             admitted: false,
             reasonCode: admission.reasonCode,
             reasonMessage: admission.reasonMessage,
+            rejectionReasons: admission.rejectionReasons,
             phaseTwoContext,
             toxicity,
             alphaAttribution,
             executableEdge: admission.executableEdge,
+            regimeContext: admission.regimeContext,
             strategyFamily,
+            noTradePrecheck,
             noTradeZone,
+            noTradeEvidenceSummary: noTradeZone.evidenceSummary,
             researchGovernance,
             robustness,
             strategyAssignment,
@@ -776,12 +865,11 @@ export class BuildSignalsJob {
         signalId,
         marketId: market.id,
         strategyVariantId:
-          strategyAssignment.variantId ?? buildStrategyVariantId(selectedStrategyVersion.id),
+          strategyVariantId,
         lineage: {
           strategyVersion: buildStrategyVersionLineage({
             strategyVersionId: selectedStrategyVersion.id,
-            strategyVariantId:
-              strategyAssignment.variantId ?? buildStrategyVariantId(selectedStrategyVersion.id),
+            strategyVariantId,
           }),
           featureSetVersion: buildFeatureSetVersionLineage({
             featureSetId: 'btc-five-minute-core',
@@ -809,6 +897,10 @@ export class BuildSignalsJob {
                 executableEdge: admission.executableEdge,
                 noTradeWindowSeconds: appEnv.NO_TRADE_WINDOW_SECONDS,
                 toxicity,
+                regimeLabel: regime.regimeLabel,
+                regimeConfidence: regime.regimeConfidence,
+                regimeTransitionRisk: regime.regimeTransitionRisk,
+                noTradePrecheck,
               },
             }),
           allocationPolicyVersion: null,
@@ -843,6 +935,7 @@ export class BuildSignalsJob {
               toxicity,
               alphaAttribution,
               admission,
+              noTradePrecheck,
             researchGovernance,
             robustness,
             promotion,
@@ -865,8 +958,11 @@ export class BuildSignalsJob {
           toxicity,
           alphaAttribution,
           executableEdge: admission.executableEdge,
+          regimeContext: admission.regimeContext,
           strategyFamily,
+          noTradePrecheck,
           noTradeZone,
+          noTradeEvidenceSummary: noTradeZone.evidenceSummary,
           researchGovernance,
           robustness,
           promotion,

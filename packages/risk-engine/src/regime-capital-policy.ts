@@ -12,6 +12,7 @@ export type RegimeCapitalTreatment =
 export interface RegimeCapitalPolicyDecision {
   treatment: RegimeCapitalTreatment;
   capitalMultiplier: number;
+  trustCapMultiplier: number;
   blockNewTrades: boolean;
   reasons: string[];
   evidence: Record<string, unknown>;
@@ -21,6 +22,8 @@ export class RegimeCapitalPolicy {
   decide(input: {
     assessment: RegimeProfitabilityAssessment;
     portfolioAllocationMultiplier?: number | null;
+    trustScore?: number | null;
+    evidenceQualityMultiplier?: number | null;
   }): RegimeCapitalPolicyDecision {
     const treatment = treatmentForRank(input.assessment.rank, input.assessment.score);
     const baseMultiplier =
@@ -33,15 +36,21 @@ export class RegimeCapitalPolicy {
           : treatment === 'reduced_capital'
             ? 0.45
             : 0;
-    const capitalMultiplier = Math.max(0, baseMultiplier);
+    const trustCapMultiplier = Math.max(
+      0,
+      Math.min(1, input.evidenceQualityMultiplier ?? trustCapForScore(input.trustScore ?? null)),
+    );
+    const capitalMultiplier = Math.max(0, Math.min(baseMultiplier, trustCapMultiplier));
 
     return {
       treatment,
       capitalMultiplier,
+      trustCapMultiplier,
       blockNewTrades: capitalMultiplier <= 0.01,
       reasons: [
         `regime_rank_${input.assessment.rank}`,
         `regime_capital_${treatment}`,
+        ...(trustCapMultiplier < baseMultiplier ? ['regime_trust_cap_applied'] : []),
         ...(input.portfolioAllocationMultiplier != null &&
         input.portfolioAllocationMultiplier < 1
           ? ['portfolio_allocation_already_reduced']
@@ -50,6 +59,10 @@ export class RegimeCapitalPolicy {
       evidence: {
         assessment: input.assessment,
         portfolioAllocationMultiplier: input.portfolioAllocationMultiplier ?? null,
+        trustScore: input.trustScore ?? null,
+        evidenceQualityMultiplier: input.evidenceQualityMultiplier ?? null,
+        baseMultiplier,
+        trustCapMultiplier,
       },
     };
   }
@@ -69,4 +82,23 @@ function treatmentForRank(
     return 'reduced_capital';
   }
   return 'blocked_capital';
+}
+
+function trustCapForScore(trustScore: number | null): number {
+  if (trustScore == null) {
+    return 0.5;
+  }
+  if (trustScore < 0.25) {
+    return 0;
+  }
+  if (trustScore < 0.45) {
+    return 0.25;
+  }
+  if (trustScore < 0.65) {
+    return 0.5;
+  }
+  if (trustScore < 0.8) {
+    return 0.75;
+  }
+  return 1;
 }

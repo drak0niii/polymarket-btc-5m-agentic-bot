@@ -7,9 +7,17 @@ import {
   type NetEdgeVenueUncertaintyLabel,
   type UncertaintyPenalty,
 } from '@polymarket-btc-5m-agentic-bot/domain';
+import {
+  buildNetRealismContext,
+  type NetRealismContext,
+} from './net-realism-context';
 
 export class NetEdgeEstimator {
-  estimate(input: NetEdgeInput): NetEdgeDecision {
+  estimate(
+    input: NetEdgeInput & {
+      realismContext?: NetRealismContext | null;
+    },
+  ): NetEdgeDecision {
     const missingInputs: string[] = [];
 
     if (!Number.isFinite(input.grossForecastEdge)) {
@@ -29,12 +37,25 @@ export class NetEdgeEstimator {
     }
 
     const grossForecastEdge = Math.max(0, input.grossForecastEdge);
-    const spread = Math.max(0, input.spread ?? 0);
+    const realismContext =
+      input.realismContext ??
+      buildNetRealismContext({
+        spreadAtDecision: input.spread ?? null,
+        bookDepthAtIntendedPrice: input.topLevelDepth,
+        expectedFillFraction: null,
+        expectedQueueDelayMs: null,
+        expectedPartialFillPenalty: null,
+        expectedCancelReplacePenalty: null,
+        venueUncertaintyLabel: input.venueUncertaintyLabel,
+        feeScheduleLabel: null,
+        venueMode: input.venueMode,
+      });
+    const spread = Math.max(0, realismContext.spreadAtDecision ?? input.spread ?? 0);
     const feeCost = Math.max(0, input.feeRate);
     const spreadComponent = spread * 0.5;
     const sizePressure = this.sizePressure(
       input.estimatedOrderSizeUnits,
-      input.topLevelDepth,
+      realismContext.bookDepthAtIntendedPrice ?? input.topLevelDepth,
     );
     const liquidityComponent = spread * sizePressure;
     const slippageCost = spreadComponent + liquidityComponent;
@@ -44,6 +65,15 @@ export class NetEdgeEstimator {
       halfLifeMultiplier: input.halfLifeMultiplier,
       venueUncertaintyLabel: input.venueUncertaintyLabel,
     });
+    const queuePenaltyCost = this.queuePenaltyCost({
+      grossForecastEdge,
+      expectedFillFraction: realismContext.expectedFillFraction,
+      expectedQueueDelayMs: realismContext.expectedQueueDelayMs,
+      expectedPartialFillPenalty: realismContext.expectedPartialFillPenalty,
+      expectedCancelReplacePenalty: realismContext.expectedCancelReplacePenalty,
+      venueUncertaintyLabel: input.venueUncertaintyLabel,
+      urgency: realismContext.urgency,
+    });
     const venuePenalty = this.venuePenalty(
       input.venueUncertaintyLabel,
       input.venueMode,
@@ -52,9 +82,9 @@ export class NetEdgeEstimator {
     const afterFeesEdge = grossForecastEdge - feeCost;
     const afterSlippageEdge = afterFeesEdge - slippageCost;
     const afterAdverseSelectionEdge = afterSlippageEdge - adverseSelectionCost;
+    const afterQueueEdge = afterAdverseSelectionEdge - queuePenaltyCost;
     const uncertaintyPenalty = this.uncertaintyPenalty(input, grossForecastEdge);
-    const afterUncertaintyEdge =
-      afterAdverseSelectionEdge - uncertaintyPenalty.totalPenalty;
+    const afterUncertaintyEdge = afterQueueEdge - uncertaintyPenalty.totalPenalty;
     const finalNetEdge = afterUncertaintyEdge - venuePenalty;
 
     const staleInputs: string[] = [];
@@ -68,12 +98,25 @@ export class NetEdgeEstimator {
     const reasons: string[] = [];
     if (finalNetEdge <= 0) {
       reasons.push('net_edge_non_positive');
+      reasons.push(
+        this.primaryCostReason({
+          feeCost,
+          slippageCost,
+          adverseSelectionCost,
+          queuePenaltyCost,
+          uncertaintyPenalty: uncertaintyPenalty.totalPenalty,
+          venuePenalty,
+        }),
+      );
     }
     if (input.venueUncertaintyLabel === 'unsafe') {
       reasons.push('venue_instability_penalty');
     }
     if (uncertaintyPenalty.totalPenalty >= Math.max(0.002, grossForecastEdge * 0.35)) {
       reasons.push('uncertainty_penalty_high');
+    }
+    if (queuePenaltyCost >= Math.max(0.001, grossForecastEdge * 0.2)) {
+      reasons.push('queue_penalty_high');
     }
     if (missingInputs.length > 0) {
       reasons.push('net_edge_inputs_missing');
@@ -86,15 +129,50 @@ export class NetEdgeEstimator {
         feeCost,
         slippageCost,
         adverseSelectionCost,
+        queuePenaltyCost,
         venuePenalty,
         spreadComponent,
         liquidityComponent,
-        totalCost: feeCost + slippageCost + adverseSelectionCost + venuePenalty,
+        partialFillComponent:
+          Math.max(
+            0,
+            (realismContext.expectedPartialFillPenalty ?? 0) -
+              Math.max(0, (realismContext.expectedCancelReplacePenalty ?? 0) * 0.35),
+          ),
+        cancelReplaceComponent: Math.max(
+          0,
+          realismContext.expectedCancelReplacePenalty ?? 0,
+        ),
+        queueDelayComponent:
+          Math.max(
+            0,
+            queuePenaltyCost -
+              Math.max(0, realismContext.expectedPartialFillPenalty ?? 0) -
+              Math.max(0, realismContext.expectedCancelReplacePenalty ?? 0),
+          ),
+        feeBps: toBps(feeCost),
+        slippageBps: toBps(slippageCost),
+        adverseSelectionPenaltyBps: toBps(adverseSelectionCost),
+        queuePenaltyBps: toBps(queuePenaltyCost),
+        totalCost:
+          feeCost +
+          slippageCost +
+          adverseSelectionCost +
+          queuePenaltyCost +
+          venuePenalty,
       },
       uncertaintyPenalty,
+      grossEdgeBps: toBps(grossForecastEdge),
+      feeBps: toBps(feeCost),
+      slippageBps: toBps(slippageCost),
+      adverseSelectionPenaltyBps: toBps(adverseSelectionCost),
+      queuePenaltyBps: toBps(queuePenaltyCost),
+      uncertaintyPenaltyBps: toBps(uncertaintyPenalty.totalPenalty),
+      netEdgeBps: toBps(finalNetEdge),
       afterFeesEdge,
       afterSlippageEdge,
       afterAdverseSelectionEdge,
+      afterQueueEdge,
       afterUncertaintyEdge,
       finalNetEdge,
       missingInputs,
@@ -156,6 +234,62 @@ export class NetEdgeEstimator {
         ? 0.003
         : 0;
     return Math.max(0, input.spread * 0.25 + agePenalty + decayPenalty + venuePenalty);
+  }
+
+  private queuePenaltyCost(input: {
+    grossForecastEdge: number;
+    expectedFillFraction: number | null;
+    expectedQueueDelayMs: number | null;
+    expectedPartialFillPenalty: number | null;
+    expectedCancelReplacePenalty: number | null;
+    venueUncertaintyLabel: NetEdgeVenueUncertaintyLabel | null;
+    urgency: string;
+  }): number {
+    const fillFraction = Math.max(0.25, Math.min(1, input.expectedFillFraction ?? 0.8));
+    const queueDelayMs = Math.max(0, input.expectedQueueDelayMs ?? 15_000);
+    const queueDelayComponent = Math.min(
+      0.004,
+      Math.max(0.0002, input.grossForecastEdge * 0.08) * (queueDelayMs / 15_000),
+    );
+    const partialFillComponent = Math.max(
+      0,
+      input.expectedPartialFillPenalty ??
+        input.grossForecastEdge * (1 - fillFraction) * 0.22,
+    );
+    const cancelReplaceComponent = Math.max(
+      0,
+      input.expectedCancelReplacePenalty ??
+        (input.urgency === 'high' ? 0.0012 : 0.0005),
+    );
+    const venueComponent =
+      input.venueUncertaintyLabel === 'degraded'
+        ? 0.0003
+        : input.venueUncertaintyLabel === 'unsafe'
+          ? 0.001
+          : 0;
+    return Math.max(
+      0,
+      queueDelayComponent + partialFillComponent + cancelReplaceComponent + venueComponent,
+    );
+  }
+
+  private primaryCostReason(input: {
+    feeCost: number;
+    slippageCost: number;
+    adverseSelectionCost: number;
+    queuePenaltyCost: number;
+    uncertaintyPenalty: number;
+    venuePenalty: number;
+  }): string {
+    const components = [
+      { reason: 'killed_by_fee_cost', value: input.feeCost },
+      { reason: 'killed_by_slippage_cost', value: input.slippageCost },
+      { reason: 'killed_by_adverse_selection', value: input.adverseSelectionCost },
+      { reason: 'killed_by_queue_penalty', value: input.queuePenaltyCost },
+      { reason: 'killed_by_uncertainty_penalty', value: input.uncertaintyPenalty },
+      { reason: 'killed_by_venue_penalty', value: input.venuePenalty },
+    ].sort((left, right) => right.value - left.value);
+    return components[0]?.reason ?? 'killed_by_cost_stack';
   }
 
   private uncertaintyPenalty(
@@ -247,4 +381,8 @@ export class NetEdgeEstimator {
   ): number {
     return penalties[health ?? 'healthy'] ?? 0;
   }
+}
+
+function toBps(value: number): number {
+  return Math.round(value * 10_000 * 100) / 100;
 }

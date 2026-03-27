@@ -1,11 +1,32 @@
 import {
   ExecutionRoute,
   ExecutionSemanticsPolicy,
-  ExecutionStyle,
   OrderUrgency,
   OrderType,
   PartialFillTolerance,
 } from './execution-semantics-policy';
+import type { NetEdgeVenueUncertaintyLabel } from '@polymarket-btc-5m-agentic-bot/domain';
+import {
+  FillProbabilityEstimator,
+  type FillProbabilityEstimatorResult,
+} from './fill-probability-estimator';
+import {
+  FillRealismStore,
+  buildFillRealismBucket,
+  type FillRealismBucketKey,
+} from './fill-realism-store';
+import {
+  PostFillToxicityStore,
+  type PostFillToxicitySummary,
+} from './post-fill-toxicity-store';
+import {
+  QueuePositionEstimator,
+  type QueuePositionEstimatorResult,
+} from './queue-position-estimator';
+import {
+  SlippageEstimator,
+  type SlippageEstimatorResult,
+} from './slippage-estimator';
 
 export type Outcome = 'YES' | 'NO';
 export type TradeIntent = 'ENTER' | 'REDUCE' | 'EXIT' | 'FLIP';
@@ -60,6 +81,12 @@ export interface LiquiditySnapshot {
    * When present, it is preferred over topLevelDepth for FOK/FAK decisions.
    */
   executableDepth?: number | null;
+
+  recentMatchedVolume?: number | null;
+  restingSizeAhead?: number | null;
+  bestBid?: number | null;
+  bestAsk?: number | null;
+  spread?: number | null;
 }
 
 export interface OrderPlannerInput {
@@ -89,6 +116,14 @@ export interface OrderPlannerInput {
    * Immediate liquidity context for choosing FOK vs FAK.
    */
   liquidity?: LiquiditySnapshot | null;
+  regime?: string | null;
+  venueUncertaintyLabel?: NetEdgeVenueUncertaintyLabel | null;
+  feeRateBpsEstimate?: number | null;
+}
+
+export interface OrderPlannerStyleRationale {
+  code: string;
+  message: string;
 }
 
 export interface OrderPlannerResult {
@@ -126,12 +161,40 @@ export interface OrderPlannerResult {
   tickSize: number | null;
   minOrderSize: number | null;
   negRisk: boolean | null;
+  expectedFillProbability: number;
+  expectedFillFraction: number | null;
+  expectedQueueDelayMs: number | null;
+  expectedRealizedCostBps: number;
+  expectedAdverseSelectionPenaltyBps: number;
+  recommendedOrderStyleRationale: OrderPlannerStyleRationale[];
+  executionBucketContext: FillRealismBucketKey;
+  fillProbabilityEstimate: FillProbabilityEstimatorResult;
+  queueEstimate: QueuePositionEstimatorResult;
+  slippageEstimate: SlippageEstimatorResult;
+  postFillToxicitySummary: PostFillToxicitySummary | null;
 
   createdAt: string;
 }
 
 export class OrderPlanner {
   private readonly executionSemanticsPolicy = new ExecutionSemanticsPolicy();
+  private readonly fillRealismStore: FillRealismStore;
+  private readonly fillProbabilityEstimator: FillProbabilityEstimator;
+  private readonly queuePositionEstimator: QueuePositionEstimator;
+  private readonly slippageEstimator: SlippageEstimator;
+  private readonly postFillToxicityStore: PostFillToxicityStore;
+
+  constructor(input?: {
+    fillRealismStore?: FillRealismStore;
+    postFillToxicityStore?: PostFillToxicityStore;
+  }) {
+    this.fillRealismStore = input?.fillRealismStore ?? new FillRealismStore();
+    this.postFillToxicityStore =
+      input?.postFillToxicityStore ?? new PostFillToxicityStore();
+    this.fillProbabilityEstimator = new FillProbabilityEstimator(this.fillRealismStore);
+    this.queuePositionEstimator = new QueuePositionEstimator(this.fillRealismStore);
+    this.slippageEstimator = new SlippageEstimator(this.fillRealismStore);
+  }
 
   plan(input: OrderPlannerInput): OrderPlannerResult {
     this.validate(input);
@@ -152,6 +215,53 @@ export class OrderPlanner {
       partialFillTolerance: input.partialFillTolerance ?? null,
       preferResting: input.preferResting ?? null,
       executionStyle: input.executionStyle ?? null,
+    });
+    const executionBucketContext = buildFillRealismBucket({
+      spreadBucket: classifySpreadBucket(input.liquidity?.spread ?? null),
+      liquidityBucket: classifyLiquidityBucket(this.getExecutableDepth(input.liquidity ?? null)),
+      orderUrgency: input.urgency,
+      regime: input.regime ?? null,
+      executionStyle: executionSemantics.route === 'maker' ? 'maker' : 'taker',
+      venueUncertaintyLabel: input.venueUncertaintyLabel ?? null,
+    });
+    const queueEstimate = this.queuePositionEstimator.estimate({
+      restingSizeAhead: this.normalizePositive(input.liquidity?.restingSizeAhead ?? null) ?? 0,
+      orderSize: input.size,
+      recentMatchedVolume: this.normalizePositive(input.liquidity?.recentMatchedVolume ?? null) ?? 0,
+      bucket: executionBucketContext,
+    });
+    const fillProbabilityEstimate = this.fillProbabilityEstimator.estimate({
+      orderSize: input.size,
+      topLevelDepth: this.normalizePositive(input.liquidity?.topLevelDepth ?? null) ?? 0,
+      recentMatchedVolume: this.normalizePositive(input.liquidity?.recentMatchedVolume ?? null) ?? 0,
+      queuePressureScore: queueEstimate.estimatedWaitScore,
+      bucket: executionBucketContext,
+    });
+    const slippageEstimate = this.slippageEstimator.estimate({
+      side: input.resolvedIntent.venueSide,
+      bestBid: this.normalizePositive(input.liquidity?.bestBid ?? null),
+      bestAsk: this.normalizePositive(input.liquidity?.bestAsk ?? null),
+      targetSize: input.size,
+      topLevelDepth: this.normalizePositive(input.liquidity?.topLevelDepth ?? null) ?? 0,
+      bucket: executionBucketContext,
+    });
+    const postFillToxicitySummary = this.postFillToxicityStore.summarize({
+      bucket: executionBucketContext,
+      limit: 250,
+    });
+    const expectedAdverseSelectionPenaltyBps =
+      postFillToxicitySummary.expectedAdverseSelectionPenaltyBps ?? 0;
+    const feeRateBpsEstimate = this.normalizeNonNegative(input.feeRateBpsEstimate ?? null) ?? 20;
+    const expectedRealizedCostBps =
+      Math.max(0, feeRateBpsEstimate) +
+      Math.max(0, slippageEstimate.finalExpectedSlippageBps) +
+      Math.max(0, expectedAdverseSelectionPenaltyBps);
+    const recommendedOrderStyleRationale = this.buildStyleRationale({
+      executionSemantics,
+      fillProbabilityEstimate,
+      queueEstimate,
+      slippageEstimate,
+      expectedAdverseSelectionPenaltyBps,
     });
 
     return {
@@ -178,6 +288,17 @@ export class OrderPlanner {
         typeof input.venueConstraints?.negRisk === 'boolean'
           ? input.venueConstraints.negRisk
           : null,
+      expectedFillProbability: fillProbabilityEstimate.fillProbability,
+      expectedFillFraction: fillProbabilityEstimate.expectedFillFraction,
+      expectedQueueDelayMs: queueEstimate.centralEstimateMs,
+      expectedRealizedCostBps,
+      expectedAdverseSelectionPenaltyBps,
+      recommendedOrderStyleRationale,
+      executionBucketContext,
+      fillProbabilityEstimate,
+      queueEstimate,
+      slippageEstimate,
+      postFillToxicitySummary,
       createdAt: new Date().toISOString(),
     };
   }
@@ -254,6 +375,57 @@ export class OrderPlanner {
     }
   }
 
+  private buildStyleRationale(input: {
+    executionSemantics: {
+      route: ExecutionRoute;
+      reasonCode: string;
+      reasonMessage: string;
+    };
+    fillProbabilityEstimate: FillProbabilityEstimatorResult;
+    queueEstimate: QueuePositionEstimatorResult;
+    slippageEstimate: SlippageEstimatorResult;
+    expectedAdverseSelectionPenaltyBps: number;
+  }): OrderPlannerStyleRationale[] {
+    const reasons: OrderPlannerStyleRationale[] = [
+      {
+        code: input.executionSemantics.reasonCode,
+        message: input.executionSemantics.reasonMessage,
+      },
+    ];
+
+    if (input.fillProbabilityEstimate.fillProbability < 0.45) {
+      reasons.push({
+        code: 'empirical_fill_probability_soft',
+        message: 'Recent bucket evidence implies low near-term fill probability.',
+      });
+    }
+    if ((input.queueEstimate.upperBoundMs ?? 0) >= 20_000) {
+      reasons.push({
+        code: 'queue_delay_tail_elevated',
+        message: 'Recent bucket evidence implies a long queue-delay tail for similar orders.',
+      });
+    }
+    if (input.slippageEstimate.finalExpectedSlippageBps >= 30) {
+      reasons.push({
+        code: 'empirical_slippage_elevated',
+        message: 'Recent fills imply slippage above the geometric baseline.',
+      });
+    }
+    if (input.expectedAdverseSelectionPenaltyBps >= 20) {
+      reasons.push({
+        code: 'post_fill_toxicity_elevated',
+        message: 'Recent post-fill drift implies elevated adverse-selection damage.',
+      });
+    }
+    if (input.executionSemantics.route === 'maker') {
+      reasons.push({
+        code: 'maker_route_retains_optionalitiy',
+        message: 'Resting execution preserves optionality when empirical toxicity is not forcing a cross.',
+      });
+    }
+    return reasons;
+  }
+
   private normalizePriceToTick(price: number, tickSize: number | null): number {
     const normalizedTick = this.normalizePositive(tickSize);
     if (normalizedTick === null) {
@@ -277,6 +449,10 @@ export class OrderPlanner {
 
   private normalizePositive(value: number | null | undefined): number | null {
     return Number.isFinite(value) && (value as number) > 0 ? (value as number) : null;
+  }
+
+  private normalizeNonNegative(value: number | null | undefined): number | null {
+    return Number.isFinite(value) && (value as number) >= 0 ? (value as number) : null;
   }
 
   private resolveVenueSideFromIntent(intent: TradeIntent): VenueSide | null {
@@ -306,4 +482,33 @@ export class OrderPlanner {
 
     return null;
   }
+}
+
+function classifySpreadBucket(spread: number | null | undefined) {
+  if (!Number.isFinite(spread ?? Number.NaN) || (spread ?? 0) <= 0) {
+    return 'unknown' as const;
+  }
+  if ((spread ?? 0) <= 0.01) {
+    return 'tight' as const;
+  }
+  if ((spread ?? 0) <= 0.025) {
+    return 'normal' as const;
+  }
+  if ((spread ?? 0) <= 0.05) {
+    return 'wide' as const;
+  }
+  return 'stressed' as const;
+}
+
+function classifyLiquidityBucket(depth: number | null | undefined) {
+  if (!Number.isFinite(depth ?? Number.NaN) || (depth ?? 0) <= 0) {
+    return 'unknown' as const;
+  }
+  if ((depth ?? 0) < 20) {
+    return 'thin' as const;
+  }
+  if ((depth ?? 0) < 100) {
+    return 'balanced' as const;
+  }
+  return 'deep' as const;
 }

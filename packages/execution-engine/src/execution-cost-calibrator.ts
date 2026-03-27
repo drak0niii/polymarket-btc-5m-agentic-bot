@@ -1,7 +1,10 @@
 import type {
   ExecutionLearningContext,
+  ExecutionStyle,
   ExecutionPolicyVersion,
+  LiquidityBucket,
   NetEdgeVenueUncertaintyLabel,
+  SpreadBucket,
 } from '@polymarket-btc-5m-agentic-bot/domain';
 
 export interface ExecutionCostObservation {
@@ -20,6 +23,12 @@ export interface ExecutionCostCalibrationInput {
   activePolicyVersion: ExecutionPolicyVersion | null;
   executionContext: ExecutionLearningContext | null;
   recentObservations: ExecutionCostObservation[];
+  regime?: string | null;
+  spreadBucket?: SpreadBucket | null;
+  liquidityBucket?: LiquidityBucket | null;
+  urgency?: 'low' | 'normal' | 'high' | null;
+  executionStyle?: ExecutionStyle | null;
+  venueMode?: string | null;
   cancelFailureRate?: number | null;
   venueUncertaintyLabel?: NetEdgeVenueUncertaintyLabel | null;
 }
@@ -33,6 +42,7 @@ export interface ExecutionCostCalibration {
   missedOpportunityCost: number;
   expectedFillProbability: number;
   confidence: number;
+  contextBucket: string;
   reasons: string[];
   evidence: Record<string, unknown>;
 }
@@ -62,16 +72,29 @@ export class ExecutionCostCalibrator {
     const policyFillDelayMs = input.activePolicyVersion?.expectedFillDelayMs ?? null;
     const contextFillDelayMs = input.executionContext?.averageFillDelayMs ?? null;
     const cancelFailureRate = clamp(input.cancelFailureRate ?? 0, 0, 1);
+    const bucketPenaltyMultiplier = this.bucketPenaltyMultiplier(input);
+    const contextBucket = [
+      `regime:${input.regime ?? 'all'}`,
+      `spread:${input.spreadBucket ?? 'unknown'}`,
+      `liquidity:${input.liquidityBucket ?? 'unknown'}`,
+      `urgency:${input.urgency ?? 'normal'}`,
+      `style:${input.executionStyle ?? 'unknown'}`,
+      `venue_mode:${input.venueMode ?? 'normal'}`,
+    ].join('|');
     const fillProbability = clamp(
-      Math.max(
-        observedFillProbability ?? 0,
-        maxNullable(
-          input.executionContext?.makerFillRate ?? null,
-          input.executionContext?.takerFillRate ?? null,
-        ) ?? 0,
+      clamp(
+        Math.max(
+          observedFillProbability ?? 0,
+          maxNullable(
+            input.executionContext?.makerFillRate ?? null,
+            input.executionContext?.takerFillRate ?? null,
+          ) ?? 0,
+          0.1,
+        ),
         0.1,
-      ),
-      0.1,
+        1,
+      ) / Math.max(1, bucketPenaltyMultiplier * 0.3),
+      0.08,
       1,
     );
     const feeCost = maxNullable(
@@ -80,19 +103,21 @@ export class ExecutionCostCalibrator {
       input.executionContext != null ? input.executionContext.averageSlippage * 0.2 : null,
       0.0005,
     ) ?? 0.0005;
-    const slippageCost = maxNullable(
+    const slippageCost = (maxNullable(
       recentSlippage,
       input.activePolicyVersion?.expectedSlippage ?? null,
       input.executionContext?.averageSlippage ?? null,
       0.001,
-    ) ?? 0.001;
-    const adverseSelectionCost = maxNullable(
+    ) ?? 0.001) * bucketPenaltyMultiplier;
+    const adverseSelectionCost = (maxNullable(
       recentAdverseSelection,
       adverseSelectionCostFromScore(input.activePolicyVersion?.adverseSelectionScore ?? null),
       adverseSelectionCostFromScore(input.executionContext?.adverseSelectionScore ?? null),
       0.0008,
-    ) ?? 0.0008;
-    const expectedFillDelayMs = maxNullable(policyFillDelayMs, contextFillDelayMs);
+    ) ?? 0.0008) * bucketPenaltyMultiplier;
+    const expectedFillDelayMs = Math.round(
+      (maxNullable(policyFillDelayMs, contextFillDelayMs) ?? 20_000) * bucketPenaltyMultiplier,
+    );
     const cancelReplaceOverheadCost = Math.max(
       0,
       cancelFailureRate * 0.0015 +
@@ -101,12 +126,14 @@ export class ExecutionCostCalibrator {
           ? 0.0005
           : input.venueUncertaintyLabel === 'unsafe'
             ? 0.0015
-            : 0),
+            : 0) +
+        (bucketPenaltyMultiplier - 1) * 0.001,
     );
     const missedOpportunityCost = Math.max(
       0,
       (1 - fillProbability) * 0.003 +
-        ((expectedFillDelayMs ?? 0) > 30_000 ? 0.001 : 0),
+        ((expectedFillDelayMs ?? 0) > 30_000 ? 0.001 : 0) +
+        (input.urgency === 'high' ? 0.0004 : 0),
     );
     const confidence = clamp(
       (input.recentObservations.length + (input.executionContext?.sampleCount ?? 0)) / 20,
@@ -127,6 +154,9 @@ export class ExecutionCostCalibrator {
     if (cancelFailureRate > 0.2) {
       reasons.push('cancel_failures_raise_cost_assumptions');
     }
+    if (bucketPenaltyMultiplier > 1) {
+      reasons.push('context_bucket_penalty_applied');
+    }
     if (input.venueUncertaintyLabel === 'degraded' || input.venueUncertaintyLabel === 'unsafe') {
       reasons.push(`venue_${input.venueUncertaintyLabel}_raises_cost_assumptions`);
     }
@@ -140,15 +170,59 @@ export class ExecutionCostCalibrator {
       missedOpportunityCost,
       expectedFillProbability: fillProbability,
       confidence,
+      contextBucket,
       reasons,
       evidence: {
         recentObservationCount: input.recentObservations.length,
         executionContext: input.executionContext,
         activePolicyVersion: input.activePolicyVersion,
         cancelFailureRate,
+        regime: input.regime ?? null,
+        spreadBucket: input.spreadBucket ?? null,
+        liquidityBucket: input.liquidityBucket ?? null,
+        urgency: input.urgency ?? null,
+        executionStyle: input.executionStyle ?? null,
+        venueMode: input.venueMode ?? null,
+        bucketPenaltyMultiplier,
         venueUncertaintyLabel: input.venueUncertaintyLabel ?? null,
       },
     };
+  }
+
+  private bucketPenaltyMultiplier(input: ExecutionCostCalibrationInput): number {
+    let multiplier = 1;
+
+    if (input.spreadBucket === 'wide') {
+      multiplier += 0.12;
+    } else if (input.spreadBucket === 'stressed') {
+      multiplier += 0.28;
+    }
+
+    if (input.liquidityBucket === 'thin') {
+      multiplier += 0.18;
+    } else if (input.liquidityBucket === 'unknown') {
+      multiplier += 0.08;
+    }
+
+    if (input.urgency === 'high') {
+      multiplier += 0.12;
+    }
+
+    if (input.executionStyle === 'taker') {
+      multiplier += 0.06;
+    } else if (input.executionStyle === 'maker') {
+      multiplier -= 0.03;
+    }
+
+    if (input.venueMode === 'size-reduced') {
+      multiplier += 0.06;
+    } else if (input.venueMode === 'cancel-only') {
+      multiplier += 0.14;
+    } else if (input.venueMode === 'reconciliation-only') {
+      multiplier += 0.18;
+    }
+
+    return clamp(multiplier, 0.85, 1.7);
   }
 }
 

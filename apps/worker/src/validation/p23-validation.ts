@@ -6,6 +6,7 @@ import type { LiveProofScorecard } from './live-proof-scorecard';
 import { buildLiveProofScorecard } from './live-proof-scorecard';
 import type { CalibrationDriftAlertsReport } from './calibration-drift-alerts';
 import { buildCalibrationDriftAlerts } from './calibration-drift-alerts';
+import { readLatestDailyDecisionQualityReport } from './daily-decision-quality-report';
 import type { RegimePerformanceReport } from './regime-performance-report';
 import { buildRegimePerformanceReport } from './regime-performance-report';
 import type { RollingBenchmarkScorecard } from './rolling-benchmark-scorecard';
@@ -1081,6 +1082,7 @@ export async function runP23Validation(options?: {
     baselineComparison,
     retentionReport,
     regimePerformanceReport,
+    dailyDecisionQualityReport: await readLatestDailyDecisionQualityReport(),
     now: options?.now,
   });
 
