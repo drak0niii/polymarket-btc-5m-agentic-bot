@@ -323,6 +323,38 @@ async function testSentinelModeSimulatesTradeWithoutLiveSubmit(): Promise<void> 
   assert.strictEqual(fs.existsSync(sentinelStateStore.getPaths().baselinePath), true);
   assert.strictEqual(await sentinelStateStore.countCompletedTrades(), 1);
   assert.strictEqual(auditEvents.includes('sentinel.trade_simulated'), true);
+  const baseline = JSON.parse(
+    fs.readFileSync(sentinelStateStore.getPaths().baselinePath, 'utf8'),
+  ) as {
+    strategyVariantId?: string | null;
+    strategyVersion?: string | null;
+    initialNetEdgeAssumptions?: { expectedNetEdgeBps?: number };
+    initialCostAssumptions?: { expectedFeeBps?: number; expectedSlippageBps?: number };
+    safeToGoLiveThresholds?: { targetSimulatedTrades?: number };
+  };
+  const [trade] = await sentinelStateStore.loadAllSimulatedTrades();
+  const readiness = await sentinelStateStore.readLatestReadiness();
+  assert.strictEqual(baseline.strategyVariantId, 'variant:strategy-1');
+  assert.strictEqual(baseline.strategyVersion, 'strategy-1');
+  assert.strictEqual(
+    typeof baseline.initialNetEdgeAssumptions?.expectedNetEdgeBps,
+    'number',
+  );
+  assert.strictEqual(typeof baseline.initialCostAssumptions?.expectedFeeBps, 'number');
+  assert.strictEqual(
+    baseline.safeToGoLiveThresholds?.targetSimulatedTrades,
+    20,
+  );
+  assert.strictEqual(trade?.decisionId, 'decision-1');
+  assert.strictEqual(typeof trade?.intendedPrice, 'number');
+  assert.strictEqual(typeof trade?.simulatedFillPrice, 'number');
+  assert.strictEqual(trade?.learned, true);
+  assert.strictEqual(
+    trade?.learningOutcomeRef,
+    `sentinel-learning:${trade?.simulationTradeId}`,
+  );
+  assert.strictEqual(readiness?.mode, 'sentinel_simulation');
+  assert.strictEqual(readiness?.baselineKnowledgeVersion, 'sentinel-baseline-v1');
 }
 
 async function testSentinelTradeCountersRemainAccurate(): Promise<void> {

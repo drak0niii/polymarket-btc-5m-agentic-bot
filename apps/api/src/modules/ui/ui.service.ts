@@ -45,7 +45,7 @@ export class UiService {
       this.marketsService.listMarkets(),
       this.signalsService.listSignals(),
       this.ordersService.listOrders(),
-      this.portfolioService.getLatestPortfolio().catch(() => null),
+      this.portfolioService.getLatestPortfolioSummary(),
       this.diagnosticsService.getExecutionDiagnostics(),
       this.diagnosticsService.getEvDriftDiagnostics(),
       this.diagnosticsService.getRegimeDiagnostics(),
@@ -92,7 +92,7 @@ export class UiService {
       this.marketsService.listMarkets(),
       this.signalsService.listSignals(),
       this.ordersService.listOrders(),
-      this.portfolioService.getLatestPortfolio().catch(() => null),
+      this.portfolioService.getLatestPortfolioSummary(),
     ]);
 
     return {

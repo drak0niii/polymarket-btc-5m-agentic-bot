@@ -3813,7 +3813,20 @@ async function testLifecycleSuitePersistsEvidenceAndReplayIncludesIt(): Promise<
     result.scenarios.every((scenario) => {
       const replay = lifecycleReplay(scenario);
       const lifecycleEvidence = replay.lifecycleEvidence as unknown[] | undefined;
-      return Array.isArray(lifecycleEvidence) && lifecycleEvidence.length >= 1;
+      const latestLifecycleValidation = replay.latestLifecycleValidation as
+        | {
+            finalTruth?: {
+              replay?: {
+                latestLifecycleValidation?: unknown;
+              };
+            };
+          }
+        | undefined;
+      return (
+        Array.isArray(lifecycleEvidence) &&
+        lifecycleEvidence.length >= 1 &&
+        (latestLifecycleValidation?.finalTruth?.replay?.latestLifecycleValidation ?? null) === null
+      );
     }),
     true,
   );

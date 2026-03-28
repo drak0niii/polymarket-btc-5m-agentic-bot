@@ -5,12 +5,15 @@ import type {
 
 interface SentinelSimulationInput {
   signalId: string;
+  decisionId?: string | null;
   marketId: string;
   tokenId: string;
   strategyVersionId: string | null;
   strategyVariantId: string | null;
   regime: string | null;
   side: 'BUY' | 'SELL';
+  intendedPrice?: number | null;
+  orderbookSnapshotRef?: string | null;
   simulatedAt?: string;
   operatingMode?: TradingOperatingMode;
   expectedFillProbability: number | null;
@@ -25,6 +28,7 @@ interface SentinelSimulationInput {
 
 export class SentinelTradeSimulator {
   simulate(input: SentinelSimulationInput): SentinelSimulatedTradeRecord {
+    const simulatedAt = input.simulatedAt ?? new Date().toISOString();
     const expectedFillProbability = clamp01(input.expectedFillProbability ?? 0.8);
     const expectedFillFraction = clamp01(input.expectedFillFraction ?? 0.95);
     const expectedQueueDelayMs = normalizeNullableNumber(input.expectedQueueDelayMs, 500);
@@ -80,16 +84,50 @@ export class SentinelTradeSimulator {
       Math.abs(expectedNetEdgeAfterCostsBps - realizedNetEdgeAfterCostsBps),
       4,
     );
+    const intendedPrice = roundTo(
+      clampUnitPrice(input.intendedPrice ?? 0.5),
+      6,
+    );
+    const simulatedFillPrice = roundTo(
+      clampUnitPrice(
+        input.side === 'BUY'
+          ? intendedPrice * (1 + realizedSlippageBps / 10_000)
+          : intendedPrice * (1 - realizedSlippageBps / 10_000),
+      ),
+      6,
+    );
+    const simulatedFee = roundTo(
+      Math.max(0, simulatedFillPrice * realizedFillFraction * (realizedFeeBps / 10_000)),
+      6,
+    );
+    const finalizedAt =
+      realizedQueueDelayMs == null
+        ? simulatedAt
+        : new Date(new Date(simulatedAt).getTime() + realizedQueueDelayMs).toISOString();
+    const learningOutcomeRef = `sentinel-learning:sentinel:${input.signalId}`;
 
     return {
       simulationTradeId: `sentinel:${input.signalId}`,
       signalId: input.signalId,
+      decisionId: input.decisionId ?? input.signalId,
       marketId: input.marketId,
       tokenId: input.tokenId,
       strategyVersionId: input.strategyVersionId,
       strategyVariantId: input.strategyVariantId,
       regime: input.regime,
-      simulatedAt: input.simulatedAt ?? new Date().toISOString(),
+      simulatedAt,
+      intendedPrice,
+      simulatedFillPrice,
+      simulatedFee,
+      simulatedSlippageBps: realizedSlippageBps,
+      expectedNetEdgeBps: expectedNetEdgeAfterCostsBps,
+      realizedNetEdgeBps: realizedNetEdgeAfterCostsBps,
+      fillProbabilityUsed: expectedFillProbability,
+      orderbookSnapshotRef: input.orderbookSnapshotRef ?? null,
+      createdAt: simulatedAt,
+      finalizedAt,
+      learned: true,
+      learningOutcomeRef,
       side: input.side,
       operatingMode: input.operatingMode ?? 'sentinel_simulation',
       expectedFillProbability,
@@ -135,6 +173,10 @@ function seededUnitInterval(seed: string): number {
 }
 
 function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function clampUnitPrice(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
 

@@ -36,6 +36,9 @@ importers:
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.9.0
+      '@polymarket-btc-5m-agentic-bot/risk-engine':
+        specifier: workspace:*
+        version: link:../../packages/risk-engine
       '@prisma/client':
         specifier: ^6.16.1
         version: 6.19.2(prisma@6.19.2(typescript@5.9.3))(typescript@5.9.3)
@@ -131,6 +134,30 @@ importers:
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.9.0
+      '@polymarket-btc-5m-agentic-bot/agent-layer':
+        specifier: workspace:*
+        version: link:../../packages/agent-layer
+      '@polymarket-btc-5m-agentic-bot/domain':
+        specifier: workspace:*
+        version: link:../../packages/domain
+      '@polymarket-btc-5m-agentic-bot/execution-engine':
+        specifier: workspace:*
+        version: link:../../packages/execution-engine
+      '@polymarket-btc-5m-agentic-bot/market-data':
+        specifier: workspace:*
+        version: link:../../packages/market-data
+      '@polymarket-btc-5m-agentic-bot/polymarket-adapter':
+        specifier: workspace:*
+        version: link:../../packages/polymarket-adapter
+      '@polymarket-btc-5m-agentic-bot/risk-engine':
+        specifier: workspace:*
+        version: link:../../packages/risk-engine
+      '@polymarket-btc-5m-agentic-bot/signal-engine':
+        specifier: workspace:*
+        version: link:../../packages/signal-engine
+      '@polymarket-btc-5m-agentic-bot/signing-engine':
+        specifier: workspace:*
+        version: link:../../packages/signing-engine
       '@polymarket/clob-client':
         specifier: ^5.8.0
         version: 5.8.0(typescript@5.9.3)(zod@4.3.6)
@@ -214,6 +241,12 @@ importers:
 
   packages/polymarket-adapter:
     dependencies:
+      '@polymarket-btc-5m-agentic-bot/execution-engine':
+        specifier: workspace:*
+        version: link:../execution-engine
+      '@polymarket-btc-5m-agentic-bot/signing-engine':
+        specifier: workspace:*
+        version: link:../signing-engine
       zod:
         specifier: ^4.1.5
         version: 4.3.6
@@ -226,6 +259,10 @@ importers:
         version: 5.9.3
 
   packages/risk-engine:
+    dependencies:
+      '@polymarket-btc-5m-agentic-bot/domain':
+        specifier: workspace:*
+        version: link:../domain
     devDependencies:
       '@types/node':
         specifier: ^24.3.0
@@ -235,6 +272,10 @@ importers:
         version: 5.9.3
 
   packages/signal-engine:
+    dependencies:
+      '@polymarket-btc-5m-agentic-bot/domain':
+        specifier: workspace:*
+        version: link:../domain
     devDependencies:
       '@types/node':
         specifier: ^24.3.0

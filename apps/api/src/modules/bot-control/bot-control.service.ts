@@ -2,6 +2,8 @@ import { Injectable } from '@nestjs/common';
 import { AppLogger } from '@api/common/logger';
 import { appEnv } from '@api/config/env';
 import {
+  BotControlError,
+  ConflictError,
   InvalidStateTransitionError,
   LiveConfigurationError,
   ReadinessError,
@@ -10,6 +12,7 @@ import { AuditService } from '@api/modules/audit/audit.service';
 import {
   BotControlRepository,
   LiveConfigState,
+  RuntimeCommandState,
   SentinelStatusState,
   TradingOperatingMode,
 } from './bot-control.repository';
@@ -26,6 +29,8 @@ type BotRuntimeState =
   | 'cancel_only'
   | 'halted_hard'
   | 'stopped';
+
+type CommandType = 'start' | 'stop' | 'halt';
 
 @Injectable()
 export class BotControlService {
@@ -48,20 +53,28 @@ export class BotControlService {
   ) {}
 
   async getState() {
-    const [runtimeStatus, liveConfig, pendingCommands, operatingMode, sentinelStatus] =
+    const [runtimeStatus, liveConfig, pendingCommands, recentCommands, operatingMode, sentinelStatus] =
       await Promise.all([
         this.repository.getOrCreateRuntimeStatus(appEnv.BOT_DEFAULT_STATUS),
         this.repository.getOrCreateLiveConfig(this.defaultLiveConfig),
         this.repository.findPendingCommands(),
+        this.repository.findRecentCommands(),
         this.repository.getOperatingMode(),
         this.repository.readSentinelStatus(),
       ]);
     const readiness = this.buildReadiness(liveConfig, operatingMode);
+    const operatingModeState = this.buildOperatingModeResponse(
+      operatingMode,
+      sentinelStatus,
+    );
+    const latestCommands = this.buildLatestCommands(recentCommands);
 
     return {
       state: runtimeStatus.state as BotRuntimeState,
       operatingMode,
       sentinelEnabled: operatingMode === 'sentinel_simulation',
+      eligibleForLiveTrading: operatingModeState.eligibleForLiveTrading,
+      warningText: operatingModeState.warningText,
       recommendedLiveEnable: sentinelStatus?.recommendedLiveEnable ?? false,
       sentinelStatus,
       deploymentTier: appEnv.BOT_DEPLOYMENT_TIER,
@@ -81,18 +94,28 @@ export class BotControlService {
       readiness,
       controlPlane: {
         source: 'worker_runtime',
+        activeCommands: recentCommands
+          .filter((command) => command.status === 'pending' || command.status === 'processing')
+          .map((command) => this.serializeCommand(command)),
+        latestCommandByType: {
+          start: latestCommands.start,
+          stop: latestCommands.stop,
+          halt: latestCommands.halt,
+        },
         pendingCommands: pendingCommands.map((command) => ({
           id: command.id,
           command: command.command,
           cancelOpenOrders: command.cancelOpenOrders,
           createdAt: command.createdAt,
         })),
+        recentCommands: recentCommands.map((command) => this.serializeCommand(command)),
       },
     };
   }
 
   async start(dto: StartBotDto) {
     if (dto.operatingMode) {
+      await this.assertOperatingModeAllowed(dto.operatingMode);
       await this.repository.setOperatingMode(
         dto.operatingMode,
         `mode set during start request by ${dto.requestedBy ?? 'unknown'}`,
@@ -116,8 +139,12 @@ export class BotControlService {
 
     const readiness = this.buildReadiness(liveConfig, operatingMode);
     if (!readiness.ready) {
-      throw new ReadinessError('Bot readiness checks failed. Cannot queue start.');
+      throw new ReadinessError(
+        `Bot readiness checks failed. Cannot queue start. Blocking checks: ${readiness.blockingReasons.join(', ')}`,
+      );
     }
+
+    await this.assertNoActiveCommand('start');
 
     const command = await this.repository.createCommand({
       command: 'start',
@@ -160,6 +187,8 @@ export class BotControlService {
       return this.getState();
     }
 
+    await this.assertNoActiveCommand('stop');
+
     const command = await this.repository.createCommand({
       command: 'stop',
       reason: dto.reason ?? 'manual stop requested',
@@ -190,6 +219,14 @@ export class BotControlService {
       appEnv.BOT_DEFAULT_STATUS,
     );
 
+    if (runtimeStatus.state === 'stopped' || runtimeStatus.state === 'halted_hard') {
+      throw new InvalidStateTransitionError(
+        `Emergency halt is not available from "${runtimeStatus.state}".`,
+      );
+    }
+
+    await this.assertNoActiveCommand('halt');
+
     const command = await this.repository.createCommand({
       command: 'halt',
       reason: dto.reason ?? 'manual emergency halt requested',
@@ -217,6 +254,7 @@ export class BotControlService {
 
   async setLiveConfig(dto: SetLiveConfigDto) {
     if (dto.operatingMode) {
+      await this.assertOperatingModeAllowed(dto.operatingMode);
       await this.repository.setOperatingMode(
         dto.operatingMode,
         `mode set during live-config update by ${dto.updatedBy ?? 'unknown'}`,
@@ -283,6 +321,7 @@ export class BotControlService {
     operatingMode: TradingOperatingMode;
     requestedBy?: string | null;
   }) {
+    await this.assertOperatingModeAllowed(input.operatingMode);
     await this.repository.setOperatingMode(
       input.operatingMode,
       `mode set by ${input.requestedBy ?? 'api'} via bot-control`,
@@ -329,6 +368,9 @@ export class BotControlService {
     return {
       ready: Object.values(checks).every(Boolean),
       checks,
+      blockingReasons: Object.entries(checks)
+        .filter(([, passed]) => !passed)
+        .map(([name]) => name),
     };
   }
 
@@ -350,6 +392,68 @@ export class BotControlService {
       warningText,
       sentinelStatus,
     };
+  }
+
+  private buildLatestCommands(recentCommands: RuntimeCommandState[]) {
+    return {
+      start: this.serializeCommand(
+        recentCommands.find((command) => command.command === 'start') ?? null,
+      ),
+      stop: this.serializeCommand(
+        recentCommands.find((command) => command.command === 'stop') ?? null,
+      ),
+      halt: this.serializeCommand(
+        recentCommands.find((command) => command.command === 'halt') ?? null,
+      ),
+    };
+  }
+
+  private serializeCommand(command: RuntimeCommandState | null) {
+    if (!command) {
+      return null;
+    }
+
+    return {
+      id: command.id,
+      command: command.command,
+      reason: command.reason,
+      requestedBy: command.requestedBy,
+      cancelOpenOrders: command.cancelOpenOrders,
+      status: command.status,
+      failureMessage: command.failureMessage,
+      createdAt: command.createdAt.toISOString(),
+      updatedAt: command.updatedAt.toISOString(),
+      processedAt: command.processedAt?.toISOString() ?? null,
+    };
+  }
+
+  private async assertOperatingModeAllowed(
+    operatingMode: TradingOperatingMode,
+  ): Promise<void> {
+    if (operatingMode !== 'live_trading') {
+      return;
+    }
+
+    const sentinelStatus = await this.repository.readSentinelStatus();
+
+    if (!(sentinelStatus?.recommendedLiveEnable ?? false)) {
+      throw new BotControlError(
+        sentinelStatus?.recommendationMessage ??
+          'Live trading is blocked until sentinel readiness recommends it.',
+      );
+    }
+  }
+
+  private async assertNoActiveCommand(command: CommandType): Promise<void> {
+    const activeCommand = await this.repository.findActiveCommand(command);
+
+    if (!activeCommand) {
+      return;
+    }
+
+    throw new ConflictError(
+      `${command} command ${activeCommand.id} is already ${activeCommand.status}.`,
+    );
   }
 
   private validateLiveConfig(dto: SetLiveConfigDto): void {

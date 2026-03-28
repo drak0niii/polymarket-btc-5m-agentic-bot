@@ -5,7 +5,7 @@
   "type": "commonjs",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "ts-node --project tsconfig.json src/main.ts",
+    "dev": "ts-node -r tsconfig-paths/register --project tsconfig.json src/main.ts",
     "start": "node dist/main.js",
     "test": "DATABASE_URL=postgresql://test REDIS_URL=redis://test POLY_CLOB_HOST=http://localhost POLY_GAMMA_HOST=http://localhost POLY_PRIVATE_KEY=1111111111111111111111111111111111111111111111111111111111111111 POLY_API_KEY=test POLY_API_SECRET=test POLY_API_PASSPHRASE=test BOT_LIVE_EXECUTION_ENABLED=true ts-node -r tsconfig-paths/register --project tsconfig.json src/tests/integration-runner.ts",
     "smoke:polymarket-auth": "ts-node -r tsconfig-paths/register --project tsconfig.json src/smoke/polymarket-auth-smoke.ts",

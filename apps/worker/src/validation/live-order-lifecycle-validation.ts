@@ -465,6 +465,39 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value));
 }
 
+function sanitizeReplayLatestLifecycleValidation(
+  scenario: LifecycleScenarioEvidence | Record<string, unknown> | null | undefined,
+): Record<string, unknown> | null {
+  if (!scenario || typeof scenario !== 'object') {
+    return null;
+  }
+
+  const finalTruthValue = (scenario as { finalTruth?: unknown }).finalTruth;
+  if (!finalTruthValue || typeof finalTruthValue !== 'object') {
+    return { ...(scenario as Record<string, unknown>) };
+  }
+
+  const finalTruth = { ...(finalTruthValue as Record<string, unknown>) };
+  const replayValue = finalTruth.replay;
+  if (!replayValue || typeof replayValue !== 'object') {
+    return {
+      ...(scenario as Record<string, unknown>),
+      finalTruth,
+    };
+  }
+
+  finalTruth.replay = {
+    ...(replayValue as Record<string, unknown>),
+    // Prevent persisted lifecycle evidence from recursively embedding prior suites.
+    latestLifecycleValidation: null,
+  };
+
+  return {
+    ...(scenario as Record<string, unknown>),
+    finalTruth,
+  };
+}
+
 function sortRecords<T extends Record<string, any>>(
   records: T[],
   key: string,
@@ -1180,7 +1213,9 @@ async function captureFinalTruth(harness: ReturnType<typeof createHarness>): Pro
       })),
       lifecycleEvidence: replay.lifecycleEvidence,
       parserFailures: replay.parserFailures,
-      latestLifecycleValidation: replay.latestLifecycleValidation,
+      latestLifecycleValidation: sanitizeReplayLatestLifecycleValidation(
+        replay.latestLifecycleValidation as LifecycleScenarioEvidence | null | undefined,
+      ),
       reconstructable: replay.reconstructable,
       generatedAt: replay.generatedAt,
     },

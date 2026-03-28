@@ -1051,10 +1051,20 @@ export class ExecuteOrdersJob {
       if (operatingMode === 'sentinel_simulation') {
         await this.simulateSentinelTrade({
           signal,
+          decisionId: decision.id,
           market,
           tokenId,
           strategyVariantId,
           orderPlan,
+          orderbookSnapshotRef:
+            orderbook && typeof orderbook === 'object' && 'observedAt' in orderbook
+              ? `${market.id}:${tokenId}:${new Date(
+                  String(
+                    (orderbook as { observedAt?: unknown }).observedAt ??
+                      new Date().toISOString(),
+                  ),
+                ).toISOString()}`
+              : null,
           feeModel,
           executionPlannerAssumptions,
           executionAdjustedEdge,
@@ -1799,6 +1809,7 @@ export class ExecuteOrdersJob {
       strategyVersionId: string | null;
       regime: string | null;
     };
+    decisionId: string;
     market: {
       id: string;
     };
@@ -1806,11 +1817,13 @@ export class ExecuteOrdersJob {
     strategyVariantId: string;
     orderPlan: {
       side: 'BUY' | 'SELL';
+      price: number;
       expectedFillProbability: number | null;
       expectedFillFraction: number | null;
       expectedQueueDelayMs: number | null;
       recommendedOrderStyleRationale?: unknown[];
     };
+    orderbookSnapshotRef: string | null;
     feeModel: {
       netFeeBps: number;
     };
@@ -1826,15 +1839,35 @@ export class ExecuteOrdersJob {
     makerQuality: unknown;
   }): Promise<void> {
     await this.sentinelStateStore.ensureBaselineKnowledge('sentinel_simulation');
+    await this.sentinelStateStore.updateBaselineKnowledge({
+      operatingMode: 'sentinel_simulation',
+      strategyVariantId: input.strategyVariantId,
+      strategyVersion: input.signal.strategyVersionId,
+      initialNetEdgeAssumptions: {
+        expectedNetEdgeBps: roundTo(input.executionAdjustedEdge * 10_000, 4),
+      },
+      initialCostAssumptions: {
+        expectedFeeBps: roundTo(input.feeModel.netFeeBps, 4),
+        expectedSlippageBps: roundTo(
+          input.executionPlannerAssumptions.slippageEstimate?.finalExpectedSlippageBps ??
+            input.slippage.expectedSlippage * 10_000,
+          4,
+        ),
+      },
+      initialTrustScore: roundTo(input.orderPlan.expectedFillProbability ?? 0.8, 4),
+    });
     const previousReadiness = await this.sentinelStateStore.readLatestReadiness();
     const trade = this.sentinelTradeSimulator.simulate({
       signalId: input.signal.id,
+      decisionId: input.decisionId,
       marketId: input.market.id,
       tokenId: input.tokenId,
       strategyVersionId: input.signal.strategyVersionId,
       strategyVariantId: input.strategyVariantId,
       regime: input.signal.regime,
       side: input.orderPlan.side,
+      intendedPrice: input.orderPlan.price,
+      orderbookSnapshotRef: input.orderbookSnapshotRef,
       operatingMode: 'sentinel_simulation',
       expectedFillProbability: input.orderPlan.expectedFillProbability,
       expectedFillFraction: input.orderPlan.expectedFillFraction,
@@ -2650,4 +2683,9 @@ function clamp01(value: number): number {
   }
 
   return Math.max(0, Math.min(1, value));
+}
+
+function roundTo(value: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
 }

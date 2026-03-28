@@ -1,20 +1,29 @@
 import { useEffect, useState } from 'react';
-import { apiClient } from '../lib/api';
+import {
+  apiClient,
+  ApiError,
+  type PortfolioSnapshotResponse,
+} from '../lib/api';
 
-interface PortfolioSnapshot {
-  id: string;
-  bankroll: number;
-  availableCapital: number;
-  openExposure: number;
-  realizedPnlDay: number;
-  unrealizedPnl: number;
-  consecutiveLosses: number;
-  capturedAt: string;
-  createdAt: string;
+type PortfolioFetchStatus = 'loading' | 'ready' | 'missing' | 'stale' | 'error';
+
+function describeApiError(error: unknown) {
+  if (error instanceof ApiError) {
+    return error.message;
+  }
+
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return 'Portfolio request failed.';
 }
 
 export function usePortfolio() {
-  const [portfolio, setPortfolio] = useState<PortfolioSnapshot | null>(null);
+  const [portfolio, setPortfolio] = useState<PortfolioSnapshotResponse | null>(null);
+  const [status, setStatus] = useState<PortfolioFetchStatus>('loading');
+  const [message, setMessage] = useState<string | null>(null);
+  const [lastSuccessfulSyncAt, setLastSuccessfulSyncAt] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -23,9 +32,16 @@ export function usePortfolio() {
       try {
         const nextPortfolio = await apiClient.getPortfolio();
         if (!active) return;
-        setPortfolio(nextPortfolio);
-      } catch {
-        // noop
+        setPortfolio(nextPortfolio.snapshot);
+        setMessage(nextPortfolio.message);
+        setStatus(nextPortfolio.status === 'ready' ? 'ready' : 'missing');
+        setLastSuccessfulSyncAt(new Date().toISOString());
+      } catch (error) {
+        if (!active) return;
+        setMessage(describeApiError(error));
+        setStatus((current) =>
+          current === 'ready' || current === 'missing' ? 'stale' : 'error',
+        );
       }
     };
 
@@ -43,5 +59,8 @@ export function usePortfolio() {
 
   return {
     portfolio,
+    status,
+    message,
+    lastSuccessfulSyncAt,
   };
 }

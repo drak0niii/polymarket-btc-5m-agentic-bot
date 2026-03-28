@@ -13,6 +13,9 @@ import { resolveRepositoryRoot } from './learning-state-store';
 const TARGET_SIMULATED_TRADES = 20;
 const TARGET_LEARNED_TRADES = 20;
 const READINESS_THRESHOLD = 0.75;
+const MAX_EDGE_GAP_BPS = 8;
+const MIN_FILL_QUALITY_PASS_RATE = 0.8;
+const MIN_NO_TRADE_DISCIPLINE_PASS_RATE = 0.8;
 
 export class SentinelStateStore {
   private readonly logger = new AppLogger('SentinelStateStore');
@@ -60,9 +63,29 @@ export class SentinelStateStore {
       baselineId: 'sentinel-baseline-v1',
       createdAt: new Date().toISOString(),
       operatingMode,
+      strategyVariantId: null,
+      strategyVersion: null,
+      regimeModelVersion: 'regime-classifier-v1',
+      initialNetEdgeAssumptions: {
+        expectedNetEdgeBps: 0,
+      },
+      initialCostAssumptions: {
+        expectedFeeBps: 0,
+        expectedSlippageBps: 0,
+      },
+      initialTrustScore: 0,
       targetSimulatedTrades: TARGET_SIMULATED_TRADES,
       targetLearnedTrades: TARGET_LEARNED_TRADES,
       readinessThreshold: READINESS_THRESHOLD,
+      safeToGoLiveThresholds: {
+        targetSimulatedTrades: TARGET_SIMULATED_TRADES,
+        targetLearnedTrades: TARGET_LEARNED_TRADES,
+        readinessThreshold: READINESS_THRESHOLD,
+        maxExpectedVsRealizedEdgeGapBps: MAX_EDGE_GAP_BPS,
+        minFillQualityPassRate: MIN_FILL_QUALITY_PASS_RATE,
+        minNoTradeDisciplinePassRate: MIN_NO_TRADE_DISCIPLINE_PASS_RATE,
+        maxUnresolvedAnomalyCount: 0,
+      },
       boundedLearningSurfaces: [
         'trust/readiness_state',
         'execution_expectation_summaries',
@@ -83,6 +106,66 @@ export class SentinelStateStore {
     };
     await this.writeJsonFile(this.baselinePath, baseline);
     return baseline;
+  }
+
+  async updateBaselineKnowledge(
+    patch: Partial<SentinelBaselineKnowledge>,
+  ): Promise<SentinelBaselineKnowledge> {
+    const current = await this.ensureBaselineKnowledge(
+      patch.operatingMode ?? 'sentinel_simulation',
+    );
+    const next: SentinelBaselineKnowledge = {
+      ...current,
+      ...patch,
+      initialNetEdgeAssumptions: {
+        expectedNetEdgeBps:
+          patch.initialNetEdgeAssumptions?.expectedNetEdgeBps ??
+          current.initialNetEdgeAssumptions?.expectedNetEdgeBps ??
+          0,
+      },
+      initialCostAssumptions: {
+        expectedFeeBps:
+          patch.initialCostAssumptions?.expectedFeeBps ??
+          current.initialCostAssumptions?.expectedFeeBps ??
+          0,
+        expectedSlippageBps:
+          patch.initialCostAssumptions?.expectedSlippageBps ??
+          current.initialCostAssumptions?.expectedSlippageBps ??
+          0,
+      },
+      safeToGoLiveThresholds: {
+        targetSimulatedTrades:
+          patch.safeToGoLiveThresholds?.targetSimulatedTrades ??
+          current.safeToGoLiveThresholds?.targetSimulatedTrades ??
+          TARGET_SIMULATED_TRADES,
+        targetLearnedTrades:
+          patch.safeToGoLiveThresholds?.targetLearnedTrades ??
+          current.safeToGoLiveThresholds?.targetLearnedTrades ??
+          TARGET_LEARNED_TRADES,
+        readinessThreshold:
+          patch.safeToGoLiveThresholds?.readinessThreshold ??
+          current.safeToGoLiveThresholds?.readinessThreshold ??
+          READINESS_THRESHOLD,
+        maxExpectedVsRealizedEdgeGapBps:
+          patch.safeToGoLiveThresholds?.maxExpectedVsRealizedEdgeGapBps ??
+          current.safeToGoLiveThresholds?.maxExpectedVsRealizedEdgeGapBps ??
+          MAX_EDGE_GAP_BPS,
+        minFillQualityPassRate:
+          patch.safeToGoLiveThresholds?.minFillQualityPassRate ??
+          current.safeToGoLiveThresholds?.minFillQualityPassRate ??
+          MIN_FILL_QUALITY_PASS_RATE,
+        minNoTradeDisciplinePassRate:
+          patch.safeToGoLiveThresholds?.minNoTradeDisciplinePassRate ??
+          current.safeToGoLiveThresholds?.minNoTradeDisciplinePassRate ??
+          MIN_NO_TRADE_DISCIPLINE_PASS_RATE,
+        maxUnresolvedAnomalyCount:
+          patch.safeToGoLiveThresholds?.maxUnresolvedAnomalyCount ??
+          current.safeToGoLiveThresholds?.maxUnresolvedAnomalyCount ??
+          0,
+      },
+    };
+    await this.writeJsonFile(this.baselinePath, next);
+    return next;
   }
 
   async appendSimulatedTrade(record: SentinelSimulatedTradeRecord): Promise<void> {

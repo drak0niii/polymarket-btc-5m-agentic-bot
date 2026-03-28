@@ -10,7 +10,7 @@ export class PortfolioController {
 
   @Get()
   async getLatestPortfolio() {
-    return this.portfolioService.getLatestPortfolio();
+    return this.portfolioService.getLatestPortfolioSummary();
   }
 
   @Get('snapshots')

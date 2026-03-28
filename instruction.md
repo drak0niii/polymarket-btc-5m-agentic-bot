@@ -1,458 +1,336 @@
-# instructions.md
+# instruction.md
 
 ## Objective
 
-Build a **Sentinel Simulation version** of the BTC 5-minute Polymarket system that:
+Fix the remaining runtime and control-plane issues completely so the dashboard becomes fully trustworthy, operationally safe, and functionally complete.
 
-1. simulates trades instead of placing real orders
-2. defines and persists a baseline knowledge state before simulation begins
-3. simulates **at least 20 trades**
-4. learns from those 20 simulated trades using explicit, durable artifacts
-5. computes a backend-side readiness score and recommendation state
-6. exposes a **dashboard switch** so the user can choose between Sentinel Simulation and Real Trading
-7. shows the user a clear progress and recommendation message:
-   - how many trades were taken
-   - how many were learned from
-   - what threshold must be reached
-   - whether the system recommends going live
+The remaining known issues are:
 
-This implementation must be **strict**:
-- simulation must not place real orders
-- readiness must be computed from persisted backend state
-- the dashboard switch must be wired through the API/backend
-- recommendation to go live must remain advisory, not automatic
+1. **Start cannot reach running**
+   - startup/authenticated venue gating fails after Start is accepted
+   - API/dashboard truth is still too optimistic before the worker proves startup success
 
----
+2. **Emergency Halt runtime race**
+   - halt can still fail during bootstrapping because the runtime transitions to `stopped` before halt is applied
+   - the UI now reports the failure honestly, but the actual runtime behavior is still unsafe
 
-## Implementation summary
+To bring the dashboard to a true top-tier operational standard, this pass must also close any remaining gaps in:
 
-The build must add a **Sentinel mode** to the existing system rather than creating a parallel bot.
+3. **pre-start eligibility truth**
+4. **runtime command state machine reliability**
+5. **operator safety guarantees for halt/start/stop**
+6. **full end-to-end dashboard trust validation after fixes**
 
-Use the existing pipeline:
-- market discovery
-- market/orderbook sync
-- signal build
-- trade evaluation
-- admission and sizing
-
-Then replace only the execution target:
-- in sentinel mode: simulated execution
-- in live mode: real execution
+This pass is complete only when the dashboard is both:
+- **truthful**
+- **operationally reliable**
 
 ---
 
-## Phase A — canonical mode and sentinel status
+## Prime directive
+
+**ELIMINATE THE REMAINING RUNTIME/CONTROL-PLANE FAILURES SO THE DASHBOARD CAN BE TRUSTED AS THE AUTHORITATIVE OPERATIONAL SURFACE**
+
+---
+
+## Non-negotiable rules
+
+1. **Fix the underlying runtime problems, not just the UI messaging.**
+   Honest failure reporting is already improved; now the actual behavior must be made reliable.
+
+2. **Start must not be offered as normal when startup success is already knowably blocked.**
+   If startup prerequisites are not satisfied, the operator must be blocked or explicitly warned before queueing.
+
+3. **Emergency Halt must be operationally reliable.**
+   It must not be vulnerable to a bootstrapping-to-stopped race that causes a failed halt after acceptance.
+
+4. **State-machine truth must be authoritative.**
+   API, worker, and UI must agree on runtime transitions and command outcomes.
+
+5. **No weakening of safety gates.**
+   Do not bypass authenticated venue reads, readiness checks, or startup gates merely to make Start succeed.
+
+6. **Fail closed.**
+   If the runtime cannot guarantee a safe state transition, it must not imply success.
+
+7. **Re-test everything after the runtime fixes.**
+   No issue is considered closed without direct re-execution of the previously failing flows.
+
+8. **Minimal but complete changes.**
+   Fix the remaining problems end to end, but do not broaden into unrelated product work.
+
+---
+
+## Target outcome: dashboard 10/10 standard
+
+For this pass, “dashboard to 10” means all of the following are true:
+
+1. no false operational truth
+2. no misleading control result states
+3. no unsafe live/sentinel ambiguity
+4. no duplicate or racy command submissions
+5. Start is either:
+   - successfully brought to running when prerequisites are satisfied, or
+   - blocked before queueing with a truthful backend reason
+6. Emergency Halt is either:
+   - successfully enforced, or
+   - blocked before acceptance if impossible
+7. UI, API, and worker remain consistent across refresh/reopen
+8. dashboard re-test finds no remaining Critical issues and no remaining High issues in core control flows
+
+---
+
+## Required implementation order
+
+Implement in this exact order:
+
+### Phase 1 — Startup truth alignment
+### Phase 2 — Runtime transition and halt-race elimination
+### Phase 3 — Command lifecycle hardening
+### Phase 4 — Dashboard/runtime contract alignment
+### Phase 5 — Full end-to-end re-test and closure report
+
+Do not skip phases.
+
+---
+
+## Phase 1 — Startup truth alignment
 
 ### Goal
-Create a shared language for mode switching and readiness reporting.
+Ensure Start cannot be accepted as normal when runtime startup is already knowably blocked.
 
-### Files to add
-- `packages/domain/src/sentinel.ts`
-
-### Files to modify
-- `packages/domain/src/bot-state.ts`
-- `packages/domain/src/index.ts`
-- `packages/ui-contracts/src/control.ts`
-- `packages/ui-contracts/src/dashboard.ts`
-
-### Required changes
-
-#### 1) Add `packages/domain/src/sentinel.ts`
-Define canonical types:
-- `TradingOperatingMode = 'sentinel_simulation' | 'live_trading'`
-- `SentinelBaselineKnowledge`
-- `SentinelSimulatedTradeRecord`
-- `SentinelLearningUpdate`
-- `SentinelReadinessStatus`
-- `SentinelRecommendationState = 'not_ready' | 'ready_to_consider_live'`
-
-#### 2) Update `packages/domain/src/bot-state.ts`
-Add operating mode fields to the canonical bot state:
-- `operatingMode`
-- `sentinelEnabled`
-- `recommendedLiveEnable`
-
-#### 3) Update `packages/ui-contracts/src/control.ts`
-Add request/response shapes for:
-- setting operating mode
-- reading current sentinel mode
-- reading sentinel toggle eligibility/warning text
-
-#### 4) Update `packages/ui-contracts/src/dashboard.ts`
-Add dashboard contract fields for sentinel status:
-- `operatingMode`
-- `sentinelStatus`
-- `recommendationMessage`
-- `simulatedTradesCompleted`
-- `simulatedTradesLearned`
-- `targetSimulatedTrades`
-- `readinessScore`
-- `readinessThreshold`
-
-### Acceptance
-- shared mode and sentinel status types exist
-- API and web can consume one canonical sentinel status model
-
----
-
-## Phase B — baseline knowledge and durable sentinel stores
-
-### Goal
-Persist the baseline state and all simulated/learned outcomes.
-
-### Files to add
-- `apps/worker/src/runtime/sentinel-state-store.ts`
-
-### Files to modify
-- `apps/worker/src/runtime/learning-state-store.ts`
-- `apps/worker/src/runtime/bot-state.ts`
-
-### Required changes
-
-#### 1) Add `apps/worker/src/runtime/sentinel-state-store.ts`
-Responsibilities:
-- initialize baseline knowledge
-- append simulated trades
-- append learning updates
-- persist latest readiness state
-- expose read methods for dashboard/API use
-
-Required methods:
-- `ensureBaselineKnowledge()`
-- `appendSimulatedTrade(record)`
-- `appendLearningUpdate(update)`
-- `writeReadiness(status)`
-- `readLatestReadiness()`
-- `loadRecentSimulatedTrades(limit)`
-- `countCompletedTrades()`
-- `countLearnedTrades()`
-
-### Required artifact paths
-- `artifacts/learning/sentinel/baseline-knowledge.latest.json`
-- `artifacts/learning/sentinel/simulated-trades.jsonl`
-- `artifacts/learning/sentinel/learning-updates.jsonl`
-- `artifacts/learning/sentinel/readiness.latest.json`
-
-#### 2) Update `apps/worker/src/runtime/learning-state-store.ts`
-Add a pointer block only, not full sentinel history:
-- `sentinelBaselinePath`
-- `sentinelTradesPath`
-- `sentinelLearningUpdatesPath`
-- `sentinelReadinessPath`
-
-#### 3) Update `apps/worker/src/runtime/bot-state.ts`
-Persist the current operating mode so sentinel/live survives restart.
-
-### Acceptance
-- baseline knowledge is written before the first sentinel trade
-- sentinel trades and learning updates persist durably
-- latest readiness can be read without scanning the whole ledger
-
----
-
-## Phase C — simulated execution path
-
-### Goal
-Run the existing trade approval path but simulate the fill and outcome.
-
-### Files to add
-- `apps/worker/src/runtime/sentinel-trade-simulator.ts`
-
-### Files to modify
-- `apps/worker/src/jobs/executeOrders.job.ts`
-- `apps/worker/src/jobs/reconcileFills.job.ts`
+### Primary files to inspect and modify
+- `apps/worker/src/runtime/start-stop-manager.ts`
+- `apps/worker/src/runtime/runtime-state-machine.ts`
 - `apps/worker/src/runtime/bot-runtime.ts`
-
-### Required changes
-
-#### 1) Add `apps/worker/src/runtime/sentinel-trade-simulator.ts`
-Responsibilities:
-- consume approved trade intents
-- simulate fill probability using current orderbook + existing calibration surfaces
-- simulate fill price and slippage
-- simulate fees and queue delay
-- finalize a simulated trade outcome
-
-Required behavior:
-- use existing order planner outputs where possible
-- use existing fee/slippage assumptions where possible
-- produce a `SentinelSimulatedTradeRecord`
-- never call real submit/cancel endpoints
-
-#### 2) Update `apps/worker/src/jobs/executeOrders.job.ts`
-Add a hard split:
-- if `operatingMode === 'sentinel_simulation'`: route to `SentinelTradeSimulator`
-- if `operatingMode === 'live_trading'`: use existing live execution path
-
-Rules:
-- the sentinel branch must never fall through to live submit
-- log an explicit audit event such as `sentinel.trade_simulated`
-
-#### 3) Update `apps/worker/src/jobs/reconcileFills.job.ts`
-Handle sentinel outcomes distinctly from live fills.
-
-Rules:
-- sentinel simulated trades may write to sentinel artifacts
-- sentinel trades must not pollute live order truth
-- if the repo already writes canonical resolved-trade evidence, sentinel may optionally write a mode-tagged record only if clearly separated from live execution truth
-
-#### 4) Update `apps/worker/src/runtime/bot-runtime.ts`
-Ensure mode is available to jobs and runtime wiring.
-
-### Acceptance
-- sentinel mode completes simulated trades without calling real exchange submission
-- live mode remains unchanged
-- both branches are explicit in code
-
----
-
-## Phase D — learning from simulated trades
-
-### Goal
-After each simulated trade, update learning state and readiness state.
-
-### Files to add
-- `apps/worker/src/runtime/sentinel-learning-service.ts`
-- `apps/worker/src/runtime/sentinel-readiness-service.ts`
-
-### Files to modify
-- `apps/worker/src/jobs/dailyReview.job.ts`
-- `apps/worker/src/runtime/decision-log.service.ts`
-
-### Required changes
-
-#### 1) Add `apps/worker/src/runtime/sentinel-learning-service.ts`
-Responsibilities:
-- consume new simulated trade records
-- mark whether the trade has been learned from
-- update bounded learning fields only
-
-Allowed updates:
-- trust/readiness state
-- calibrated execution expectation summaries
-- regime confidence support metrics
-- no-trade discipline summaries
-- strategy confidence/readiness metrics
-
-Not allowed:
-- rewrite strategy families
-- rewrite safety policy
-- bypass risk rules
-
-Required learning update fields:
-- `learningUpdateId`
-- `simulationTradeId`
-- `learnedAt`
-- `parameterChanges[]`
-- `evidenceRefs[]`
-- `reason`
-- `rollbackCriteria[]`
-
-#### 2) Add `apps/worker/src/runtime/sentinel-readiness-service.ts`
-Responsibilities:
-- compute readiness after every new learned trade
-- write `readiness.latest.json`
-- generate recommendation text
-
-Readiness formula must combine at minimum:
-- trade count progress
-- learning coverage
-- net edge after costs
-- expected-vs-realized edge gap
-- fill-quality pass rate
-- no-trade discipline pass rate
-- anomaly count
-
-Default thresholds:
-- `targetSimulatedTrades = 20`
-- `targetLearnedTrades = 20`
-- `readinessThreshold = 0.75`
-- `expectedVsRealizedEdgeGapBps <= 8`
-- `fillQualityPassRate >= 0.80`
-- `noTradeDisciplinePassRate >= 0.80`
-- `unresolvedAnomalyCount = 0`
-
-#### 3) Update `apps/worker/src/jobs/dailyReview.job.ts`
-Include sentinel review outputs:
-- daily simulated trade count
-- daily learned trade count
-- sentinel readiness summary
-- recommendation state
-
-#### 4) Update `apps/worker/src/runtime/decision-log.service.ts`
-Log sentinel-specific decision evidence and recommendation transitions.
-
-### Acceptance
-- every simulated trade can become a learned trade
-- readiness updates after learning
-- recommendation text is persisted backend-side
-
----
-
-## Phase E — API control and dashboard read model
-
-### Goal
-Expose sentinel mode and readiness through API.
-
-### Files to add
-- `apps/api/src/modules/ui/dto/sentinel-status-response.dto.ts` *(optional if you prefer a separate DTO)*
-
-### Files to modify
-- `apps/api/src/modules/bot-control/dto/start-bot.dto.ts`
-- `apps/api/src/modules/bot-control/dto/set-live-config.dto.ts`
-- `apps/api/src/modules/bot-control/bot-control.controller.ts`
+- `apps/worker/src/runtime/live-loop.ts`
+- `apps/worker/src/runtime/venue-open-order-heartbeat.service.ts`
+- `apps/worker/src/runtime/user-websocket-state.service.ts`
 - `apps/api/src/modules/bot-control/bot-control.service.ts`
-- `apps/api/src/modules/bot-control/bot-control.repository.ts`
-- `apps/api/src/modules/ui/dto/dashboard-response.dto.ts`
+- `apps/api/src/modules/bot-control/bot-control.controller.ts`
 - `apps/api/src/modules/ui/ui.service.ts`
-- `apps/api/src/modules/ui/ui.controller.ts`
+- `apps/web/src/hooks/useBotState.ts`
+- `apps/web/src/components/panels/ControlPanel.tsx`
 
 ### Required changes
+1. Identify exactly why API/backend can expose readiness/startability that is more optimistic than real worker startup truth.
 
-#### 1) Bot control DTO/controller/service
-Allow the backend to:
-- set `operatingMode`
-- read `operatingMode`
-- persist switch choice
+2. Add or refine a backend-visible **pre-start eligibility state** that reflects the real runtime prerequisites needed to reach running.
 
-Add an endpoint such as:
-- `POST /bot-control/mode`
-- `GET /bot-control/mode`
+3. Ensure Start behavior becomes one of only two honest outcomes:
+   - **allowed and plausibly runnable**
+   - **blocked with explicit backend reason before queueing**
 
-#### 2) UI service/controller/dashboard DTO
-Add sentinel status to the dashboard response.
+4. If some prerequisites are only knowable at worker/runtime level, propagate that truth back up into the API/dashboard contract.
 
-Required dashboard payload fields:
-- `operatingMode`
-- `sentinelStatus`
-- `recommendationMessage`
-- `simulatedTradesCompleted`
-- `simulatedTradesLearned`
-- `targetSimulatedTrades`
-- `readinessScore`
-- `readinessThreshold`
-- `recommendedLiveEnable`
+5. Do not allow “ready” to mean merely “not currently running” if authenticated venue checks or startup dependencies are known to fail.
 
 ### Acceptance
-- dashboard data can be fetched from backend truth
-- mode switch persists server-side
-- recommendation text comes from backend readiness state
+- Start is not offered as normal when startup would predictably fail
+- blocking reason is surfaced before or immediately at submission
+- API/dashboard truth matches worker startup truth
 
 ---
 
-## Phase F — dashboard switch and user message
+## Phase 2 — Runtime transition and halt-race elimination
 
 ### Goal
-Let the user flip the mode from the dashboard and see progress clearly.
+Make Emergency Halt operationally reliable and eliminate the stopped-vs-halt race.
 
-### Files to modify
+### Primary files to inspect and modify
+- `apps/worker/src/runtime/runtime-state-machine.ts`
+- `apps/worker/src/runtime/start-stop-manager.ts`
+- `apps/worker/src/runtime/bot-runtime.ts`
+- `apps/worker/src/runtime/live-loop.ts`
+- `apps/api/src/modules/bot-control/bot-control.service.ts`
+- `apps/web/src/hooks/useBotState.ts`
+- `apps/web/src/components/buttons/EmergencyHaltButton.tsx`
 - `apps/web/src/components/panels/ControlPanel.tsx`
+
+### Required changes
+1. Identify the exact race that allows:
+   - Start accepted
+   - runtime falls back to `stopped`
+   - Halt accepted or queued
+   - Halt later fails with illegal transition
+
+2. Redesign or harden the relevant transition logic so halt semantics are safe and deterministic.
+
+3. Emergency Halt must have one of these truthful models:
+   - **preemptive priority command** that wins over normal fallback-to-stopped transitions, or
+   - **explicitly blocked** if halt is no longer meaningful in current state
+
+4. Do not allow the operator to believe halt succeeded when runtime semantics make it impossible.
+
+5. Expose a truthful final halt outcome consistently across worker, API, and UI.
+
+### Acceptance
+- no accepted halt ends in a race-induced illegal transition
+- halt outcome is operationally reliable
+- runtime transitions are deterministic and auditable
+
+---
+
+## Phase 3 — Command lifecycle hardening
+
+### Goal
+Bring control actions to a fully reliable operator model.
+
+### Primary files to inspect and modify
+- `apps/api/src/modules/bot-control/bot-control.repository.ts`
+- `apps/api/src/modules/bot-control/bot-control.service.ts`
+- `apps/api/src/modules/bot-control/bot-control.controller.ts`
 - `apps/web/src/hooks/useBotState.ts`
 - `apps/web/src/lib/api.ts`
-- `apps/web/src/components/panels/DiagnosticsPanel.tsx` *(optional if sentinel details also belong there)*
+- `apps/web/src/components/buttons/StartBotButton.tsx`
+- `apps/web/src/components/buttons/StopBotButton.tsx`
+- `apps/web/src/components/buttons/EmergencyHaltButton.tsx`
+- `apps/web/src/components/panels/ControlPanel.tsx`
 
 ### Required changes
+1. Standardize command lifecycle semantics for:
+   - start
+   - stop
+   - halt
+   - mode switch if relevant
 
-#### 1) Update `apps/web/src/lib/api.ts`
-Add client methods for:
-- reading current bot mode
-- setting bot mode
-- reading dashboard sentinel status
+2. Ensure one authoritative lifecycle model exists:
+   - idle
+   - queued
+   - processing
+   - applied
+   - failed
+   - blocked/precondition_failed if appropriate
 
-#### 2) Update `apps/web/src/hooks/useBotState.ts`
-Expose:
-- `operatingMode`
-- `setOperatingMode(...)`
-- `sentinelStatus`
-- mode-switch loading/error state
+3. Remove any remaining ambiguity between:
+   - accepted
+   - queued
+   - actually applied
 
-#### 3) Update `apps/web/src/components/panels/ControlPanel.tsx`
-Add a visible switch or segmented control with exactly two options:
-- `Sentinel Simulation`
-- `Real Trading`
+4. Keep duplicate-prevention, disable-in-flight, and latest-result visibility coherent across refresh/reopen.
 
-Add a persistent sentinel status card/message showing:
-- `Simulated trades taken: X / 20`
-- `Trades learned from: Y / 20`
-- `Readiness score: Z / 0.75`
-- `Recommended: Yes / No`
-- `Message: ...`
-
-When not ready, display a warning style.
-When ready, display a recommendation style.
-
-### Required message behavior
-
-If not ready:
-`Sentinel is still learning. Simulated trades: X/20. Learned trades: Y/20. Readiness score: Z/0.75. Do not enable live trading yet.`
-
-If ready:
-`Sentinel thresholds are satisfied. Simulated trades: X/20. Learned trades: Y/20. Readiness score: Z/0.75. It is safe to consider enabling live trading.`
+5. Ensure the operator can always answer:
+   - what command was last attempted
+   - what happened
+   - what state the runtime is actually in now
 
 ### Acceptance
-- user can flip the mode from dashboard
-- UI updates from backend truth
-- the user always sees counts, threshold, and recommendation
+- command lifecycle is coherent and consistent across UI/API/worker
+- no remaining misleading command states in core controls
 
 ---
 
-## Phase G — strict tests
+## Phase 4 — Dashboard/runtime contract alignment
 
 ### Goal
-Prove sentinel mode is safe, separate, and informative.
+Finish the last contract gaps so the dashboard can be trusted as the operational source of truth.
 
-### Files to add
-- `apps/worker/src/tests/sentinel-simulation.integration.test.ts`
-- `apps/worker/src/tests/sentinel-readiness.integration.test.ts`
-- `apps/api/src/modules/bot-control/bot-control.sentinel.integration.test.ts`
+### Primary files to inspect and modify
+- `packages/ui-contracts/src/control.ts`
+- `packages/ui-contracts/src/dashboard.ts`
+- `apps/api/src/modules/ui/dto/dashboard-response.dto.ts`
+- `apps/api/src/modules/ui/ui.service.ts`
+- `apps/web/src/hooks/useBotState.ts`
+- `apps/web/src/components/panels/ControlPanel.tsx`
+- `apps/web/src/components/panels/DiagnosticsPanel.tsx`
+- any related read-model DTO or adapter surface
 
-### Required test cases
+### Required changes
+1. Ensure the dashboard has explicit fields for:
+   - pre-start eligibility
+   - pre-start blocking reason
+   - latest command result by type
+   - halt reliability/final result state
+   - stale/offline/current truth state
+   - any runtime transition state needed for operators to understand what is happening
 
-#### Worker tests
-1. sentinel mode simulates a trade without live submit
-2. sentinel writes baseline knowledge before first trade
-3. after 20 simulated trades and 20 learned trades with passing metrics, readiness recommends live
-4. if edge gap is too large or anomaly count is non-zero, readiness does not recommend live
-5. simulated trade counters and learned counters remain accurate
+2. Remove any remaining places where the dashboard must infer critical operator truth from weak local assumptions.
 
-#### API tests
-6. mode switch persists through bot-control endpoints
-7. dashboard response contains sentinel status and recommendation fields
-
-#### UI tests if repo conventions allow
-8. ControlPanel renders current mode and progress message
-9. toggle action calls backend mode endpoint
+3. Ensure refresh/reopen preserves truthful backend-driven control status.
 
 ### Acceptance
-- simulation/live separation is proven by tests
-- recommendation threshold logic is proven by tests
-- dashboard/API mode switch is proven by tests
+- dashboard contract is sufficient for truthful operation
+- control panel no longer depends on unsafe inference
+
+---
+
+## Phase 5 — Full end-to-end re-test and closure report
+
+### Goal
+Prove the fixes actually close the remaining High/Critical issues.
+
+### Required re-test list
+Re-test at minimum:
+
+1. Start when runtime prerequisites are not satisfied
+2. Start when runtime prerequisites are satisfied, if feasible in the environment
+3. Emergency Halt during bootstrapping
+4. Emergency Halt when runtime is already stopping/stopped
+5. Refresh/reopen after command submission
+6. Mode switching persistence
+7. API outage + recovery behavior
+8. dashboard truth vs backend truth after the runtime fixes
+
+### Required final report status labels
+For each previously open issue, report:
+- fixed
+- partially fixed
+- still broken
+- blocked by environment
+
+### Required final report sections
+1. concise remediation summary
+2. files added
+3. files changed
+4. exact root cause of startup truth mismatch
+5. exact root cause of halt race
+6. startup commands run
+7. endpoints exercised
+8. re-test results by issue
+9. remaining broken flows
+10. any still-open Medium/Low issues
+11. highest-priority remaining attention list
+12. assumptions
+13. blockers
+
+---
+
+## Severity model
+
+Use this model consistently for anything still open:
+
+- **Critical** — unsafe control-plane behavior, false state, live/sentinel confusion, impossible to trust
+- **High** — core control flow broken, command lifecycle misleading, runtime transition unreliable
+- **Medium** — partial functionality, degraded UX, missing operator clarity
+- **Low** — minor nuisance or low-risk clarity issue
 
 ---
 
 ## Final acceptance criteria
 
-This work is complete only when all are true:
+This pass is complete only when all are true:
 
-1. Sentinel Simulation and Real Trading are explicit backend-controlled modes.
-2. Sentinel mode reuses the decision pipeline but does not place real orders.
-3. A baseline knowledge file is created and persisted.
-4. The system can simulate and learn from 20 trades.
-5. Readiness and recommendation are computed backend-side from persisted state.
-6. The dashboard shows counts, threshold, readiness score, and recommendation text.
-7. The user can switch modes from the dashboard.
-8. The recommendation to go live is advisory only.
-9. Tests prove that sentinel mode cannot accidentally execute live orders.
+1. Start cannot be queued deceptively when failure is already knowable
+2. Emergency Halt no longer fails due to the stopped/halt race
+3. command lifecycle is consistent and truthful across UI/API/worker
+4. no remaining Critical issues exist in the dashboard/control-plane surface
+5. no remaining High issues exist in:
+   - Start
+   - Stop
+   - Halt
+   - mode switching
+   - backend truth rendering
+6. the dashboard re-test supports a practical 10/10 trust rating for the operator surface
 
 ---
 
 ## Strict scope boundary
 
-Do not add in this implementation:
-- automatic flipping from sentinel to live
-- dynamic threshold tuning before the first version works
-- new strategy families
-- broad autonomous strategy rewriting
-- live capital scaling changes unrelated to sentinel mode
+Do not add in this pass:
+- new trading strategy logic
+- unrelated optimization work
+- speculative architectural redesign
+- convenience threshold tuning
+- UI redesign unrelated to control-plane truth and runtime reliability
 
-The target is a **strict first Sentinel build** that safely learns from 20 simulated trades and tells the user when it is reasonable to consider turning on live trading.
+The target is a **strict final runtime/control-plane remediation pass** that closes the remaining defects completely and makes the dashboard genuinely dependable.

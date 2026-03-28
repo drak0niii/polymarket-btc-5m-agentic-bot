@@ -18,9 +18,10 @@ export class SentinelReadinessService {
   async recompute(
     operatingMode: TradingOperatingMode = 'sentinel_simulation',
   ): Promise<SentinelReadinessStatus> {
-    await this.sentinelStateStore.ensureBaselineKnowledge(operatingMode);
-    const [trades, learnedTradeCount] = await Promise.all([
+    const baseline = await this.sentinelStateStore.ensureBaselineKnowledge(operatingMode);
+    const [trades, updates, learnedTradeCount] = await Promise.all([
       this.sentinelStateStore.loadAllSimulatedTrades(),
+      this.sentinelStateStore.loadAllLearningUpdates(),
       this.sentinelStateStore.countLearnedTrades(),
     ]);
 
@@ -46,6 +47,12 @@ export class SentinelReadinessService {
       (sum, trade) => sum + Math.max(0, trade.unresolvedAnomalyCount),
       0,
     );
+    const lastLearningAt =
+      updates.length === 0
+        ? null
+        : updates
+            .map((update) => update.learnedAt)
+            .sort((left, right) => new Date(right).getTime() - new Date(left).getTime())[0] ?? null;
 
     const readinessScore = roundTo(
       [
@@ -79,6 +86,7 @@ export class SentinelReadinessService {
     const status: SentinelReadinessStatus = {
       updatedAt: new Date().toISOString(),
       operatingMode,
+      mode: operatingMode,
       recommendationState,
       recommendationMessage:
         recommendationState === 'ready_to_consider_live'
@@ -91,12 +99,15 @@ export class SentinelReadinessService {
       readinessScore,
       readinessThreshold: READINESS_THRESHOLD,
       simulatedNetEdgeAfterCostsBps: roundTo(simulatedNetEdgeAfterCostsBps, 4),
+      netEdgeAfterCostsBps: roundTo(simulatedNetEdgeAfterCostsBps, 4),
       expectedVsRealizedEdgeGapBps: roundTo(expectedVsRealizedEdgeGapBps, 4),
       fillQualityPassRate: roundTo(fillQualityPassRate, 4),
       noTradeDisciplinePassRate: roundTo(noTradeDisciplinePassRate, 4),
       learningCoverage: roundTo(learningCoverage, 4),
       unresolvedAnomalyCount,
       recommendedLiveEnable: recommendationState === 'ready_to_consider_live',
+      lastLearningAt,
+      baselineKnowledgeVersion: baseline.baselineId,
     };
 
     await this.sentinelStateStore.writeReadiness(status);

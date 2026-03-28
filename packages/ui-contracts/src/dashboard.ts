@@ -1,10 +1,29 @@
 import type {
+  BotControlStateContract,
   SentinelStatusContract,
   TradingOperatingMode,
 } from './control';
 
+export interface PortfolioSnapshotContract {
+  id: string;
+  bankroll: number;
+  availableCapital: number;
+  openExposure: number;
+  realizedPnlDay: number;
+  unrealizedPnl: number;
+  consecutiveLosses: number;
+  capturedAt: string;
+  createdAt: string;
+}
+
+export interface PortfolioStateContract {
+  status: 'ready' | 'missing';
+  message: string | null;
+  snapshot: PortfolioSnapshotContract | null;
+}
+
 export interface DashboardContract {
-  botState: unknown;
+  botState: BotControlStateContract;
   readinessDashboard: unknown;
   operatingMode: TradingOperatingMode;
   sentinelStatus: SentinelStatusContract | null;
@@ -18,7 +37,7 @@ export interface DashboardContract {
   markets: unknown[];
   signals: unknown[];
   orders: unknown[];
-  portfolio: unknown | null;
+  portfolio: PortfolioStateContract;
   diagnostics: {
     execution: unknown[];
     evDrift: unknown[];

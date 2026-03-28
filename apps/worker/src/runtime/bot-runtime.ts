@@ -19,8 +19,10 @@ import { MarketWebSocketStateService } from '@polymarket-btc-5m-agentic-bot/mark
 import { UserWebSocketStateService } from './user-websocket-state.service';
 import { DailyReviewJob } from '@worker/jobs/dailyReview.job';
 import { LearningStateStore } from './learning-state-store';
+import { type TradingOperatingMode } from '@polymarket-btc-5m-agentic-bot/domain';
 
 const LEARNING_CYCLE_POLL_INTERVAL_MS = 60 * 60 * 1000;
+const PRE_START_ELIGIBILITY_REFRESH_INTERVAL_MS = 30 * 1000;
 
 export class BotRuntime {
   private readonly logger = new AppLogger('BotRuntime');
@@ -149,6 +151,9 @@ export class BotRuntime {
   private controlHandle: NodeJS.Timeout | null = null;
   private learningCycleHandle: NodeJS.Timeout | null = null;
   private processingCommand = false;
+  private preStartEligibilityRefreshInFlight = false;
+  private lastPreStartEligibilityRefreshAt = 0;
+  private lastPreStartEligibilityMode: TradingOperatingMode | null = null;
 
   async start(): Promise<void> {
     this.logger.log('Initializing bot runtime.', {
@@ -166,7 +171,7 @@ export class BotRuntime {
 
     if (persistedState.state === 'running') {
       try {
-        await this.startStopManager.assertReadiness();
+        await this.startStopManager.assertReadiness(this.stateStore.getOperatingMode());
         this.startStopManager.enterRunning('resumed after startup gate');
         await this.liveLoop.start();
       } catch (error) {
@@ -183,6 +188,7 @@ export class BotRuntime {
     this.startHeartbeat();
     this.startControlPlanePolling();
     this.startLearningCyclePolling();
+    await this.refreshPreStartEligibility(true);
   }
 
   async stop(): Promise<void> {
@@ -220,7 +226,7 @@ export class BotRuntime {
   }
 
   async requestStart(reason = 'manual start requested'): Promise<void> {
-    await this.startStopManager.start(reason);
+    await this.startStopManager.start(reason, this.stateStore.getOperatingMode());
     this.startStopManager.enterRunning(reason);
     try {
       await this.liveLoop.start();
@@ -321,8 +327,13 @@ export class BotRuntime {
     }
 
     this.controlHandle = setInterval(() => {
-      void this.processNextCommand();
+      void this.tickControlPlane();
     }, 1_000);
+  }
+
+  private async tickControlPlane(): Promise<void> {
+    await this.processNextCommand();
+    await this.refreshPreStartEligibility();
   }
 
   private startLearningCyclePolling(): void {
@@ -452,6 +463,43 @@ export class BotRuntime {
       }
     } finally {
       this.processingCommand = false;
+    }
+  }
+
+  private async refreshPreStartEligibility(force = false): Promise<void> {
+    if (this.preStartEligibilityRefreshInFlight) {
+      return;
+    }
+
+    const runtimeState = this.stateStore.getState();
+    if (runtimeState !== 'stopped' && runtimeState !== 'halted_hard') {
+      return;
+    }
+
+    const operatingMode = this.stateStore.getOperatingMode();
+    const shouldRefresh =
+      force ||
+      this.lastPreStartEligibilityMode !== operatingMode ||
+      Date.now() - this.lastPreStartEligibilityRefreshAt >=
+        PRE_START_ELIGIBILITY_REFRESH_INTERVAL_MS;
+
+    if (!shouldRefresh) {
+      return;
+    }
+
+    this.preStartEligibilityRefreshInFlight = true;
+    try {
+      await this.startupGateService.evaluate(
+        operatingMode === 'sentinel_simulation'
+          ? 'sentinel'
+          : appEnv.IS_TEST
+            ? 'test'
+            : 'live',
+      );
+      this.lastPreStartEligibilityRefreshAt = Date.now();
+      this.lastPreStartEligibilityMode = operatingMode;
+    } finally {
+      this.preStartEligibilityRefreshInFlight = false;
     }
   }
 

@@ -1,33 +1,30 @@
 import { useBotState } from '../../hooks/useBotState';
-import { apiClient } from '../../lib/api';
-
 export function StopBotButton() {
-  const { botState, refresh } = useBotState();
+  const { botState, canSubmitControls, commandStates, stopBot } = useBotState();
 
   const disabled =
-    botState.state !== 'running' &&
-    botState.state !== 'bootstrapping' &&
-    botState.state !== 'degraded' &&
-    botState.state !== 'reconciliation_only' &&
-    botState.state !== 'cancel_only';
-
-  const handleClick = async () => {
-    if (disabled) {
-      return;
-    }
-
-    await apiClient.stopBot({
-      reason: 'stop requested from web dashboard',
-      requestedBy: 'web',
-      cancelOpenOrders: true,
-    });
-
-    await refresh();
-  };
+    !canSubmitControls ||
+    !botState ||
+    (botState.state !== 'running' &&
+      botState.state !== 'bootstrapping' &&
+      botState.state !== 'degraded' &&
+      botState.state !== 'reconciliation_only' &&
+      botState.state !== 'cancel_only') ||
+    commandStates.stop.status === 'submitting' ||
+    commandStates.stop.status === 'queued' ||
+    commandStates.stop.status === 'processing';
+  const label =
+    commandStates.stop.status === 'submitting'
+      ? 'Stopping...'
+      : commandStates.stop.status === 'queued'
+        ? 'Stop Queued'
+        : commandStates.stop.status === 'processing'
+          ? 'Stopping'
+          : 'Stop';
 
   return (
-    <button className="action-button" onClick={handleClick} disabled={disabled}>
-      Stop
+    <button className="action-button" onClick={() => void stopBot()} disabled={disabled}>
+      {label}
     </button>
   );
 }

@@ -8,9 +8,29 @@ export interface SentinelBaselineKnowledge {
   baselineId: string;
   createdAt: string;
   operatingMode: TradingOperatingMode;
+  strategyVariantId?: string | null;
+  strategyVersion?: string | null;
+  regimeModelVersion?: string | null;
+  initialNetEdgeAssumptions?: {
+    expectedNetEdgeBps: number;
+  };
+  initialCostAssumptions?: {
+    expectedFeeBps: number;
+    expectedSlippageBps: number;
+  };
+  initialTrustScore?: number;
   targetSimulatedTrades: number;
   targetLearnedTrades: number;
   readinessThreshold: number;
+  safeToGoLiveThresholds?: {
+    targetSimulatedTrades: number;
+    targetLearnedTrades: number;
+    readinessThreshold: number;
+    maxExpectedVsRealizedEdgeGapBps: number;
+    minFillQualityPassRate: number;
+    minNoTradeDisciplinePassRate: number;
+    maxUnresolvedAnomalyCount: number;
+  };
   boundedLearningSurfaces: string[];
   sourceOfTruth: {
     simulatedTradesPath: string;
@@ -23,12 +43,25 @@ export interface SentinelBaselineKnowledge {
 export interface SentinelSimulatedTradeRecord {
   simulationTradeId: string;
   signalId: string;
+  decisionId?: string;
   marketId: string;
   tokenId: string;
   strategyVersionId: string | null;
   strategyVariantId: string | null;
   regime: string | null;
   simulatedAt: string;
+  intendedPrice?: number;
+  simulatedFillPrice?: number;
+  simulatedFee?: number;
+  simulatedSlippageBps?: number;
+  expectedNetEdgeBps?: number;
+  realizedNetEdgeBps?: number;
+  fillProbabilityUsed?: number;
+  orderbookSnapshotRef?: string | null;
+  createdAt?: string;
+  finalizedAt?: string;
+  learned?: boolean;
+  learningOutcomeRef?: string | null;
   side: 'BUY' | 'SELL';
   operatingMode: TradingOperatingMode;
   expectedFillProbability: number;
@@ -70,6 +103,7 @@ export interface SentinelLearningUpdate {
 export interface SentinelReadinessStatus {
   updatedAt: string;
   operatingMode: TradingOperatingMode;
+  mode?: TradingOperatingMode;
   recommendationState: SentinelRecommendationState;
   recommendationMessage: string;
   simulatedTradesCompleted: number;
@@ -79,10 +113,13 @@ export interface SentinelReadinessStatus {
   readinessScore: number;
   readinessThreshold: number;
   simulatedNetEdgeAfterCostsBps: number;
+  netEdgeAfterCostsBps?: number;
   expectedVsRealizedEdgeGapBps: number;
   fillQualityPassRate: number;
   noTradeDisciplinePassRate: number;
   learningCoverage: number;
   unresolvedAnomalyCount: number;
   recommendedLiveEnable: boolean;
+  lastLearningAt?: string | null;
+  baselineKnowledgeVersion?: string;
 }

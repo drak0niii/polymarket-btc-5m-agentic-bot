@@ -3,6 +3,7 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { appEnv } from './config/env';
 import { AppLogger } from './common/logger';
+import { AppExceptionFilter } from './common/app-exception.filter';
 
 async function bootstrap(): Promise<void> {
   const bootstrapLogger = new AppLogger('Bootstrap');
@@ -34,6 +35,7 @@ async function bootstrap(): Promise<void> {
         stopAtFirstError: false,
       }),
     );
+    app.useGlobalFilters(new AppExceptionFilter());
 
     app.enableCors({
       origin: true,

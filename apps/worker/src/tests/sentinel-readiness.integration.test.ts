@@ -27,6 +27,9 @@ async function testSentinelReadinessRecommendsLiveAfterTwentyPassingTrades(): Pr
 
   assert.strictEqual(status.recommendedLiveEnable, true);
   assert.strictEqual(status.recommendationState, 'ready_to_consider_live');
+  assert.strictEqual(status.mode, 'sentinel_simulation');
+  assert.strictEqual(status.baselineKnowledgeVersion, 'sentinel-baseline-v1');
+  assert.strictEqual(typeof status.lastLearningAt, 'string');
   assert.strictEqual(
     status.recommendationMessage.includes('It is safe to consider enabling live trading.'),
     true,

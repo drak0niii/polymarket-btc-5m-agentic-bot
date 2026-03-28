@@ -1,4 +1,5 @@
 import { AppLogger } from '@worker/common/logger';
+import { type TradingOperatingMode } from '@polymarket-btc-5m-agentic-bot/domain';
 import { BotStateStore } from './bot-state';
 import { StartupGateService } from './startup-gate.service';
 
@@ -8,13 +9,16 @@ export class StartStopManager {
   constructor(
     private readonly stateStore: BotStateStore,
     private readonly startupGateService?:
-      | Pick<StartupGateService, 'assertLiveStartupAllowed'>
+      | Pick<StartupGateService, 'assertLiveStartupAllowed' | 'assertStartupAllowedForMode'>
       | {
           preflightVenue?: () => Promise<{ ready: boolean; reasonCode?: string | null }>;
         },
   ) {}
 
-  async start(reason: string): Promise<void> {
+  async start(
+    reason: string,
+    operatingMode: TradingOperatingMode = 'live_trading',
+  ): Promise<void> {
     const current = this.stateStore.getState();
     if (current !== 'stopped' && current !== 'halted_hard') {
       throw new Error(
@@ -28,7 +32,7 @@ export class StartStopManager {
     });
 
     try {
-      await this.assertReadiness();
+      await this.assertReadiness(operatingMode);
     } catch (error) {
       this.stateStore.setState('stopped', 'startup readiness failed');
       throw error;
@@ -90,12 +94,22 @@ export class StartStopManager {
     });
   }
 
-  async assertReadiness(): Promise<void> {
+  async assertReadiness(
+    operatingMode: TradingOperatingMode = 'live_trading',
+  ): Promise<void> {
     if (!this.startupGateService) {
       return;
     }
 
     try {
+      if (
+        'assertStartupAllowedForMode' in this.startupGateService &&
+        typeof this.startupGateService.assertStartupAllowedForMode === 'function'
+      ) {
+        await this.startupGateService.assertStartupAllowedForMode(operatingMode);
+        return;
+      }
+
       if ('assertLiveStartupAllowed' in this.startupGateService) {
         await this.startupGateService.assertLiveStartupAllowed();
         return;

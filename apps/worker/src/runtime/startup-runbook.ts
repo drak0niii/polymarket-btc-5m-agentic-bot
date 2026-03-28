@@ -1,6 +1,7 @@
 import { AppLogger } from '@worker/common/logger';
 import path from 'path';
 import { appEnv, type AppEnv } from '@worker/config/env';
+import { type TradingOperatingMode } from '@polymarket-btc-5m-agentic-bot/domain';
 import { SignerHealth } from '@polymarket-btc-5m-agentic-bot/signing-engine';
 import { OfficialPolymarketTradingClient } from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
 import { LiveTrustScore } from '@polymarket-btc-5m-agentic-bot/risk-engine';
@@ -250,12 +251,15 @@ export class StartupRunbook {
     private readonly deploymentRegistry = new StrategyDeploymentRegistry(),
   ) {}
 
-  async run(): Promise<StartupRunbookResult> {
+  async run(
+    operatingMode: TradingOperatingMode = 'live_trading',
+  ): Promise<StartupRunbookResult> {
     const executedAt = new Date().toISOString();
     const cycleKey = `startup-runbook:${Date.now()}`;
     const steps: StartupRunbookStepResult[] = [];
     let smoke: PolymarketSmokeResult | null = null;
     let externalSnapshot: ExternalPortfolioSnapshot | null = null;
+    const sentinelSimulation = operatingMode === 'sentinel_simulation';
 
     const preflight = await this.tradingClient.preflightVenue();
     steps.push({
@@ -365,12 +369,12 @@ export class StartupRunbook {
     if (!startupTokenId) {
       steps.push({
         step: 'orderbook_data_channel_live',
-        ok: false,
+        ok: sentinelSimulation,
         checkedAt: new Date().toISOString(),
-        reasonCode: 'startup_token_id_missing',
-        evidence: {},
+        reasonCode: sentinelSimulation ? 'not_required_for_sentinel' : 'startup_token_id_missing',
+        evidence: sentinelSimulation ? { operatingMode } : {},
       });
-      if (appEnv.BOT_STARTUP_RUNBOOK_FAIL_FAST) {
+      if (!sentinelSimulation && appEnv.BOT_STARTUP_RUNBOOK_FAIL_FAST) {
         return this.finalize(cycleKey, executedAt, steps, smoke, externalSnapshot);
       }
     } else {
@@ -446,90 +450,113 @@ export class StartupRunbook {
       }
     }
 
-    const latestSmokeCheckpoint = await this.runtimeControl.getLatestCheckpoint(
-      'authenticated_venue_smoke_suite',
-    );
-    const recentSmokePassed =
-      latestSmokeCheckpoint?.status === 'completed' &&
-      Date.now() - latestSmokeCheckpoint.processedAt.getTime() <= appEnv.BOT_MAX_VENUE_SMOKE_AGE_MS;
+    let recentSmokePassAt: string | null = null;
+    if (sentinelSimulation) {
+      for (const step of [
+        'recent_smoke_test_timestamp',
+        'authenticated_venue_smoke_gate',
+        'heartbeat_path_tested',
+        'cancel_path_tested',
+      ] as const) {
+        steps.push({
+          step,
+          ok: true,
+          checkedAt: new Date().toISOString(),
+          reasonCode: 'not_required_for_sentinel',
+          evidence: {
+            operatingMode,
+          },
+        });
+      }
+    } else {
+      const latestSmokeCheckpoint = await this.runtimeControl.getLatestCheckpoint(
+        'authenticated_venue_smoke_suite',
+      );
+      const recentSmokePassed =
+        latestSmokeCheckpoint?.status === 'completed' &&
+        Date.now() - latestSmokeCheckpoint.processedAt.getTime() <=
+          appEnv.BOT_MAX_VENUE_SMOKE_AGE_MS;
 
-    if (appEnv.BOT_RUN_VENUE_SMOKE_ON_STARTUP) {
-      smoke = await this.smokeRunner(process.env, this.tradingClient);
-      await this.runtimeControl.recordReconciliationCheckpoint({
-        cycleKey: `smoke-gate:${Date.now()}`,
-        source: 'authenticated_venue_smoke_suite',
-        status: smoke.success ? 'completed' : 'failed',
-        details: {
-          executedAt: smoke.executedAt,
-          freshnessTtlMs: smoke.freshnessTtlMs,
-          steps: smoke.steps,
-          orderId: smoke.orderId,
+      if (appEnv.BOT_RUN_VENUE_SMOKE_ON_STARTUP) {
+        smoke = await this.smokeRunner(process.env, this.tradingClient);
+        await this.runtimeControl.recordReconciliationCheckpoint({
+          cycleKey: `smoke-gate:${Date.now()}`,
+          source: 'authenticated_venue_smoke_suite',
+          status: smoke.success ? 'completed' : 'failed',
+          details: {
+            executedAt: smoke.executedAt,
+            freshnessTtlMs: smoke.freshnessTtlMs,
+            steps: smoke.steps,
+            orderId: smoke.orderId,
+          },
+        });
+      }
+
+      const effectiveSmokeSuccess = smoke?.success ?? recentSmokePassed;
+      recentSmokePassAt = smoke?.success
+        ? smoke.executedAt
+        : recentSmokePassed
+          ? latestSmokeCheckpoint?.processedAt?.toISOString() ?? null
+          : null;
+      steps.push({
+        step: 'recent_smoke_test_timestamp',
+        ok:
+          recentSmokePassAt != null ||
+          !isLiveExecutableDeploymentTier(appEnv.BOT_DEPLOYMENT_TIER),
+        checkedAt: new Date().toISOString(),
+        reasonCode:
+          recentSmokePassAt != null
+            ? 'passed'
+            : isLiveExecutableDeploymentTier(appEnv.BOT_DEPLOYMENT_TIER)
+              ? 'recent_smoke_test_missing'
+              : 'not_required_for_tier',
+        evidence: {
+          tier: appEnv.BOT_DEPLOYMENT_TIER,
+          recentSmokePassAt,
+          maxAllowedAgeMs: appEnv.BOT_MAX_VENUE_SMOKE_AGE_MS,
+          checkpointAt: latestSmokeCheckpoint?.processedAt?.toISOString() ?? null,
+          checkpointStatus: latestSmokeCheckpoint?.status ?? null,
+        },
+      });
+      steps.push({
+        step: 'authenticated_venue_smoke_gate',
+        ok: effectiveSmokeSuccess,
+        checkedAt: new Date().toISOString(),
+        reasonCode: effectiveSmokeSuccess ? 'passed' : 'recent_smoke_gate_missing',
+        evidence: smoke
+          ? {
+              executedAt: smoke.executedAt,
+              success: smoke.success,
+            }
+          : {
+              checkpointAt: latestSmokeCheckpoint?.processedAt?.toISOString() ?? null,
+              checkpointStatus: latestSmokeCheckpoint?.status ?? null,
+            },
+      });
+
+      const heartbeatStep = smoke?.steps.find((step) => step.step === 'heartbeat');
+      const cancelStep = smoke?.steps.find((step) => step.step === 'cancel');
+      steps.push({
+        step: 'heartbeat_path_tested',
+        ok: heartbeatStep?.ok ?? recentSmokePassed,
+        checkedAt: new Date().toISOString(),
+        reasonCode:
+          heartbeatStep?.reasonCode ?? (recentSmokePassed ? 'passed' : 'smoke_not_recent'),
+        evidence: heartbeatStep?.evidence ?? {
+          smokeCheckpointAt: latestSmokeCheckpoint?.processedAt?.toISOString() ?? null,
+        },
+      });
+      steps.push({
+        step: 'cancel_path_tested',
+        ok: cancelStep?.ok ?? recentSmokePassed,
+        checkedAt: new Date().toISOString(),
+        reasonCode:
+          cancelStep?.reasonCode ?? (recentSmokePassed ? 'passed' : 'smoke_not_recent'),
+        evidence: cancelStep?.evidence ?? {
+          smokeCheckpointAt: latestSmokeCheckpoint?.processedAt?.toISOString() ?? null,
         },
       });
     }
-
-    const effectiveSmokeSuccess = smoke?.success ?? recentSmokePassed;
-    const recentSmokePassAt = smoke?.success
-      ? smoke.executedAt
-      : recentSmokePassed
-        ? latestSmokeCheckpoint?.processedAt?.toISOString() ?? null
-        : null;
-    steps.push({
-      step: 'recent_smoke_test_timestamp',
-      ok:
-        recentSmokePassAt != null ||
-        !isLiveExecutableDeploymentTier(appEnv.BOT_DEPLOYMENT_TIER),
-      checkedAt: new Date().toISOString(),
-      reasonCode:
-        recentSmokePassAt != null
-          ? 'passed'
-          : isLiveExecutableDeploymentTier(appEnv.BOT_DEPLOYMENT_TIER)
-            ? 'recent_smoke_test_missing'
-            : 'not_required_for_tier',
-      evidence: {
-        tier: appEnv.BOT_DEPLOYMENT_TIER,
-        recentSmokePassAt,
-        maxAllowedAgeMs: appEnv.BOT_MAX_VENUE_SMOKE_AGE_MS,
-        checkpointAt: latestSmokeCheckpoint?.processedAt?.toISOString() ?? null,
-        checkpointStatus: latestSmokeCheckpoint?.status ?? null,
-      },
-    });
-    steps.push({
-      step: 'authenticated_venue_smoke_gate',
-      ok: effectiveSmokeSuccess,
-      checkedAt: new Date().toISOString(),
-      reasonCode: effectiveSmokeSuccess ? 'passed' : 'recent_smoke_gate_missing',
-      evidence: smoke
-        ? {
-            executedAt: smoke.executedAt,
-            success: smoke.success,
-          }
-        : {
-            checkpointAt: latestSmokeCheckpoint?.processedAt?.toISOString() ?? null,
-            checkpointStatus: latestSmokeCheckpoint?.status ?? null,
-          },
-    });
-
-    const heartbeatStep = smoke?.steps.find((step) => step.step === 'heartbeat');
-    const cancelStep = smoke?.steps.find((step) => step.step === 'cancel');
-    steps.push({
-      step: 'heartbeat_path_tested',
-      ok: heartbeatStep?.ok ?? recentSmokePassed,
-      checkedAt: new Date().toISOString(),
-      reasonCode: heartbeatStep?.reasonCode ?? (recentSmokePassed ? 'passed' : 'smoke_not_recent'),
-      evidence: heartbeatStep?.evidence ?? {
-        smokeCheckpointAt: latestSmokeCheckpoint?.processedAt?.toISOString() ?? null,
-      },
-    });
-    steps.push({
-      step: 'cancel_path_tested',
-      ok: cancelStep?.ok ?? recentSmokePassed,
-      checkedAt: new Date().toISOString(),
-      reasonCode: cancelStep?.reasonCode ?? (recentSmokePassed ? 'passed' : 'smoke_not_recent'),
-      evidence: cancelStep?.evidence ?? {
-        smokeCheckpointAt: latestSmokeCheckpoint?.processedAt?.toISOString() ?? null,
-      },
-    });
 
     const latestReadinessCheckpoint = await this.runtimeControl.getLatestCheckpoint(
       'production_readiness_suite',
@@ -635,6 +662,10 @@ export class StartupRunbook {
     });
 
     return this.finalize(cycleKey, executedAt, steps, smoke, externalSnapshot);
+  }
+
+  async runSentinelSimulation(): Promise<StartupRunbookResult> {
+    return this.run('sentinel_simulation');
   }
 
   private async finalize(

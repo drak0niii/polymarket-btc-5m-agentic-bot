@@ -13,7 +13,11 @@ export class DashboardResponseDto {
   markets!: unknown[];
   signals!: unknown[];
   orders!: unknown[];
-  portfolio!: unknown | null;
+  portfolio!: {
+    status: 'ready' | 'missing';
+    message: string | null;
+    snapshot: unknown | null;
+  };
   diagnostics!: {
     execution: unknown[];
     evDrift: unknown[];

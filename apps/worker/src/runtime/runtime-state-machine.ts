@@ -38,7 +38,7 @@ export interface RuntimeSubsystemPermissions {
 }
 
 const LEGAL_TRANSITIONS: Record<BotRuntimeState, BotRuntimeState[]> = {
-  stopped: ['bootstrapping'],
+  stopped: ['bootstrapping', 'halted_hard'],
   bootstrapping: [
     'running',
     'degraded',

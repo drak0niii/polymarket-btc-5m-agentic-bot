@@ -1,5 +1,6 @@
 import { AppLogger } from '@worker/common/logger';
 import { appEnv } from '@worker/config/env';
+import { type TradingOperatingMode } from '@polymarket-btc-5m-agentic-bot/domain';
 import { SignerHealth } from '@polymarket-btc-5m-agentic-bot/signing-engine';
 import {
   StartupRunbook,
@@ -27,12 +28,14 @@ export interface StartupGateCheckResult {
 export interface StartupGateVerdict {
   passed: boolean;
   timestamp: string;
-  mode: 'live' | 'test';
+  mode: StartupGateMode;
   checks: StartupGateCheckResult[];
   blockingReasons: string[];
   warningReasons: string[];
   evidence: Record<string, unknown>;
 }
+
+type StartupGateMode = 'live' | 'test' | 'sentinel';
 
 export class StartupGateService {
   private readonly logger = new AppLogger('StartupGateService');
@@ -46,7 +49,7 @@ export class StartupGateService {
     private readonly userStreamService?: UserWebSocketStateService,
   ) {}
 
-  async evaluate(mode: 'live' | 'test' = 'live'): Promise<StartupGateVerdict> {
+  async evaluate(mode: StartupGateMode = 'live'): Promise<StartupGateVerdict> {
     const timestamp = new Date().toISOString();
     const checks: StartupGateCheckResult[] = [];
 
@@ -86,7 +89,10 @@ export class StartupGateService {
       },
     });
 
-    const runbook = await this.startupRunbook.run();
+    const runbook =
+      mode === 'sentinel'
+        ? await this.startupRunbook.runSentinelSimulation()
+        : await this.startupRunbook.run();
     checks.push(this.asCheck('startup_runbook', runbook.passed, runbook.reasonCode, runbook));
     const liveTierHardGateRequired =
       mode === 'live' &&
@@ -194,7 +200,19 @@ export class StartupGateService {
   }
 
   async assertLiveStartupAllowed(): Promise<StartupGateVerdict> {
-    const verdict = await this.evaluate(appEnv.IS_TEST ? 'test' : 'live');
+    return this.assertStartupAllowedForMode('live_trading');
+  }
+
+  async assertStartupAllowedForMode(
+    operatingMode: TradingOperatingMode,
+  ): Promise<StartupGateVerdict> {
+    const verdict = await this.evaluate(
+      operatingMode === 'sentinel_simulation'
+        ? 'sentinel'
+        : appEnv.IS_TEST
+          ? 'test'
+          : 'live',
+    );
     if (!verdict.passed) {
       throw new Error(
         `startup_gate_failed:${verdict.blockingReasons.join('|') || 'unknown'}`,

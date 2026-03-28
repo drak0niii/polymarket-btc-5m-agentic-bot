@@ -32,6 +32,8 @@ export interface BotControlStateContract {
     | 'stopped';
   operatingMode: TradingOperatingMode;
   sentinelEnabled: boolean;
+  eligibleForLiveTrading: boolean;
+  warningText: string | null;
   recommendedLiveEnable: boolean;
   sentinelStatus: SentinelStatusContract | null;
   liveConfig: {
@@ -50,12 +52,43 @@ export interface BotControlStateContract {
   readiness: {
     ready: boolean;
     checks: {
-      startupRunbook: boolean;
-      authenticatedVenueSmoke: boolean;
-      recovery: boolean;
-      secrets: boolean;
+      env: boolean;
+      signing: boolean;
+      credentials: boolean;
+      liveMode: boolean;
+      riskConfig: boolean;
+    };
+    blockingReasons: string[];
+  };
+  controlPlane: {
+    source: string;
+    pendingCommands: Array<{
+      id: string;
+      command: 'start' | 'stop' | 'halt';
+      cancelOpenOrders: boolean;
+      createdAt: string;
+    }>;
+    activeCommands: RuntimeCommandContract[];
+    recentCommands: RuntimeCommandContract[];
+    latestCommandByType: {
+      start: RuntimeCommandContract | null;
+      stop: RuntimeCommandContract | null;
+      halt: RuntimeCommandContract | null;
     };
   };
+}
+
+export interface RuntimeCommandContract {
+  id: string;
+  command: 'start' | 'stop' | 'halt';
+  reason: string;
+  requestedBy: string | null;
+  cancelOpenOrders: boolean;
+  status: 'pending' | 'processing' | 'applied' | 'failed';
+  failureMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+  processedAt: string | null;
 }
 
 export interface SetOperatingModeRequestContract {

@@ -1,14 +1,27 @@
 import { usePortfolio } from '../../hooks/usePortfolio';
 
 export function PortfolioPanel() {
-  const { portfolio } = usePortfolio();
+  const { portfolio, status, message, lastSuccessfulSyncAt } = usePortfolio();
 
   return (
     <section className="panel">
       <h2 className="panel-title">portfolio</h2>
 
-      {!portfolio ? (
-        <div className="panel-copy">No portfolio snapshot available.</div>
+      {status === 'loading' ? (
+        <div className="panel-copy">Loading portfolio truth...</div>
+      ) : status === 'error' ? (
+        <div className="panel-copy">
+          Portfolio truth unavailable. {message ?? 'Backend request failed.'}
+        </div>
+      ) : status === 'stale' ? (
+        <div className="panel-copy">
+          Portfolio truth is stale from {lastSuccessfulSyncAt ?? 'an unknown time'}.{' '}
+          {message ?? 'Latest refresh failed.'}
+        </div>
+      ) : status === 'missing' ? (
+        <div className="panel-copy">{message ?? 'No portfolio snapshot has been recorded yet.'}</div>
+      ) : !portfolio ? (
+        <div className="panel-copy">Portfolio response was empty.</div>
       ) : (
         <div className="metric-grid">
           <div className="metric-card">

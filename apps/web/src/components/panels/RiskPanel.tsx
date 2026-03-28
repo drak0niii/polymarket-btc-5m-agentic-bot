@@ -1,7 +1,21 @@
 import { useBotState } from '../../hooks/useBotState';
 
 export function RiskPanel() {
-  const { botState } = useBotState();
+  const { botState, fetchStatus } = useBotState();
+
+  if (!botState) {
+    return (
+      <section className="panel">
+        <h2 className="panel-title">risk</h2>
+        <div className="panel-copy">
+          {fetchStatus === 'loading'
+            ? 'Loading risk truth...'
+            : 'Risk truth unavailable while backend data is unavailable.'}
+        </div>
+      </section>
+    );
+  }
+
   const config = botState.liveConfig;
 
   return (

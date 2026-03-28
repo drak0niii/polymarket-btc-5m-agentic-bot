@@ -2,7 +2,10 @@ import assert from 'assert';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { type TradingOperatingMode } from '@polymarket-btc-5m-agentic-bot/domain';
 import { appEnv } from '../config/env';
+import { BotStateStore } from '../runtime/bot-state';
+import { StartStopManager } from '../runtime/start-stop-manager';
 import { StartupGateService } from '../runtime/startup-gate.service';
 import {
   assessDeploymentTierEvidence,
@@ -121,6 +124,74 @@ async function testPhaseNineStartupGateAddsLiveTierBlockingCheck(): Promise<void
     ),
     true,
   );
+}
+
+async function testPhaseNineStartupGateUsesSentinelRunbook(): Promise<void> {
+  let liveRunInvoked = false;
+  let sentinelRunInvoked = false;
+
+  const gate = new StartupGateService(
+    {
+      recordReconciliationCheckpoint: async () => undefined,
+    } as never,
+    {
+      run: async () => {
+        liveRunInvoked = true;
+        return {
+          passed: false,
+          reasonCode: 'live_runbook_should_not_execute',
+          executedAt: new Date().toISOString(),
+          steps: [],
+          smoke: null,
+          externalSnapshot: null,
+        };
+      },
+      runSentinelSimulation: async () => {
+        sentinelRunInvoked = true;
+        return {
+          passed: true,
+          reasonCode: null,
+          executedAt: new Date().toISOString(),
+          steps: [],
+          smoke: null,
+          externalSnapshot: null,
+        };
+      },
+    } as never,
+  );
+
+  const verdict = await gate.evaluate('sentinel');
+
+  assert.strictEqual(verdict.passed, true);
+  assert.strictEqual(liveRunInvoked, false);
+  assert.strictEqual(sentinelRunInvoked, true);
+}
+
+async function testPhaseNineStartStopManagerUsesOperatingModeAwareGate(): Promise<void> {
+  const stateStore = new BotStateStore('stopped');
+  let requestedMode: string | null = null;
+  const manager = new StartStopManager(
+    stateStore,
+    {
+      assertStartupAllowedForMode: async (operatingMode: TradingOperatingMode) => {
+        requestedMode = operatingMode;
+        return {
+          passed: true,
+          timestamp: new Date().toISOString(),
+          mode: 'sentinel',
+          checks: [],
+          blockingReasons: [],
+          warningReasons: [],
+          evidence: {},
+        };
+      },
+    } as never,
+  );
+
+  await manager.start('manual start', 'sentinel_simulation');
+
+  assert.strictEqual(requestedMode, 'sentinel_simulation');
+  assert.strictEqual(stateStore.getState(), 'bootstrapping');
 }
 
 async function testPhaseNineProductionReadinessPersistsArtifact(): Promise<void> {
@@ -307,6 +378,14 @@ export const phaseNineReadinessEnforcementTests = [
   {
     name: 'phase9 startup gate adds live tier hard block',
     fn: testPhaseNineStartupGateAddsLiveTierBlockingCheck,
+  },
+  {
+    name: 'phase9 startup gate uses sentinel-specific runbook',
+    fn: testPhaseNineStartupGateUsesSentinelRunbook,
+  },
+  {
+    name: 'phase9 start-stop manager uses operating mode aware startup gate',
+    fn: testPhaseNineStartStopManagerUsesOperatingModeAwareGate,
   },
   {
     name: 'phase9 production readiness persists latest artifact',

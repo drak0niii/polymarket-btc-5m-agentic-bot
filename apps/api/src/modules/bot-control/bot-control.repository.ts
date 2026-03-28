@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import path from 'path';
@@ -36,6 +36,25 @@ export interface SentinelStatusState {
   recommendedLiveEnable: boolean;
 }
 
+export interface RuntimeCommandState {
+  id: string;
+  command: 'start' | 'stop' | 'halt';
+  reason: string;
+  requestedBy: string | null;
+  cancelOpenOrders: boolean;
+  status: 'pending' | 'processing' | 'applied' | 'failed' | 'blocked';
+  failureMessage: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  processedAt: Date | null;
+}
+
+export interface ReconciliationCheckpointState {
+  status: string;
+  processedAt: Date;
+  details: Record<string, unknown> | null;
+}
+
 @Injectable()
 export class BotControlRepository {
   private readonly runtimeStatePath: string;
@@ -43,6 +62,8 @@ export class BotControlRepository {
 
   constructor(
     private readonly prisma: PrismaService,
+    @Optional()
+    @Inject('BOT_CONTROL_REPOSITORY_PATHS')
     paths?: {
       runtimeStatePath?: string;
       sentinelReadinessPath?: string;
@@ -127,6 +148,8 @@ export class BotControlRepository {
     reason: string;
     requestedBy?: string | null;
     cancelOpenOrders?: boolean;
+    status?: 'pending' | 'blocked';
+    failureMessage?: string | null;
   }) {
     return this.prisma.botRuntimeCommand.create({
       data: {
@@ -134,7 +157,9 @@ export class BotControlRepository {
         reason: input.reason,
         requestedBy: input.requestedBy ?? null,
         cancelOpenOrders: input.cancelOpenOrders ?? false,
-        status: 'pending',
+        status: input.status ?? 'pending',
+        failureMessage: input.failureMessage ?? null,
+        ...(input.status === 'blocked' ? { processedAt: new Date() } : {}),
       },
     });
   }
@@ -145,6 +170,43 @@ export class BotControlRepository {
       orderBy: { createdAt: 'asc' },
       take: limit,
     });
+  }
+
+  async findActiveCommand(command: 'start' | 'stop' | 'halt') {
+    return this.prisma.botRuntimeCommand.findFirst({
+      where: {
+        command,
+        status: { in: ['pending', 'processing'] },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  async findRecentCommands(limit = 12): Promise<RuntimeCommandState[]> {
+    return this.prisma.botRuntimeCommand.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+    }) as Promise<RuntimeCommandState[]>;
+  }
+
+  async findLatestCheckpoint(source: string): Promise<ReconciliationCheckpointState | null> {
+    const latest = await this.prisma.reconciliationCheckpoint.findFirst({
+      where: { source },
+      orderBy: { processedAt: 'desc' },
+    });
+
+    if (!latest?.processedAt) {
+      return null;
+    }
+
+    return {
+      status: latest.status,
+      processedAt: latest.processedAt,
+      details:
+        latest.details && typeof latest.details === 'object'
+          ? (latest.details as Record<string, unknown>)
+          : null,
+    };
   }
 
   async getOperatingMode(): Promise<TradingOperatingMode> {
@@ -195,7 +257,7 @@ export class BotControlRepository {
       return {
         state: typeof parsed.state === 'string' ? parsed.state : 'stopped',
         operatingMode:
-          parsed.operatingMode === 'sentinel_simulation' ? 'sentinel_simulation' : 'live_trading',
+          parsed.operatingMode === 'live_trading' ? 'live_trading' : 'sentinel_simulation',
         reason: typeof parsed.reason === 'string' ? parsed.reason : null,
         updatedAt:
           typeof parsed.updatedAt === 'string'
@@ -206,7 +268,7 @@ export class BotControlRepository {
       if (!isMissingFile(error)) {
         return {
           state: 'stopped',
-          operatingMode: 'live_trading',
+          operatingMode: 'sentinel_simulation',
           reason: 'runtime_artifact_unreadable',
           updatedAt: new Date().toISOString(),
         };
@@ -214,7 +276,7 @@ export class BotControlRepository {
 
       return {
         state: 'stopped',
-        operatingMode: 'live_trading',
+        operatingMode: 'sentinel_simulation',
         reason: null,
         updatedAt: new Date().toISOString(),
       };

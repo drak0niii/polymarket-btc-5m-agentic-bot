@@ -1,27 +1,26 @@
 import { useBotState } from '../../hooks/useBotState';
-import { apiClient } from '../../lib/api';
-
 export function StartBotButton() {
-  const { botState, refresh } = useBotState();
+  const { botState, canSubmitControls, commandStates, startBot } = useBotState();
 
-  const disabled = botState.state !== 'stopped';
-
-  const handleClick = async () => {
-    if (disabled) {
-      return;
-    }
-
-    await apiClient.startBot({
-      reason: 'start requested from web dashboard',
-      requestedBy: 'web',
-    });
-
-    await refresh();
-  };
+  const disabled =
+    !canSubmitControls ||
+    !botState ||
+    botState.state !== 'stopped' ||
+    commandStates.start.status === 'submitting' ||
+    commandStates.start.status === 'queued' ||
+    commandStates.start.status === 'processing';
+  const label =
+    commandStates.start.status === 'submitting'
+      ? 'Starting...'
+      : commandStates.start.status === 'queued'
+        ? 'Start Queued'
+        : commandStates.start.status === 'processing'
+          ? 'Starting'
+          : 'Start';
 
   return (
-    <button className="action-button" onClick={handleClick} disabled={disabled}>
-      Start
+    <button className="action-button" onClick={() => void startBot()} disabled={disabled}>
+      {label}
     </button>
   );
 }

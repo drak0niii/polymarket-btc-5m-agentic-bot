@@ -1,6 +1,8 @@
 const API_BASE = 'http://127.0.0.1:3000/api/v1';
 
 export type TradingOperatingMode = 'sentinel_simulation' | 'live_trading';
+export type RuntimeCommandType = 'start' | 'stop' | 'halt';
+export type RuntimeCommandStatus = 'pending' | 'processing' | 'applied' | 'failed';
 
 export interface SentinelStatusResponse {
   updatedAt: string;
@@ -20,6 +22,129 @@ export interface SentinelStatusResponse {
   recommendedLiveEnable: boolean;
 }
 
+export interface RuntimeCommandResponse {
+  id: string;
+  command: RuntimeCommandType;
+  reason: string;
+  requestedBy: string | null;
+  cancelOpenOrders: boolean;
+  status: RuntimeCommandStatus;
+  failureMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+  processedAt: string | null;
+}
+
+export interface BotStateResponse {
+  state:
+    | 'bootstrapping'
+    | 'running'
+    | 'degraded'
+    | 'reconciliation_only'
+    | 'cancel_only'
+    | 'halted_hard'
+    | 'stopped';
+  liveConfig: {
+    maxOpenPositions: number;
+    maxDailyLossPct: number;
+    maxPerTradeRiskPct: number;
+    maxKellyFraction: number;
+    maxConsecutiveLosses: number;
+    noTradeWindowSeconds: number;
+    evaluationIntervalMs: number;
+    orderReconcileIntervalMs: number;
+    portfolioRefreshIntervalMs: number;
+  };
+  operatingMode: TradingOperatingMode;
+  sentinelEnabled: boolean;
+  eligibleForLiveTrading: boolean;
+  warningText: string | null;
+  recommendedLiveEnable: boolean;
+  sentinelStatus: SentinelStatusResponse | null;
+  lastTransitionAt: string | null;
+  lastTransitionReason: string | null;
+  readiness: {
+    ready: boolean;
+    checks: {
+      env: boolean;
+      signing: boolean;
+      credentials: boolean;
+      liveMode: boolean;
+      riskConfig: boolean;
+    };
+    blockingReasons: string[];
+  };
+  controlPlane: {
+    source: string;
+    pendingCommands: Array<{
+      id: string;
+      command: RuntimeCommandType;
+      cancelOpenOrders: boolean;
+      createdAt: string;
+    }>;
+    activeCommands: RuntimeCommandResponse[];
+    recentCommands: RuntimeCommandResponse[];
+    latestCommandByType: Record<RuntimeCommandType, RuntimeCommandResponse | null>;
+  };
+}
+
+export interface PortfolioSnapshotResponse {
+  id: string;
+  bankroll: number;
+  availableCapital: number;
+  openExposure: number;
+  realizedPnlDay: number;
+  unrealizedPnl: number;
+  consecutiveLosses: number;
+  capturedAt: string;
+  createdAt: string;
+}
+
+export interface PortfolioResponse {
+  status: 'ready' | 'missing';
+  message: string | null;
+  snapshot: PortfolioSnapshotResponse | null;
+}
+
+interface ApiErrorBody {
+  message?: string | string[];
+  error?: string;
+  statusCode?: number;
+}
+
+export class ApiError extends Error {
+  status: number;
+  statusText: string;
+  body: unknown;
+
+  constructor(input: {
+    message: string;
+    status: number;
+    statusText: string;
+    body: unknown;
+  }) {
+    super(input.message);
+    this.name = 'ApiError';
+    this.status = input.status;
+    this.statusText = input.statusText;
+    this.body = input.body;
+  }
+}
+
+async function readResponseBody(response: Response): Promise<unknown> {
+  const text = await response.text();
+
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     headers: {
@@ -29,52 +154,30 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   });
 
+  const body = await readResponseBody(response);
+
   if (!response.ok) {
-    throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+    const payload =
+      body && typeof body === 'object' ? (body as ApiErrorBody) : undefined;
+    const message =
+      Array.isArray(payload?.message)
+        ? payload.message.join(', ')
+        : payload?.message ?? `API request failed: ${response.status} ${response.statusText}`;
+
+    throw new ApiError({
+      message,
+      status: response.status,
+      statusText: response.statusText,
+      body,
+    });
   }
 
-  return response.json() as Promise<T>;
+  return body as T;
 }
 
 export const apiClient = {
   getBotState() {
-    return request<{
-      state:
-        | 'bootstrapping'
-        | 'running'
-        | 'degraded'
-        | 'reconciliation_only'
-        | 'cancel_only'
-        | 'halted_hard'
-        | 'stopped';
-      liveConfig: {
-        maxOpenPositions: number;
-        maxDailyLossPct: number;
-        maxPerTradeRiskPct: number;
-        maxKellyFraction: number;
-        maxConsecutiveLosses: number;
-        noTradeWindowSeconds: number;
-        evaluationIntervalMs: number;
-        orderReconcileIntervalMs: number;
-        portfolioRefreshIntervalMs: number;
-      };
-      operatingMode: TradingOperatingMode;
-      sentinelEnabled: boolean;
-      recommendedLiveEnable: boolean;
-      sentinelStatus: SentinelStatusResponse | null;
-      lastTransitionAt: string | null;
-      lastTransitionReason: string | null;
-      readiness: {
-        ready: boolean;
-        checks: {
-          env: boolean;
-          signing: boolean;
-          credentials: boolean;
-          liveMode: boolean;
-          riskConfig: boolean;
-        };
-      };
-    }>('/bot-control/state');
+    return request<BotStateResponse>('/bot-control/state');
   },
 
   getOperatingMode() {
@@ -107,7 +210,7 @@ export const apiClient = {
     reason?: string;
     requestedBy?: string;
   }) {
-    return request('/bot-control/start', {
+    return request<BotStateResponse>('/bot-control/start', {
       method: 'POST',
       body: JSON.stringify(body),
     });
@@ -118,7 +221,7 @@ export const apiClient = {
     requestedBy?: string;
     cancelOpenOrders?: boolean;
   }) {
-    return request('/bot-control/stop', {
+    return request<BotStateResponse>('/bot-control/stop', {
       method: 'POST',
       body: JSON.stringify(body),
     });
@@ -129,7 +232,7 @@ export const apiClient = {
     requestedBy?: string;
     cancelOpenOrders?: boolean;
   }) {
-    return request('/bot-control/halt', {
+    return request<BotStateResponse>('/bot-control/halt', {
       method: 'POST',
       body: JSON.stringify(body),
     });
@@ -193,17 +296,7 @@ export const apiClient = {
   },
 
   getPortfolio() {
-    return request<{
-      id: string;
-      bankroll: number;
-      availableCapital: number;
-      openExposure: number;
-      realizedPnlDay: number;
-      unrealizedPnl: number;
-      consecutiveLosses: number;
-      capturedAt: string;
-      createdAt: string;
-    }>('/portfolio');
+    return request<PortfolioResponse>('/portfolio');
   },
 
   getAuditEvents() {
@@ -295,7 +388,7 @@ export const apiClient = {
 
   getDashboard() {
     return request<{
-      botState: unknown;
+      botState: BotStateResponse;
       readinessDashboard: unknown;
       operatingMode: TradingOperatingMode;
       sentinelStatus: SentinelStatusResponse | null;
@@ -309,7 +402,7 @@ export const apiClient = {
       markets: unknown[];
       signals: unknown[];
       orders: unknown[];
-      portfolio: unknown | null;
+      portfolio: PortfolioResponse;
       diagnostics: {
         execution: unknown[];
         evDrift: unknown[];
