@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
-import { apiClient } from '../lib/api';
+import {
+  apiClient,
+  type SentinelStatusResponse,
+  type TradingOperatingMode,
+} from '../lib/api';
 
 interface BotStateResponse {
   state:
@@ -21,6 +25,10 @@ interface BotStateResponse {
     orderReconcileIntervalMs: number;
     portfolioRefreshIntervalMs: number;
   };
+  operatingMode: TradingOperatingMode;
+  sentinelEnabled: boolean;
+  recommendedLiveEnable: boolean;
+  sentinelStatus: SentinelStatusResponse | null;
   lastTransitionAt: string | null;
   lastTransitionReason: string | null;
   readiness: {
@@ -29,6 +37,7 @@ interface BotStateResponse {
       env: boolean;
       signing: boolean;
       credentials: boolean;
+      liveMode: boolean;
       riskConfig: boolean;
     };
   };
@@ -47,6 +56,10 @@ const defaultState: BotStateResponse = {
     orderReconcileIntervalMs: 2000,
     portfolioRefreshIntervalMs: 5000,
   },
+  operatingMode: 'live_trading',
+  sentinelEnabled: false,
+  recommendedLiveEnable: false,
+  sentinelStatus: null,
   lastTransitionAt: null,
   lastTransitionReason: null,
   readiness: {
@@ -55,6 +68,7 @@ const defaultState: BotStateResponse = {
       env: false,
       signing: false,
       credentials: false,
+      liveMode: false,
       riskConfig: false,
     },
   },
@@ -62,6 +76,8 @@ const defaultState: BotStateResponse = {
 
 export function useBotState() {
   const [botState, setBotState] = useState<BotStateResponse>(defaultState);
+  const [modeLoading, setModeLoading] = useState(false);
+  const [modeError, setModeError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -71,6 +87,25 @@ export function useBotState() {
       // noop
     }
   }, []);
+
+  const setOperatingMode = useCallback(
+    async (operatingMode: TradingOperatingMode) => {
+      setModeLoading(true);
+      setModeError(null);
+      try {
+        await apiClient.setOperatingMode({
+          operatingMode,
+          requestedBy: 'web',
+        });
+        await refresh();
+      } catch (error) {
+        setModeError(error instanceof Error ? error.message : 'Failed to update mode.');
+      } finally {
+        setModeLoading(false);
+      }
+    },
+    [refresh],
+  );
 
   useEffect(() => {
     void refresh();
@@ -86,6 +121,11 @@ export function useBotState() {
 
   return {
     botState,
+    operatingMode: botState.operatingMode,
+    sentinelStatus: botState.sentinelStatus,
+    setOperatingMode,
+    modeLoading,
+    modeError,
     refresh,
   };
 }

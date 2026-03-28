@@ -1,3 +1,5 @@
+import type { TradingOperatingMode } from './sentinel';
+
 export type BotRuntimeState =
   | 'bootstrapping'
   | 'degraded'
@@ -9,6 +11,9 @@ export type BotRuntimeState =
 
 export interface BotStateSnapshot {
   state: BotRuntimeState;
+  operatingMode: TradingOperatingMode;
+  sentinelEnabled: boolean;
+  recommendedLiveEnable: boolean;
   lastTransitionAt: string | null;
   lastTransitionReason: string | null;
   readiness: {

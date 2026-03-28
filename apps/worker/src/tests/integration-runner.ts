@@ -195,6 +195,8 @@ import { phaseElevenLearningEventLogTests } from './phase11-learning-event-log.i
 import { phaseElevenLearningCycleJobTests } from './phase11-learning-cycle-job.integration.test';
 import { phaseElevenLearningCycleRunnerTests } from './phase11-learning-cycle-runner.integration.test';
 import { phaseElevenLearningParameterRecommendationTests } from './phase11-learning-parameter-recommendations.integration.test';
+import { sentinelSimulationIntegrationTests } from './sentinel-simulation.integration.test';
+import { sentinelReadinessIntegrationTests } from './sentinel-readiness.integration.test';
 import { itemOneLossAttributionClassifierTests } from './loss-attribution-classifier.integration.test';
 import { itemTwoRetentionContextTests } from './retention-context-report.integration.test';
 import { itemTwelveCalibrationDriftAlertTests } from './calibration-drift-alerts.integration.test';
@@ -10509,6 +10511,8 @@ async function run(): Promise<void> {
     ...phaseElevenLearningCycleJobTests,
     ...phaseElevenLearningCycleRunnerTests,
     ...phaseElevenLearningParameterRecommendationTests,
+    ...sentinelSimulationIntegrationTests,
+    ...sentinelReadinessIntegrationTests,
     ...itemOneLossAttributionClassifierTests,
     ...itemTwoRetentionContextTests,
     ...itemTwelveCalibrationDriftAlertTests,

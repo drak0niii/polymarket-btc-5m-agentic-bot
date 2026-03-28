@@ -1,5 +1,25 @@
 const API_BASE = 'http://127.0.0.1:3000/api/v1';
 
+export type TradingOperatingMode = 'sentinel_simulation' | 'live_trading';
+
+export interface SentinelStatusResponse {
+  updatedAt: string;
+  recommendationState: 'not_ready' | 'ready_to_consider_live';
+  recommendationMessage: string;
+  simulatedTradesCompleted: number;
+  simulatedTradesLearned: number;
+  targetSimulatedTrades: number;
+  targetLearnedTrades: number;
+  readinessScore: number;
+  readinessThreshold: number;
+  expectedVsRealizedEdgeGapBps: number;
+  fillQualityPassRate: number;
+  noTradeDisciplinePassRate: number;
+  learningCoverage: number;
+  unresolvedAnomalyCount: number;
+  recommendedLiveEnable: boolean;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     headers: {
@@ -38,6 +58,10 @@ export const apiClient = {
         orderReconcileIntervalMs: number;
         portfolioRefreshIntervalMs: number;
       };
+      operatingMode: TradingOperatingMode;
+      sentinelEnabled: boolean;
+      recommendedLiveEnable: boolean;
+      sentinelStatus: SentinelStatusResponse | null;
       lastTransitionAt: string | null;
       lastTransitionReason: string | null;
       readiness: {
@@ -46,10 +70,37 @@ export const apiClient = {
           env: boolean;
           signing: boolean;
           credentials: boolean;
+          liveMode: boolean;
           riskConfig: boolean;
         };
       };
     }>('/bot-control/state');
+  },
+
+  getOperatingMode() {
+    return request<{
+      operatingMode: TradingOperatingMode;
+      sentinelEnabled: boolean;
+      eligibleForLiveTrading: boolean;
+      warningText: string | null;
+      sentinelStatus: SentinelStatusResponse | null;
+    }>('/bot-control/mode');
+  },
+
+  setOperatingMode(body: {
+    operatingMode: TradingOperatingMode;
+    requestedBy?: string;
+  }) {
+    return request<{
+      operatingMode: TradingOperatingMode;
+      sentinelEnabled: boolean;
+      eligibleForLiveTrading: boolean;
+      warningText: string | null;
+      sentinelStatus: SentinelStatusResponse | null;
+    }>('/bot-control/mode', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
   },
 
   startBot(body: {
@@ -243,7 +294,29 @@ export const apiClient = {
   },
 
   getDashboard() {
-    return request('/ui/dashboard');
+    return request<{
+      botState: unknown;
+      readinessDashboard: unknown;
+      operatingMode: TradingOperatingMode;
+      sentinelStatus: SentinelStatusResponse | null;
+      recommendationMessage: string;
+      simulatedTradesCompleted: number;
+      simulatedTradesLearned: number;
+      targetSimulatedTrades: number;
+      readinessScore: number;
+      readinessThreshold: number;
+      recommendedLiveEnable: boolean;
+      markets: unknown[];
+      signals: unknown[];
+      orders: unknown[];
+      portfolio: unknown | null;
+      diagnostics: {
+        execution: unknown[];
+        evDrift: unknown[];
+        regimes: unknown[];
+      };
+      activity: unknown[];
+    }>('/ui/dashboard');
   },
 
   getScene() {

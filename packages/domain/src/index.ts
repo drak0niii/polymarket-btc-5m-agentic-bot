@@ -1,5 +1,6 @@
 export * from './account-state';
 export * from './audit';
+export * from './bot-state';
 export * from './decision-log';
 export * from './deployment-tier';
 export * from './edge';
@@ -8,6 +9,7 @@ export * from './net-edge';
 export * from './readiness';
 export * from './research';
 export * from './resolved-trade';
+export * from './sentinel';
 export * from './signal';
 export * from './strategy';
 export * from './strategy-variant';

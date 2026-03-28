@@ -63,6 +63,16 @@ export class UiService {
     return {
       botState,
       readinessDashboard,
+      operatingMode: botState.operatingMode,
+      sentinelStatus: botState.sentinelStatus,
+      recommendationMessage:
+        botState.sentinelStatus?.recommendationMessage ?? 'Sentinel readiness not available yet.',
+      simulatedTradesCompleted: botState.sentinelStatus?.simulatedTradesCompleted ?? 0,
+      simulatedTradesLearned: botState.sentinelStatus?.simulatedTradesLearned ?? 0,
+      targetSimulatedTrades: botState.sentinelStatus?.targetSimulatedTrades ?? 20,
+      readinessScore: botState.sentinelStatus?.readinessScore ?? 0,
+      readinessThreshold: botState.sentinelStatus?.readinessThreshold ?? 0.75,
+      recommendedLiveEnable: botState.recommendedLiveEnable,
       markets,
       signals,
       orders,

@@ -14,7 +14,10 @@ import {
   SizeVsLiquidityPolicy,
   OrderIntentService,
 } from '@polymarket-btc-5m-agentic-bot/execution-engine';
-import { buildStrategyVariantId } from '@polymarket-btc-5m-agentic-bot/domain';
+import {
+  buildStrategyVariantId,
+  type TradingOperatingMode,
+} from '@polymarket-btc-5m-agentic-bot/domain';
 import { SignerHealth } from '@polymarket-btc-5m-agentic-bot/signing-engine';
 import {
   LiveTradeGuard,
@@ -43,6 +46,10 @@ import {
 import { RuntimeControlRepository } from '@worker/runtime/runtime-control.repository';
 import { DecisionLogService } from '@worker/runtime/decision-log.service';
 import { LearningStateStore } from '@worker/runtime/learning-state-store';
+import { SentinelStateStore } from '@worker/runtime/sentinel-state-store';
+import { SentinelTradeSimulator } from '@worker/runtime/sentinel-trade-simulator';
+import { SentinelLearningService } from '@worker/runtime/sentinel-learning-service';
+import { SentinelReadinessService } from '@worker/runtime/sentinel-readiness-service';
 import { AccountStateService } from '@worker/portfolio/account-state.service';
 import {
   OrderIntentRepository,
@@ -140,6 +147,10 @@ export class ExecuteOrdersJob {
   private readonly externalPortfolioService: ExternalPortfolioService;
   private readonly accountStateService: Pick<AccountStateService, 'capture'>;
   private readonly decisionLogService: DecisionLogService;
+  private readonly sentinelStateStore: SentinelStateStore;
+  private readonly sentinelTradeSimulator: SentinelTradeSimulator;
+  private readonly sentinelLearningService: SentinelLearningService;
+  private readonly sentinelReadinessService: SentinelReadinessService;
   private readonly orderIntentRepository: Pick<
     OrderIntentRepository,
     'record' | 'loadLatest'
@@ -151,6 +162,7 @@ export class ExecuteOrdersJob {
     learningStateStore?: LearningStateStore,
     versionLineageRegistry?: VersionLineageRegistry,
     venueHealthLearningStore?: VenueHealthLearningStore,
+    sentinelStateStore?: SentinelStateStore,
   ) {
     this.runtimeControl =
       runtimeControl ??
@@ -177,6 +189,10 @@ export class ExecuteOrdersJob {
     this.venueHealthLearningStore =
       venueHealthLearningStore ?? createDefaultVenueHealthLearningStore(this.learningStateStore);
     this.decisionLogService = new DecisionLogService(this.prisma);
+    this.sentinelStateStore = sentinelStateStore ?? new SentinelStateStore();
+    this.sentinelTradeSimulator = new SentinelTradeSimulator();
+    this.sentinelLearningService = new SentinelLearningService(this.sentinelStateStore);
+    this.sentinelReadinessService = new SentinelReadinessService(this.sentinelStateStore);
     this.externalPortfolioService = new ExternalPortfolioService(
       this.prisma,
       this.tradingClient,
@@ -191,8 +207,10 @@ export class ExecuteOrdersJob {
   async run(options?: {
     canSubmit?: () => boolean;
     runtimeState?: BotRuntimeState;
+    operatingMode?: TradingOperatingMode;
   }): Promise<{ submitted: number; rejected: number }> {
     const canSubmit = options?.canSubmit ?? (() => true);
+    const operatingMode = options?.operatingMode ?? 'live_trading';
     if (
       options?.runtimeState &&
       !permissionsForRuntimeState(options.runtimeState).allowOrderSubmit
@@ -498,11 +516,14 @@ export class ExecuteOrdersJob {
       });
       const guard = this.liveTradeGuard.evaluate({
         botState: canSubmit() ? 'running' : 'cancel_only',
-        signerHealthy: signerHealth.checks.privateKey,
+        signerHealthy:
+          operatingMode === 'sentinel_simulation' ? true : signerHealth.checks.privateKey,
         credentialsHealthy:
-          signerHealth.checks.apiKey &&
-          signerHealth.checks.apiSecret &&
-          signerHealth.checks.apiPassphrase,
+          operatingMode === 'sentinel_simulation'
+            ? true
+            : signerHealth.checks.apiKey &&
+              signerHealth.checks.apiSecret &&
+              signerHealth.checks.apiPassphrase,
         marketDataFresh:
           signalAgeMs <= appEnv.BOT_MAX_SIGNAL_AGE_MS &&
           orderbookAgeMs <= appEnv.BOT_MAX_ORDERBOOK_AGE_MS &&
@@ -1026,6 +1047,27 @@ export class ExecuteOrdersJob {
         tickSize,
         rewardsMarkets,
       });
+
+      if (operatingMode === 'sentinel_simulation') {
+        await this.simulateSentinelTrade({
+          signal,
+          market,
+          tokenId,
+          strategyVariantId,
+          orderPlan,
+          feeModel,
+          executionPlannerAssumptions,
+          executionAdjustedEdge,
+          slippage,
+          makerQuality,
+        });
+        await this.prisma.signal.update({
+          where: { id: signal.id },
+          data: { status: 'sentinel_simulated' },
+        });
+        submitted += 1;
+        continue;
+      }
 
       const localOrderId = randomUUID();
       const intentEpoch = await this.resolveIntentEpoch(signal.id);
@@ -1723,6 +1765,7 @@ export class ExecuteOrdersJob {
     this.logger.debug('Order execution cycle complete.', {
       submitted,
       rejected,
+      operatingMode,
       liveExecutionEnabled: appEnv.BOT_LIVE_EXECUTION_ENABLED,
     });
 
@@ -1746,6 +1789,90 @@ export class ExecuteOrdersJob {
         positionSize: null,
         decisionAt: new Date(),
       },
+    });
+  }
+
+  private async simulateSentinelTrade(input: {
+    signal: {
+      id: string;
+      marketId: string;
+      strategyVersionId: string | null;
+      regime: string | null;
+    };
+    market: {
+      id: string;
+    };
+    tokenId: string;
+    strategyVariantId: string;
+    orderPlan: {
+      side: 'BUY' | 'SELL';
+      expectedFillProbability: number | null;
+      expectedFillFraction: number | null;
+      expectedQueueDelayMs: number | null;
+      recommendedOrderStyleRationale?: unknown[];
+    };
+    feeModel: {
+      netFeeBps: number;
+    };
+    executionPlannerAssumptions: {
+      slippageEstimate?: {
+        finalExpectedSlippageBps?: number | null;
+      } | null;
+    };
+    executionAdjustedEdge: number;
+    slippage: {
+      expectedSlippage: number;
+    };
+    makerQuality: unknown;
+  }): Promise<void> {
+    await this.sentinelStateStore.ensureBaselineKnowledge('sentinel_simulation');
+    const previousReadiness = await this.sentinelStateStore.readLatestReadiness();
+    const trade = this.sentinelTradeSimulator.simulate({
+      signalId: input.signal.id,
+      marketId: input.market.id,
+      tokenId: input.tokenId,
+      strategyVersionId: input.signal.strategyVersionId,
+      strategyVariantId: input.strategyVariantId,
+      regime: input.signal.regime,
+      side: input.orderPlan.side,
+      operatingMode: 'sentinel_simulation',
+      expectedFillProbability: input.orderPlan.expectedFillProbability,
+      expectedFillFraction: input.orderPlan.expectedFillFraction,
+      expectedQueueDelayMs: input.orderPlan.expectedQueueDelayMs,
+      expectedFeeBps: input.feeModel.netFeeBps,
+      expectedSlippageBps:
+        input.executionPlannerAssumptions.slippageEstimate?.finalExpectedSlippageBps ??
+        input.slippage.expectedSlippage * 10_000,
+      expectedNetEdgeAfterCostsBps: input.executionAdjustedEdge * 10_000,
+      rationale: (input.orderPlan.recommendedOrderStyleRationale ?? []).map((value) =>
+        typeof value === 'string'
+          ? value
+          : value && typeof value === 'object' && 'reasonCode' in value
+            ? String((value as { reasonCode?: unknown }).reasonCode ?? 'sentinel_style')
+            : 'sentinel_style',
+      ),
+      evidenceRefs: [this.sentinelStateStore.getPaths().tradesPath],
+    });
+    await this.sentinelStateStore.appendSimulatedTrade(trade);
+    await this.decisionLogService.recordSentinelTradeEvidence({ trade });
+    await this.prisma.auditEvent.create({
+      data: {
+        marketId: input.market.id,
+        signalId: input.signal.id,
+        eventType: 'sentinel.trade_simulated',
+        message: 'Trade was simulated through sentinel mode.',
+        metadata: {
+          operatingMode: 'sentinel_simulation',
+          sentinelTrade: trade,
+          makerQuality: input.makerQuality,
+        } as object,
+      },
+    });
+    await this.sentinelLearningService.learnFromTrade(trade);
+    const readiness = await this.sentinelReadinessService.recompute('sentinel_simulation');
+    await this.decisionLogService.recordSentinelRecommendationTransition({
+      previous: previousReadiness,
+      next: readiness,
     });
   }
 

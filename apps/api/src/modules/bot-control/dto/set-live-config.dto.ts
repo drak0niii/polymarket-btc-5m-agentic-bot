@@ -1,10 +1,13 @@
 import {
+  IsIn,
   IsNumber,
   IsOptional,
   IsString,
   MaxLength,
   Min,
 } from 'class-validator';
+
+const OPERATING_MODES = ['sentinel_simulation', 'live_trading'] as const;
 
 export class SetLiveConfigDto {
   @IsOptional()
@@ -56,4 +59,9 @@ export class SetLiveConfigDto {
   @IsString()
   @MaxLength(200)
   updatedBy?: string;
+
+  @IsOptional()
+  @IsString()
+  @IsIn(OPERATING_MODES)
+  operatingMode?: (typeof OPERATING_MODES)[number];
 }

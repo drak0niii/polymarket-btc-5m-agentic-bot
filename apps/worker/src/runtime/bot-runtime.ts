@@ -153,6 +153,7 @@ export class BotRuntime {
   async start(): Promise<void> {
     this.logger.log('Initializing bot runtime.', {
       botState: this.stateStore.getState(),
+      operatingMode: this.stateStore.getOperatingMode(),
     });
 
     await this.prisma.$connect();
@@ -212,6 +213,10 @@ export class BotRuntime {
 
   getState(): BotRuntimeState {
     return this.stateStore.getState();
+  }
+
+  getOperatingMode() {
+    return this.stateStore.getOperatingMode();
   }
 
   async requestStart(reason = 'manual start requested'): Promise<void> {
@@ -358,6 +363,7 @@ export class BotRuntime {
 
     this.processingCommand = true;
     try {
+      this.stateStore.refreshOperatingModeFromDisk();
       const command = await this.runtimeControl.claimNextPendingCommand();
       if (!command) {
         return;

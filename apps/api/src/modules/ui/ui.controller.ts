@@ -1,5 +1,6 @@
 import { Controller, Get } from '@nestjs/common';
 import { UiService } from './ui.service';
+import { DashboardResponseDto } from './dto/dashboard-response.dto';
 
 @Controller({
   path: 'ui',
@@ -9,7 +10,7 @@ export class UiController {
   constructor(private readonly uiService: UiService) {}
 
   @Get('dashboard')
-  async getDashboard() {
+  async getDashboard(): Promise<DashboardResponseDto> {
     return this.uiService.getDashboard();
   }
 

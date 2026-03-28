@@ -2,575 +2,375 @@
 
 ## Repository mission
 
-This repository exists to become a **measurably trustworthy capital-growth bot** for live BTC 5-minute Polymarket trading.
+This repository must support **two explicit operating modes** for the BTC 5-minute Polymarket system:
 
-Its purpose is not to look sophisticated. Its purpose is to:
+1. **Sentinel Simulation Mode** — a learning-first, no-real-orders mode that simulates trade execution end to end, learns from those simulated outcomes, and decides whether the system is ready to recommend live trading.
+2. **Real Trading Mode** — the existing live execution path, which may only be enabled by a user-controlled dashboard switch after Sentinel has produced enough evidence.
 
-- trade only when **net edge remains positive after fees, slippage, queue friction, and adverse selection**
-- survive live venue uncertainty without corrupting state
-- keep capital sizing bounded by **live evidence quality**
-- improve through **controlled, auditable, reversible** learning
-- earn higher deployment tiers only through **real operational proof**
+The immediate objective of this document is not to optimize live returns directly.
+It is to create a **strict, auditable sentinel gate** that answers:
 
-The target state is **8+/10 trustworthiness** only when the bot proves:
+- how many simulated trades have been taken
+- how many have been learned from
+- what the current learning baseline is
+- what threshold remains before the system is considered ready
+- whether the system recommends switching from simulation to live trading
 
-- durable positive net expectancy after realized costs
-- execution quality stable enough to preserve edge
-- regime-aware selectivity, including explicit no-trade behavior
-- low reconciliation defect rates
-- promotion and scaling based on live evidence, not optimism
-
----
-
-## What this repository is
-
-It is:
-
-- a live-oriented Polymarket BTC 5-minute directional trading system
-- a runtime-controlled, reconciliation-first execution platform
-- a system that must convert forecast edge into **realized post-cost edge**
-- a staged deployment system with shadow, paper, canary, cautious live, and scaled live tiers
-- an auditable learning system with bounded adaptation
-
-It is not:
-
-- a generic LLM trading experiment
-- a self-rewriting autonomous trader
-- a backtest theater repo
-- a “just place more trades and learn” system
-- a strategy that gets trusted because its architecture is advanced
+This repository must never silently blur simulation and live trading.
 
 ---
 
 ## Prime directive
 
-**MAXIMIZE RISK-ADJUSTED LONG-TERM CAPITAL GROWTH WITHOUT LOSING CONTROL OF EXECUTION, STATE, OR CAPITAL CONTAINMENT**
+**BUILD A SENTINEL-FIRST TRADING SYSTEM THAT LEARNS SAFELY FROM SIMULATED BTC 5-MINUTE POLYMARKET TRADES BEFORE ANY REAL CAPITAL IS DEPLOYED**
 
-This prime directive has four mandatory sub-goals:
+Sub-goals:
 
-1. preserve capital first
-2. trade only when net edge remains positive after realistic costs
-3. scale only when live evidence justifies scaling
-4. degrade safely when truth quality becomes uncertain
-
----
-
-## Mandatory operating principles
-
-1. **Reconciliation beats assumption.**
-   External venue truth, account truth, and confirmed execution truth take priority over local intent.
-
-2. **Net edge beats raw signal.**
-   Gross predictive strength does not justify a trade unless net expectancy stays positive after realistic costs.
-
-3. **No-trade is a first-class action.**
-   The bot must explicitly refuse marginal or noisy conditions.
-
-4. **Evidence beats confidence.**
-   Forecast conviction cannot override weak live sample quality.
-
-5. **Bounded adaptation only.**
-   The live bot may tune parameters within narrow, audited bounds. It must not rewrite its own strategy logic broadly.
-
-6. **Promotion is earned, not inferred.**
-   No strategy variant moves up the rollout ladder without satisfying live promotion gates.
-
-7. **Execution truth is risk truth.**
-   Stale user streams, missing cancel confirmations, ghost exposure, or lifecycle ambiguity are direct risk inputs.
-
-8. **Capital protection outranks throughput.**
-   If there is tension between making more decisions and protecting capital, protect capital.
+1. simulation must reuse the real decision path as much as possible
+2. simulation must never place real orders
+3. learning must be based on explicit, reviewable trade outcomes
+4. readiness to go live must be computed from clear thresholds, not vague confidence
+5. the dashboard must let the user switch modes explicitly and must display sentinel progress clearly
 
 ---
 
-## Non-negotiable guardrails
+## Non-negotiable operating rules
 
-### 1) Secret and environment hygiene
+1. **Simulation and live are separate operating modes.**
+   Sentinel mode must never call the real Polymarket order-placement path.
 
-- Never commit real secrets.
-- Treat `.env`, `.env.smoke`, runtime artifacts, snapshots, and logs as non-source material.
-- In non-paper live tiers, missing required credentials must fail hard.
-- If secrets have ever been committed, assume compromise and rotate them.
+2. **One decision pipeline, two execution targets.**
+   Signal generation, edge evaluation, regime logic, no-trade logic, and sizing logic should be reused. Only the execution target changes.
 
-### 2) Deployment-tier discipline
+3. **Sentinel must be strict, not theatrical.**
+   The simulator must model spread, fees, slippage, fill probability, and timing frictions. It must not assume perfect fills.
 
-Valid rollout order:
+4. **Readiness is advisory, not autonomous.**
+   Sentinel may recommend “safe to go live,” but the final switch to real trading must be user-controlled via the dashboard.
 
-- `shadow`
-- `paper`
-- `canary`
-- `cautious_live`
-- `scaled_live`
+5. **No real trading until sentinel thresholds pass.**
+   If sentinel thresholds are not met, the UI must say so explicitly and live mode should remain visually discouraged.
+
+6. **Learning must be durable and auditable.**
+   Every simulated trade and every learning update must be written to artifacts under `artifacts/learning/`.
+
+7. **Learning must be bounded.**
+   Sentinel may update narrow parameters and confidence/trust state. It must not rewrite strategy families or bypass risk rules.
+
+8. **The user must always know the current sentinel state.**
+   The dashboard must show:
+   - current mode
+   - simulated trades completed
+   - simulated trades learned from
+   - target threshold
+   - current readiness score
+   - recommendation status
+
+---
+
+## Canonical Sentinel operating model
+
+### Mode definitions
+
+#### `sentinel_simulation`
+The system:
+- runs discovery, market sync, signal generation, edge evaluation, regime classification, no-trade filtering, and sizing
+- routes approved trade intents into a simulated execution engine
+- writes simulated fills/trade outcomes into dedicated sentinel artifacts
+- learns from those outcomes
+- never places a live venue order
+
+#### `live_trading`
+The system:
+- uses the existing live execution path
+- may only be entered through the dashboard switch
+- should be recommended only when sentinel readiness is satisfied
+
+---
+
+## Minimum Sentinel baseline requirements
+
+Before the first simulated trade, the system must create a **baseline knowledge state**.
+
+That baseline must include:
+- current strategy variant and version
+- current regime model version
+- current net-edge assumptions
+- current cost assumptions
+- current learning-state snapshot
+- current trust/readiness defaults
+- sentinel target thresholds
+
+This baseline is the reference point from which Sentinel learns.
+
+### Mandatory baseline artifact
+Create and maintain:
+- `artifacts/learning/sentinel/baseline-knowledge.latest.json`
+
+Required contents:
+- `createdAt`
+- `strategyVariantId`
+- `strategyVersion`
+- `regimeModelVersion`
+- `initialNetEdgeAssumptions`
+- `initialCostAssumptions`
+- `initialTrustScore`
+- `targetSimulatedTrades`
+- `targetLearnedTrades`
+- `safeToGoLiveThresholds`
+
+---
+
+## Sentinel readiness thresholds
+
+The default target window is:
+- **20 simulated trades completed**
+- **20 simulated trades learned from**
+
+The system may only recommend live trading when all of the following are true:
+
+1. `simulatedTradesCompleted >= 20`
+2. `simulatedTradesLearned >= 20`
+3. `readinessScore >= 0.75`
+4. `simulatedNetEdgeAfterCostsBps > 0` over the sentinel window
+5. `expectedVsRealizedEdgeGapBps <= 8` on average over the sentinel window
+6. `simulatedFillQualityPassRate >= 0.80`
+7. `unresolvedSentinelAnomalies = 0`
+8. `noTradeDisciplinePassRate >= 0.80`
+9. `learningCoverage = simulatedTradesLearned / simulatedTradesCompleted >= 0.95`
+
+### Important rule
+Crossing the threshold means:
+- **display “Safe to consider live trading”**
+- **display “Recommended to flip toggle to live trading”**
+
+It does **not** mean:
+- auto-enable live trading
+- bypass startup gates
+- bypass real readiness checks
+- bypass existing deployment-tier rules
+
+---
+
+## Dashboard requirements
+
+The dashboard must include a clear **mode switch** controlled by the user.
+
+### Required switch behavior
+
+Two visible options:
+- `Sentinel Simulation`
+- `Real Trading`
 
 Rules:
+- switching to Sentinel is always allowed
+- switching to Real Trading must require explicit user action
+- when Sentinel thresholds are not met, the UI must show a warning
+- when Sentinel thresholds are met, the UI must show a recommendation
+- the switch must persist through the API/backend control path, not only local UI state
 
-- no skipping tiers
-- no direct promotion from paper to scaled live
-- readiness artifacts are mandatory for live-executable tiers
-- each higher tier requires stronger evidence thresholds
+### Required sentinel message block
+The dashboard must show a persistent message similar to:
 
-### 3) Reconciliation-first truth model
+- `Mode: Sentinel Simulation`
+- `Simulated trades taken: X / 20`
+- `Trades learned from: Y / 20`
+- `Current readiness score: Z`
+- `Threshold to recommend live trading: 0.75`
+- `Recommendation: Not ready / Ready to consider live trading`
 
-- local fill assumptions are provisional
-- matched is not always final
-- reserve release must follow confirmed truth
-- portfolio truth, open-order truth, and trade truth must reconcile before the system trusts exposure
-- unresolved anomalies must downgrade runtime state automatically
-
-### 4) Learning boundaries
-
-Allowed live-adjustable surfaces:
-
-- entry threshold
-- aggressiveness band
-- max holding time
-- cancel/repost timing
-- regime confidence threshold
-- size multiplier band within evidence caps
-
-Not allowed for autonomous live rewriting:
-
-- replacing the strategy family wholesale
-- changing objective hierarchy
-- silently introducing new live features
-- changing safety gates or deployment-tier rules
-- bypassing promotion criteria
-
-### 5) Capital containment
-
-- sizing must be capped by evidence quality
-- regime caps must apply even when a local setup looks strong
-- benchmark underperformance must clamp size
-- kill-switches must be allowed to drive size to zero immediately
-- no strategy may scale because of backtests alone
+### Required extra breakdown
+Also show:
+- net edge after simulated costs
+- average realized-vs-expected edge gap
+- fill-quality pass rate
+- unresolved anomaly count
+- no-trade discipline pass rate
 
 ---
 
-## Canonical truth hierarchy
+## Canonical truth hierarchy for Sentinel
 
-When system views disagree, trust in this order:
+When Sentinel views disagree, trust in this order:
 
-1. confirmed venue/account truth
-2. reconciled fill-state truth
-3. canonical resolved-trade ledger
-4. recent audited runtime snapshots
-5. local order-intent metadata
-6. forecast and planning assumptions
+1. canonical simulated trade ledger
+2. sentinel learning state
+3. sentinel readiness summary
+4. dashboard/API read models
+5. UI local state
 
-This hierarchy applies to:
-
-- exposure
-- realized pnl
-- fee accounting
-- slippage attribution
-- strategy promotion evidence
-- capital scaling evidence
+Sentinel must not derive readiness directly from transient UI state.
 
 ---
 
 ## Required architectural stance
 
-All major upgrades must preserve and extend the existing architecture instead of creating parallel systems.
+Extend existing systems. Do not build a disconnected simulator.
 
-### Extend, do not fork, these subsystems
+### Extend, do not fork
 
 #### Worker / runtime
 - `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
 - `apps/worker/src/jobs/executeOrders.job.ts`
 - `apps/worker/src/jobs/reconcileFills.job.ts`
 - `apps/worker/src/jobs/dailyReview.job.ts`
+- `apps/worker/src/runtime/bot-state.ts`
+- `apps/worker/src/runtime/bot-runtime.ts`
+- `apps/worker/src/runtime/runtime-control.repository.ts`
 - `apps/worker/src/runtime/learning-state-store.ts`
-- `apps/worker/src/runtime/strategy-deployment-registry.ts`
-- `apps/worker/src/runtime/strategy-rollout-controller.ts`
-- `apps/worker/src/runtime/runtime-state-machine.ts`
-- `apps/worker/src/runtime/startup-gate.service.ts`
-- `apps/worker/src/runtime/venue-open-order-heartbeat.service.ts`
-- `apps/worker/src/runtime/user-websocket-state.service.ts`
+- `apps/worker/src/runtime/decision-log.service.ts`
+- `apps/worker/src/runtime/start-stop-manager.ts`
 
-#### Signal / edge / calibration
-- `packages/signal-engine/src/net-edge-estimator.ts`
-- `packages/signal-engine/src/executable-ev-model.ts`
-- `packages/signal-engine/src/live-calibration-store.ts`
-- `packages/signal-engine/src/live-calibration-updater.ts`
-- `packages/signal-engine/src/regime-classifier.ts`
-- `packages/signal-engine/src/regime-conditioned-edge-model.ts`
-- `packages/signal-engine/src/no-trade-zone-policy.ts`
-- `packages/signal-engine/src/trade-admission-gate.ts`
-- `packages/signal-engine/src/benchmarks/*`
-- `packages/signal-engine/src/champion-challenger-manager.ts`
-- `packages/signal-engine/src/promotion-decision-engine.ts`
-- `packages/signal-engine/src/strategy-quarantine-policy.ts`
+#### API / control
+- `apps/api/src/modules/bot-control/bot-control.controller.ts`
+- `apps/api/src/modules/bot-control/bot-control.service.ts`
+- `apps/api/src/modules/bot-control/bot-control.repository.ts`
+- `apps/api/src/modules/bot-control/dto/start-bot.dto.ts`
+- `apps/api/src/modules/bot-control/dto/set-live-config.dto.ts`
+- `apps/api/src/modules/ui/ui.service.ts`
+- `apps/api/src/modules/ui/ui.controller.ts`
+- `apps/api/src/modules/ui/dto/dashboard-response.dto.ts`
 
-#### Execution
-- `packages/execution-engine/src/fill-probability-estimator.ts`
-- `packages/execution-engine/src/slippage-estimator.ts`
-- `packages/execution-engine/src/realized-cost-model.ts`
-- `packages/execution-engine/src/execution-cost-calibrator.ts`
-- `packages/execution-engine/src/order-planner.ts`
-- `packages/execution-engine/src/marketable-limit.ts`
-- `packages/execution-engine/src/fill-state-service.ts`
-- `packages/execution-engine/src/execution-diagnostics.ts`
-- `packages/execution-engine/src/fee-accounting-service.ts`
-- `packages/execution-engine/src/queue-position-estimator.ts`
+#### Web dashboard
+- `apps/web/src/components/panels/ControlPanel.tsx`
+- `apps/web/src/hooks/useBotState.ts`
+- `apps/web/src/lib/api.ts`
+- `apps/web/src/components/panels/DiagnosticsPanel.tsx` *(only if the sentinel status is surfaced there too)*
 
-#### Risk / capital / kill-switches
-- `packages/risk-engine/src/live-trade-guard.ts`
-- `packages/risk-engine/src/live-sizing-feedback-policy.ts`
-- `packages/risk-engine/src/regime-capital-policy.ts`
-- `packages/risk-engine/src/regime-local-sizing.ts`
-- `packages/risk-engine/src/execution-quality-kill-switches.ts`
-- `packages/risk-engine/src/expected-vs-realized-ev-guard.ts`
-- `packages/risk-engine/src/consecutive-loss-kill-switch.ts`
-- `packages/risk-engine/src/capital-ramp-policy-service.ts`
-- `packages/risk-engine/src/trade-quality-history-store.ts`
-- `packages/risk-engine/src/portfolio-kill-switch-service.ts`
+#### Domain / UI contracts
+- `packages/domain/src/bot-state.ts`
+- `packages/domain/src/index.ts`
+- `packages/ui-contracts/src/control.ts`
+- `packages/ui-contracts/src/dashboard.ts`
 
 ---
 
-## Required new truth surfaces
+## Sentinel-specific files that may be added
 
-The implementation plan must establish and keep authoritative the following surfaces:
+These are the preferred canonical insertion points for the sentinel build:
 
-### 1) Canonical resolved-trade ledger
+### Domain
+- `packages/domain/src/sentinel.ts`
 
-Every economically resolved trade must generate exactly one canonical resolved record with:
+### Worker runtime
+- `apps/worker/src/runtime/sentinel-state-store.ts`
+- `apps/worker/src/runtime/sentinel-trade-simulator.ts`
+- `apps/worker/src/runtime/sentinel-learning-service.ts`
+- `apps/worker/src/runtime/sentinel-readiness-service.ts`
 
-- decision-time assumptions
-- execution path facts
-- realized costs
-- regime/archetype context
-- realized net outcome
-- attribution labels
+### API DTOs / read models
+- `apps/api/src/modules/ui/dto/sentinel-status-response.dto.ts` *(if DTO separation is preferred)*
 
-This ledger is the source of truth for:
-
-- daily review
-- promotion/demotion
-- evidence-quality sizing
-- realized-vs-expected edge analysis
-- benchmark-relative validation
-
-### 2) Net-edge decomposition
-
-Every tradable decision must have a persisted decomposition including:
-
-- gross edge
-- fee cost
-- slippage cost
-- adverse-selection penalty
-- queue penalty
-- uncertainty penalty
-- final net edge
-
-The system must be able to explain both:
-
-- why a trade was approved
-- why a trade was rejected
-
-### 3) Empirical execution realism
-
-Planner assumptions must be grounded in recent live evidence by bucket, including:
-
-- fill probability
-- fill fraction
-- queue delay
-- cancel latency
-- slippage
-- post-fill toxicity
-
-### 4) Regime/no-trade context
-
-Every candidate signal must carry:
-
-- regime label
-- regime confidence
-- transition risk
-- no-trade allow/block status
-- no-trade reason codes
-
-### 5) Evidence-weighted sizing decomposition
-
-Every order must have a sizing breakdown showing:
-
-- base risk
-- edge factor
-- regime factor
-- evidence factor
-- deployment-tier factor
-- kill-switch factor
+### Tests
+- `apps/worker/src/tests/sentinel-simulation.integration.test.ts`
+- `apps/worker/src/tests/sentinel-readiness.integration.test.ts`
+- `apps/api/src/modules/bot-control/bot-control.sentinel.integration.test.ts`
+- `apps/web/src/components/panels/ControlPanel.sentinel.test.tsx` *(if web tests exist in repo conventions)*
 
 ---
 
-## Trading approval doctrine
+## Sentinel data model requirements
 
-A trade is allowed only when all conditions hold:
+### Canonical mode enum
+Add a domain enum/value union for:
+- `sentinel_simulation`
+- `live_trading`
 
-1. runtime state permits new exposure
-2. authenticated venue and user-state truth are healthy enough
-3. regime classifier identifies a tradable regime with sufficient confidence
-4. no-trade classifier does not block the setup
-5. net edge remains positive after realistic costs
-6. execution realism does not predict unacceptable fill degradation
-7. capital sizing is allowed by evidence quality and tier rules
-8. no kill-switch or anomaly detector is active
+### Canonical sentinel status
+Must include at minimum:
+- `mode`
+- `targetSimulatedTrades`
+- `simulatedTradesCompleted`
+- `simulatedTradesLearned`
+- `learningCoverage`
+- `readinessScore`
+- `readinessThreshold`
+- `netEdgeAfterCostsBps`
+- `expectedVsRealizedEdgeGapBps`
+- `fillQualityPassRate`
+- `noTradeDisciplinePassRate`
+- `unresolvedAnomalyCount`
+- `recommendedLiveEnable`
+- `recommendationMessage`
+- `lastLearningAt`
+- `baselineKnowledgeVersion`
 
-If any one of these fails, the correct behavior is reject, degrade, cancel-only, or reconciliation-only depending on severity.
-
----
-
-## Strategy governance doctrine
-
-### Promotion requirements
-
-A strategy variant may be promoted only if it demonstrates:
-
-- minimum live trade count
-- positive net expectancy after realized costs
-- benchmark-relative outperformance
-- acceptable drawdown behavior
-- acceptable execution variance
-- acceptable reconciliation cleanliness
-- no unresolved anomaly pattern
-
-### Demotion / quarantine triggers
-
-A strategy variant must be demoted, clamped, or quarantined when it exhibits:
-
-- persistent realized-vs-expected edge underperformance
-- benchmark-relative underperformance
-- unstable regime behavior
-- repeated adverse-selection spikes
-- repeated execution-quality failures
-- unresolved lifecycle or reconciliation defects
-
-### Rollout discipline
-
-All rollout must follow the registry and rollout controller. No manual shortcut that bypasses gating logic is acceptable.
-
----
-
-## Runtime degradation doctrine
-
-The system must be able to move deterministically among:
-
-- `bootstrapping`
-- `running`
-- `degraded`
-- `reconciliation_only`
-- `cancel_only`
-- `halted_hard`
-- `stopped`
-
-### Mandatory degradation triggers
-
-The system must request downgrade when it detects:
-
-- stale user stream while orders are live
-- venue/local open-order disagreement
-- repeated retry/fail lifecycle states
-- abnormal cancel latency
-- ghost exposure after reconnect
-- filled-locally vs absent-from-venue inconsistency
-- realized-vs-expected cost blowout
-- repeated partial-fill toxicity deterioration
-- reconciliation defect rate above policy threshold
-
-### Escalation logic
-
-- mild execution quality drift → `degraded`
-- state truth uncertainty → `reconciliation_only`
-- cancel-path urgency with live orders → `cancel_only`
-- severe unresolved exposure or truth corruption → `halted_hard`
+### Canonical simulated trade record
+Must include at minimum:
+- `simulationTradeId`
+- `decisionId`
+- `strategyVariantId`
+- `marketId`
+- `tokenId`
+- `regime`
+- `side`
+- `intendedPrice`
+- `simulatedFillPrice`
+- `simulatedFee`
+- `simulatedSlippageBps`
+- `expectedNetEdgeBps`
+- `realizedNetEdgeBps`
+- `fillProbabilityUsed`
+- `orderbookSnapshotRef`
+- `createdAt`
+- `finalizedAt`
+- `learned`
+- `learningOutcomeRef`
 
 ---
 
-## Daily review doctrine
+## Hard guardrails for Sentinel implementation
 
-A valid daily review must answer:
-
-- did the bot make money after costs
-- which regimes helped or hurt
-- whether losses came from forecast, execution, sizing, regime selection, or fee/slippage underestimation
-- whether realized edge matched expected edge
-- whether the bot is beating simple baselines after costs
-- whether promotion or demotion evidence changed materially
-- whether any anomaly blocks tier advancement
-
-The daily report is not optional bookkeeping. It is a control system input.
+1. Sentinel execution must never call the real exchange submit path.
+2. Live trading mode must never read Sentinel recommendation from the UI as truth; it must come from backend state.
+3. Sentinel readiness must be computed backend-side.
+4. Sentinel trades must be persisted independently from live trades.
+5. Sentinel learning must be append-safe and auditable.
+6. Reusing the live planning path is mandatory; duplicating signal/edge logic for simulation is forbidden.
+7. The dashboard switch must go through the API control path and be persisted.
+8. The dashboard message must reflect backend truth, not client-only counters.
 
 ---
 
-## Code-change priorities
+## Required artifacts
 
-Implementation work must follow this order unless a security issue forces reordering.
+The sentinel build must write these artifacts:
 
-### Priority 0 — before all live trust work
-1. secret hygiene and environment hardening
-2. canonical resolved-trade ledger
-3. net-edge-after-costs truth path
-4. live-calibrated fill realism
-5. regime-aware no-trade authority
+- `artifacts/learning/sentinel/baseline-knowledge.latest.json`
+- `artifacts/learning/sentinel/simulated-trades.jsonl`
+- `artifacts/learning/sentinel/learning-updates.jsonl`
+- `artifacts/learning/sentinel/readiness.latest.json`
 
-### Priority 1 — before 8+/10 is realistic
-6. evidence-quality sizing
-7. live promotion/demotion gates
-8. execution-state anomaly handling and kill-switch tightening
-9. daily decision-quality pack
-10. readiness and rollout enforcement
-
-### Priority 2 — only after Priority 0/1
-11. better review UX / CLI summaries
-12. secondary model upgrades
-13. broader benchmark families
-
-No work on cosmetic dashboards or non-essential abstractions may delay Priority 0 items.
+Optional but allowed:
+- `artifacts/learning/sentinel/daily-summary/YYYY-MM-DD.json`
 
 ---
 
-## File-by-file intent map
+## Acceptance standard
 
-### Worker layer
+This Sentinel feature is only complete when all of the following are true:
 
-#### `apps/worker/src/jobs/evaluateTradeOpportunities.job.ts`
-Must become the canonical point where:
-
-- net-edge decomposition is consumed
-- regime/no-trade admission is enforced
-- evidence-weighted sizing is applied
-- full decision metadata is persisted
-
-#### `apps/worker/src/jobs/executeOrders.job.ts`
-Must persist planner assumptions, expected fill realism, and order-style rationale so later reconciliation can judge whether execution matched expectation.
-
-#### `apps/worker/src/jobs/reconcileFills.job.ts`
-Must write canonical resolved-trade records, update empirical fill realism, compute realized-vs-expected edge gaps, and emit auditable resolution events.
-
-#### `apps/worker/src/jobs/refreshPortfolio.job.ts`
-Must backfill final economic truth for recently resolved trades after external portfolio truth refresh.
-
-#### `apps/worker/src/jobs/dailyReview.job.ts`
-Must consume the resolved-trade ledger and produce daily decision-quality, promotion, demotion, and readiness evidence.
-
-#### `apps/worker/src/runtime/*`
-Must preserve deterministic rollout, startup gates, runtime transitions, and anomaly-triggered degradation.
-
-### Signal layer
-
-#### `packages/signal-engine/src/net-edge-estimator.ts`
-Must return a decomposed cost-aware edge structure, not a black-box scalar only.
-
-#### `packages/signal-engine/src/executable-ev-model.ts`
-Must use empirical execution realism rather than optimistic static assumptions.
-
-#### `packages/signal-engine/src/regime-classifier.ts`
-Must produce regime confidence and transition-risk output that materially affects approval behavior.
-
-#### `packages/signal-engine/src/trade-admission-gate.ts`
-Must reject trades lacking sufficient regime confidence, live evidence quality, or net edge.
-
-#### `packages/signal-engine/src/champion-challenger-manager.ts`
-Must treat live promotion gates as mandatory.
-
-### Execution layer
-
-#### `packages/execution-engine/src/order-planner.ts`
-Must output expected fill probability, fill fraction, queue delay, realized-cost estimate, adverse-selection penalty, and style rationale.
-
-#### `packages/execution-engine/src/fill-probability-estimator.ts`
-Must become empirical and bucket-based.
-
-#### `packages/execution-engine/src/slippage-estimator.ts`
-Must be calibrated from real fills.
-
-#### `packages/execution-engine/src/realized-cost-model.ts`
-Must produce a realized breakdown matching the estimator’s decomposition.
-
-#### `packages/execution-engine/src/fill-state-service.ts`
-Must distinguish provisional, matched, partial, retrying, failed, and finalized truth carefully.
-
-### Risk layer
-
-#### `packages/risk-engine/src/live-sizing-feedback-policy.ts`
-Must blend execution quality with evidence quality.
-
-#### `packages/risk-engine/src/regime-capital-policy.ts`
-Must cap risk by regime trust, not regime label alone.
-
-#### `packages/risk-engine/src/capital-ramp-policy-service.ts`
-Must require evidence thresholds by deployment tier.
-
-#### `packages/risk-engine/src/execution-quality-kill-switches.ts`
-Must include realized-vs-expected edge gap and lifecycle anomaly triggers.
-
-#### `packages/risk-engine/src/portfolio-kill-switch-service.ts`
-Must drive deterministic runtime downgrades when truth becomes unsafe.
+1. the user can switch between Sentinel Simulation and Real Trading from the dashboard
+2. Sentinel mode runs the real decision path but simulates execution
+3. the system can complete and learn from at least 20 simulated trades
+4. the backend computes readiness and recommendation status
+5. the dashboard displays counts, thresholds, and recommendation text
+6. the recommendation is based on persisted backend artifacts
+7. live mode remains explicitly user-controlled
+8. simulation and live execution paths are impossible to confuse in code and in UI
 
 ---
 
-## Testing doctrine
+## Delivery stance
 
-Every new truth-affecting feature must ship with matching integration coverage.
+This work should be implemented in this order:
 
-Minimum required coverage includes:
+1. domain + contracts for sentinel mode and status
+2. durable sentinel stores and baseline state
+3. simulated execution adapter in worker
+4. learning/readiness computation after each simulated trade
+5. API exposure of sentinel mode/status
+6. dashboard switch and progress message
+7. tests and hard failure cases
 
-1. resolved trade written once and only once
-2. expected vs realized edge decomposition matches ledger truth
-3. empirical execution realism updates future planner output
-4. no-trade logic blocks high-toxicity or marginal setups
-5. evidence-quality sizing caps under-sampled strategies
-6. promotion gate rejects benchmark-underperforming strategies
-7. execution watchdog triggers correct runtime degradation
-8. daily decision-quality report attributes losses correctly
-
-No merge that changes live trading behavior is complete without tests for the new control path.
-
----
-
-## Review and acceptance doctrine
-
-A code change is acceptable only if it:
-
-- preserves or strengthens safety controls
-- improves truth quality or decision quality in a measurable way
-- leaves structured evidence for future review
-- does not create parallel shadow logic that bypasses canonical systems
-- is auditable and reversible
-
-Reject any change that:
-
-- weakens runtime or reconciliation safeguards
-- increases live autonomy without increasing proof requirements
-- hides cost components inside opaque scores
-- scales capital without evidence-based gating
-- confuses provisional and final execution truth
-
----
-
-## Hard no-go conditions for scaled capital
-
-Do not advance beyond canary if any of the following is false:
-
-1. resolved-trade ledger is complete and internally consistent
-2. net edge remains positive after realized costs over a meaningful live window
-3. strategy beats simple baselines after costs
-4. realized-vs-expected edge gap stays within tolerance
-5. reconciliation defect rate stays below policy threshold
-6. no unresolved execution-state anomalies remain active
-7. recent daily decision-quality reports are available and healthy
-8. readiness and smoke gates pass mechanically for the target tier
-
----
-
-## Final instruction to all contributors and agents
-
-When modifying this repository, act as though the bot is one good week away from earning trust and one sloppy assumption away from losing it.
-
-That means:
-
-- prefer explicit truth over convenience
-- prefer smaller, auditable improvements over broad rewrites
-- prefer capital containment over trade frequency
-- prefer live evidence over theoretical confidence
-- prefer deterministic downgrade over hopeful continuation
-
-The repository becomes trustworthy not when it looks advanced, but when it repeatedly proves that it can preserve edge, preserve capital, and preserve control under live conditions.
+No step may skip directly to “UI only” without backend truth and persistence.

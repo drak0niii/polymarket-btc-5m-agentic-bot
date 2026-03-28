@@ -62,6 +62,7 @@ import { BoundedLearningParameterRecommender } from '@worker/orchestration/bound
 import { LearningEventLog } from '@worker/runtime/learning-event-log';
 import { LearningStateStore } from '@worker/runtime/learning-state-store';
 import { ResolvedTradeLedger } from '@worker/runtime/resolved-trade-ledger';
+import { SentinelStateStore } from '@worker/runtime/sentinel-state-store';
 import { RollbackController } from '@worker/runtime/rollback-controller';
 import { StrategyDeploymentRegistry } from '@worker/runtime/strategy-deployment-registry';
 import { StrategyRolloutController } from '@worker/runtime/strategy-rollout-controller';
@@ -146,6 +147,7 @@ export class DailyReviewJob {
   private readonly toxicityTrend = new ToxicityTrend();
   private readonly boundedLearningParameterRecommender =
     new BoundedLearningParameterRecommender();
+  private readonly sentinelStateStore: SentinelStateStore;
   private readonly cycleArtifactDir: string;
   private readonly latestCycleArtifactPath: string;
   private activeRun: Promise<LearningCycleSummary> | null = null;
@@ -169,6 +171,9 @@ export class DailyReviewJob {
       venueHealthLearningStore ?? createDefaultVenueHealthLearningStore(this.learningStateStore);
     this.tradeQualityHistoryStore = new TradeQualityHistoryStore(
       path.join(this.learningStateStore.getPaths().rootDir, 'trade-quality'),
+    );
+    this.sentinelStateStore = new SentinelStateStore(
+      path.dirname(this.learningStateStore.getPaths().sentinelBaselinePath),
     );
     this.cycleArtifactDir = path.join(
       this.learningStateStore.getPaths().rootDir,
@@ -418,6 +423,10 @@ export class DailyReviewJob {
           sampleSourceSummary: sampleLoadResult.sampleSourceSummary,
           resolvedTradeLedgerPath: this.resolvedTradeLedger.getPath(),
         });
+      const sentinelReview = await this.buildSentinelReview({
+        from: window.from,
+        to: window.to,
+      });
       const summary = attachReviewOutputs(
         appendWarnings(result.summary, [
           ...executionLearning.warnings,
@@ -438,6 +447,7 @@ export class DailyReviewJob {
           ...toxicityReview.warnings,
           ...liveSizingFeedbackReview.warnings,
           ...boundedParameterRecommendations.warnings,
+          ...sentinelReview.warnings,
         ]),
         {
           alphaAttribution: alphaAttributionReview.summary,
@@ -455,6 +465,7 @@ export class DailyReviewJob {
           liveProofScorecard: capitalGrowthReview.report.liveProofScorecard,
           liveSizingFeedback: liveSizingFeedbackReview.summary,
           boundedParameterRecommendations: boundedParameterRecommendations.reviewOutput,
+          sentinel: sentinelReview.summary,
         },
       );
       const finalState: LearningState = {
@@ -1157,6 +1168,39 @@ export class DailyReviewJob {
       learningState,
       registry,
       events,
+    };
+  }
+
+  private async buildSentinelReview(input: {
+    from: Date;
+    to: Date;
+  }): Promise<{ warnings: string[]; summary: Record<string, unknown> }> {
+    const [trades, updates, readiness] = await Promise.all([
+      this.sentinelStateStore.loadAllSimulatedTrades(),
+      this.sentinelStateStore.loadAllLearningUpdates(),
+      this.sentinelStateStore.readLatestReadiness(),
+    ]);
+    const simulatedTrades = trades.filter((trade) => {
+      const simulatedAt = new Date(trade.simulatedAt).getTime();
+      return simulatedAt >= input.from.getTime() && simulatedAt <= input.to.getTime();
+    });
+    const learnedTrades = updates.filter((update) => {
+      const learnedAt = new Date(update.learnedAt).getTime();
+      return learnedAt >= input.from.getTime() && learnedAt <= input.to.getTime();
+    });
+    const warnings =
+      readiness && !readiness.recommendedLiveEnable
+        ? ['sentinel_not_ready_for_live']
+        : [];
+
+    return {
+      warnings,
+      summary: {
+        dailySimulatedTradeCount: simulatedTrades.length,
+        dailyLearnedTradeCount: learnedTrades.length,
+        sentinelReadinessSummary: readiness,
+        recommendationState: readiness?.recommendationState ?? 'not_ready',
+      },
     };
   }
 

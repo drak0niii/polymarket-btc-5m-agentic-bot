@@ -21,6 +21,7 @@ import {
   type ResolvedTradeBenchmarkContext,
   type ResolvedTradeLifecycleState,
   type ResolvedTradeRecord,
+  type TradingOperatingMode,
 } from '@polymarket-btc-5m-agentic-bot/domain';
 import { OfficialPolymarketTradingClient } from '@polymarket-btc-5m-agentic-bot/polymarket-adapter';
 import { TradeAttributionService } from '@polymarket-btc-5m-agentic-bot/risk-engine';
@@ -84,6 +85,7 @@ export class ReconcileFillsJob {
 
   async run(options?: {
     runtimeState?: BotRuntimeState;
+    operatingMode?: TradingOperatingMode;
   }): Promise<{ fillsInserted: number; syncFailed: boolean }> {
     if (
       options?.runtimeState &&
@@ -101,6 +103,32 @@ export class ReconcileFillsJob {
       source: 'fills_reconcile_cycle',
       status: 'processing',
     });
+
+    if (options?.operatingMode === 'sentinel_simulation') {
+      await this.runtimeControl.recordReconciliationCheckpoint({
+        cycleKey,
+        source: 'fills_reconcile_cycle',
+        status: 'completed',
+        details: {
+          operatingMode: options.operatingMode,
+          sentinelHandledSeparately: true,
+        },
+      });
+      await this.prisma.auditEvent.create({
+        data: {
+          eventType: 'sentinel.reconciliation_skipped',
+          message:
+            'Fill reconciliation skipped because sentinel trades are finalized in sentinel artifacts.',
+          metadata: {
+            operatingMode: options.operatingMode,
+          } as object,
+        },
+      });
+      return {
+        fillsInserted: 0,
+        syncFailed: false,
+      };
+    }
 
     const venueSync = appEnv.BOT_LIVE_EXECUTION_ENABLED
       ? await this.fetchVenueTrades()

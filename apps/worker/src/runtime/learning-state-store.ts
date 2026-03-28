@@ -110,6 +110,10 @@ export class LearningStateStore {
     snapshotDir: string;
     corruptDir: string;
     resolvedTradePointerPath: string;
+    sentinelBaselinePath: string;
+    sentinelTradesPath: string;
+    sentinelLearningUpdatesPath: string;
+    sentinelReadinessPath: string;
   } {
     return {
       rootDir: this.rootDir,
@@ -117,6 +121,10 @@ export class LearningStateStore {
       snapshotDir: this.snapshotDir,
       corruptDir: this.corruptDir,
       resolvedTradePointerPath: this.resolvedTradePointerPath,
+      sentinelBaselinePath: path.join(this.rootDir, 'sentinel/baseline-knowledge.latest.json'),
+      sentinelTradesPath: path.join(this.rootDir, 'sentinel/simulated-trades.jsonl'),
+      sentinelLearningUpdatesPath: path.join(this.rootDir, 'sentinel/learning-updates.jsonl'),
+      sentinelReadinessPath: path.join(this.rootDir, 'sentinel/readiness.latest.json'),
     };
   }
 

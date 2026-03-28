@@ -187,6 +187,7 @@ export class LiveLoop {
     const reconciliation = await this.executionPortfolioAgent.runReconciliation({
       forceCancelAll,
       runtimeState: this.stateStore.getState(),
+      operatingMode: this.stateStore.getOperatingMode(),
     });
     const portfolio = await this.executionPortfolioAgent.runPortfolioRefresh({
       runtimeState: this.stateStore.getState(),
@@ -200,6 +201,7 @@ export class LiveLoop {
   private async ensureInitialPortfolioTruth(): Promise<void> {
     const reconciliation = await this.executionPortfolioAgent.runReconciliation({
       runtimeState: this.stateStore.getState(),
+      operatingMode: this.stateStore.getOperatingMode(),
     });
     if (reconciliation.syncFailed) {
       throw new Error('initial_reconciliation_failed:venue_sync_failed');
@@ -221,6 +223,7 @@ export class LiveLoop {
   }
 
   private async tickEvaluation(): Promise<void> {
+    this.stateStore.refreshOperatingModeFromDisk();
     const permissions = permissionsForRuntimeState(this.stateStore.getState());
     if (
       this.evaluating ||
@@ -297,6 +300,7 @@ export class LiveLoop {
       const executionResult = await this.executionPortfolioAgent.runExecution({
         canSubmit: () => this.stateStore.canAcceptNewEntries(),
         runtimeState: this.stateStore.getState(),
+        operatingMode: this.stateStore.getOperatingMode(),
         authority: {
           marketAuthorityPassed: marketResult.marketAuthorityPassed,
           marketAuthorityReason: marketResult.marketAuthorityReason,
@@ -348,6 +352,7 @@ export class LiveLoop {
   }
 
   private async tickReconcile(): Promise<void> {
+    this.stateStore.refreshOperatingModeFromDisk();
     const permissions = permissionsForRuntimeState(this.stateStore.getState());
     if (this.reconciling || !permissions.allowReconciliation) {
       return;
@@ -359,6 +364,7 @@ export class LiveLoop {
       await this.enforceLiquidationPolicy();
       await this.executionPortfolioAgent.runReconciliation({
         runtimeState: this.stateStore.getState(),
+        operatingMode: this.stateStore.getOperatingMode(),
       });
       await this.venueHeartbeatService.sync();
       this.logger.debug('Reconcile tick executed.', {
@@ -374,6 +380,7 @@ export class LiveLoop {
   }
 
   private async tickPortfolio(): Promise<void> {
+    this.stateStore.refreshOperatingModeFromDisk();
     const permissions = permissionsForRuntimeState(this.stateStore.getState());
     if (this.refreshingPortfolio || !permissions.allowPortfolioRefresh) {
       return;
@@ -424,6 +431,7 @@ export class LiveLoop {
 
       await this.executionPortfolioAgent.runReconciliation({
         runtimeState: this.stateStore.getState(),
+        operatingMode: this.stateStore.getOperatingMode(),
       });
       await this.executionPortfolioAgent.runPortfolioRefresh({
         runtimeState: this.stateStore.getState(),
@@ -513,6 +521,7 @@ export class LiveLoop {
       }
       await this.executionPortfolioAgent.runReconciliation({
         runtimeState: this.stateStore.getState(),
+        operatingMode: this.stateStore.getOperatingMode(),
       });
       await this.prisma.auditEvent.create({
         data: {
@@ -707,6 +716,7 @@ export class LiveLoop {
       await this.executionPortfolioAgent.runReconciliation({
         forceCancelAll: true,
         runtimeState: this.stateStore.getState(),
+        operatingMode: this.stateStore.getOperatingMode(),
       });
     }
 

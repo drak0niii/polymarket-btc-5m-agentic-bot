@@ -6,11 +6,23 @@ import {
   HttpStatus,
   Post,
 } from '@nestjs/common';
+import { IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
 import { BotControlService } from './bot-control.service';
 import { StartBotDto } from './dto/start-bot.dto';
 import { StopBotDto } from './dto/stop-bot.dto';
 import { HaltBotDto } from './dto/halt-bot.dto';
 import { SetLiveConfigDto } from './dto/set-live-config.dto';
+
+class SetOperatingModeDto {
+  @IsString()
+  @IsIn(['sentinel_simulation', 'live_trading'])
+  operatingMode!: 'sentinel_simulation' | 'live_trading';
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  requestedBy?: string;
+}
 
 @Controller({
   path: 'bot-control',
@@ -22,6 +34,11 @@ export class BotControlController {
   @Get('state')
   async getState() {
     return this.botControlService.getState();
+  }
+
+  @Get('mode')
+  async getMode() {
+    return this.botControlService.getOperatingMode();
   }
 
   @Post('start')
@@ -46,5 +63,11 @@ export class BotControlController {
   @HttpCode(HttpStatus.OK)
   async setLiveConfig(@Body() dto: SetLiveConfigDto) {
     return this.botControlService.setLiveConfig(dto);
+  }
+
+  @Post('mode')
+  @HttpCode(HttpStatus.OK)
+  async setMode(@Body() dto: SetOperatingModeDto) {
+    return this.botControlService.setOperatingMode(dto);
   }
 }

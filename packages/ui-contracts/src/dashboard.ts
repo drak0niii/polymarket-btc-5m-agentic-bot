@@ -1,6 +1,20 @@
+import type {
+  SentinelStatusContract,
+  TradingOperatingMode,
+} from './control';
+
 export interface DashboardContract {
   botState: unknown;
   readinessDashboard: unknown;
+  operatingMode: TradingOperatingMode;
+  sentinelStatus: SentinelStatusContract | null;
+  recommendationMessage: string;
+  simulatedTradesCompleted: number;
+  simulatedTradesLearned: number;
+  targetSimulatedTrades: number;
+  readinessScore: number;
+  readinessThreshold: number;
+  recommendedLiveEnable: boolean;
   markets: unknown[];
   signals: unknown[];
   orders: unknown[];

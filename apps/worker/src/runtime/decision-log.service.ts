@@ -1,5 +1,9 @@
 import { PrismaClient } from '@prisma/client';
-import type { AuditDecisionLog } from '@polymarket-btc-5m-agentic-bot/domain';
+import type {
+  AuditDecisionLog,
+  SentinelReadinessStatus,
+  SentinelSimulatedTradeRecord,
+} from '@polymarket-btc-5m-agentic-bot/domain';
 
 export class DecisionLogService {
   constructor(private readonly prisma: PrismaClient) {}
@@ -23,6 +27,51 @@ export class DecisionLogService {
         },
         createdAt: new Date(input.createdAt),
       },
+    });
+  }
+
+  async recordSentinelTradeEvidence(input: {
+    trade: SentinelSimulatedTradeRecord;
+    summary?: string;
+  }): Promise<void> {
+    await this.record({
+      category: 'post_trade',
+      eventType: 'sentinel.trade_simulated',
+      summary:
+        input.summary ??
+        `Sentinel simulated trade recorded for signal ${input.trade.signalId}.`,
+      marketId: input.trade.marketId,
+      signalId: input.trade.signalId,
+      payload: {
+        sentinelTrade: input.trade,
+      },
+      createdAt: input.trade.simulatedAt,
+    });
+  }
+
+  async recordSentinelRecommendationTransition(input: {
+    previous: SentinelReadinessStatus | null;
+    next: SentinelReadinessStatus;
+  }): Promise<void> {
+    if (
+      input.previous?.recommendationState === input.next.recommendationState &&
+      input.previous?.recommendationMessage === input.next.recommendationMessage
+    ) {
+      return;
+    }
+
+    await this.record({
+      category: 'readiness',
+      eventType: 'sentinel.recommendation_updated',
+      summary: 'Sentinel readiness recommendation updated.',
+      payload: {
+        previousRecommendationState: input.previous?.recommendationState ?? null,
+        nextRecommendationState: input.next.recommendationState,
+        readinessScore: input.next.readinessScore,
+        readinessThreshold: input.next.readinessThreshold,
+        recommendationMessage: input.next.recommendationMessage,
+      },
+      createdAt: input.next.updatedAt,
     });
   }
 

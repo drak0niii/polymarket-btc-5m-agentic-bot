@@ -10,6 +10,8 @@ import { AuditService } from '@api/modules/audit/audit.service';
 import {
   BotControlRepository,
   LiveConfigState,
+  SentinelStatusState,
+  TradingOperatingMode,
 } from './bot-control.repository';
 import { StartBotDto } from './dto/start-bot.dto';
 import { StopBotDto } from './dto/stop-bot.dto';
@@ -46,14 +48,22 @@ export class BotControlService {
   ) {}
 
   async getState() {
-    const [runtimeStatus, liveConfig, pendingCommands] = await Promise.all([
-      this.repository.getOrCreateRuntimeStatus(appEnv.BOT_DEFAULT_STATUS),
-      this.repository.getOrCreateLiveConfig(this.defaultLiveConfig),
-      this.repository.findPendingCommands(),
-    ]);
+    const [runtimeStatus, liveConfig, pendingCommands, operatingMode, sentinelStatus] =
+      await Promise.all([
+        this.repository.getOrCreateRuntimeStatus(appEnv.BOT_DEFAULT_STATUS),
+        this.repository.getOrCreateLiveConfig(this.defaultLiveConfig),
+        this.repository.findPendingCommands(),
+        this.repository.getOperatingMode(),
+        this.repository.readSentinelStatus(),
+      ]);
+    const readiness = this.buildReadiness(liveConfig, operatingMode);
 
     return {
       state: runtimeStatus.state as BotRuntimeState,
+      operatingMode,
+      sentinelEnabled: operatingMode === 'sentinel_simulation',
+      recommendedLiveEnable: sentinelStatus?.recommendedLiveEnable ?? false,
+      sentinelStatus,
       deploymentTier: appEnv.BOT_DEPLOYMENT_TIER,
       liveConfig: {
         maxOpenPositions: liveConfig.maxOpenPositions,
@@ -68,7 +78,7 @@ export class BotControlService {
       },
       lastTransitionAt: runtimeStatus.updatedAt.toISOString(),
       lastTransitionReason: runtimeStatus.reason,
-      readiness: this.buildReadiness(liveConfig),
+      readiness,
       controlPlane: {
         source: 'worker_runtime',
         pendingCommands: pendingCommands.map((command) => ({
@@ -82,9 +92,17 @@ export class BotControlService {
   }
 
   async start(dto: StartBotDto) {
-    const [runtimeStatus, liveConfig] = await Promise.all([
+    if (dto.operatingMode) {
+      await this.repository.setOperatingMode(
+        dto.operatingMode,
+        `mode set during start request by ${dto.requestedBy ?? 'unknown'}`,
+      );
+    }
+
+    const [runtimeStatus, liveConfig, operatingMode] = await Promise.all([
       this.repository.getOrCreateRuntimeStatus(appEnv.BOT_DEFAULT_STATUS),
       this.repository.getOrCreateLiveConfig(this.defaultLiveConfig),
+      this.repository.getOperatingMode(),
     ]);
 
     if (
@@ -96,7 +114,7 @@ export class BotControlService {
       );
     }
 
-    const readiness = this.buildReadiness(liveConfig);
+    const readiness = this.buildReadiness(liveConfig, operatingMode);
     if (!readiness.ready) {
       throw new ReadinessError('Bot readiness checks failed. Cannot queue start.');
     }
@@ -198,6 +216,13 @@ export class BotControlService {
   }
 
   async setLiveConfig(dto: SetLiveConfigDto) {
+    if (dto.operatingMode) {
+      await this.repository.setOperatingMode(
+        dto.operatingMode,
+        `mode set during live-config update by ${dto.updatedBy ?? 'unknown'}`,
+      );
+    }
+
     this.validateLiveConfig(dto);
     await this.repository.getOrCreateLiveConfig(this.defaultLiveConfig);
 
@@ -245,21 +270,55 @@ export class BotControlService {
     return this.getState();
   }
 
+  async getOperatingMode() {
+    const [operatingMode, sentinelStatus] = await Promise.all([
+      this.repository.getOperatingMode(),
+      this.repository.readSentinelStatus(),
+    ]);
+
+    return this.buildOperatingModeResponse(operatingMode, sentinelStatus);
+  }
+
+  async setOperatingMode(input: {
+    operatingMode: TradingOperatingMode;
+    requestedBy?: string | null;
+  }) {
+    await this.repository.setOperatingMode(
+      input.operatingMode,
+      `mode set by ${input.requestedBy ?? 'api'} via bot-control`,
+    );
+    await this.auditService.record({
+      eventType: 'bot.operating_mode.updated',
+      message: 'Bot operating mode updated.',
+      metadata: {
+        operatingMode: input.operatingMode,
+        requestedBy: input.requestedBy ?? null,
+      },
+    });
+
+    const sentinelStatus = await this.repository.readSentinelStatus();
+    return this.buildOperatingModeResponse(input.operatingMode, sentinelStatus);
+  }
+
   private buildReadiness(liveConfig: {
     maxOpenPositions: number;
     maxDailyLossPct: number;
     maxPerTradeRiskPct: number;
     maxKellyFraction: number;
-  }) {
+  }, operatingMode: TradingOperatingMode) {
     const checks = {
       env: Boolean(appEnv.DATABASE_URL && appEnv.REDIS_URL),
-      signing: Boolean(appEnv.POLY_PRIVATE_KEY),
+      signing:
+        operatingMode === 'sentinel_simulation' ? true : Boolean(appEnv.POLY_PRIVATE_KEY),
       credentials: Boolean(
-        appEnv.POLY_API_KEY &&
-          appEnv.POLY_API_SECRET &&
-          appEnv.POLY_API_PASSPHRASE,
+        operatingMode === 'sentinel_simulation' ||
+          (appEnv.POLY_API_KEY &&
+            appEnv.POLY_API_SECRET &&
+            appEnv.POLY_API_PASSPHRASE),
       ),
-      liveMode: appEnv.BOT_LIVE_EXECUTION_ENABLED === true,
+      liveMode:
+        operatingMode === 'sentinel_simulation' ||
+        appEnv.BOT_LIVE_EXECUTION_ENABLED === true,
       riskConfig:
         liveConfig.maxOpenPositions > 0 &&
         liveConfig.maxDailyLossPct > 0 &&
@@ -270,6 +329,26 @@ export class BotControlService {
     return {
       ready: Object.values(checks).every(Boolean),
       checks,
+    };
+  }
+
+  private buildOperatingModeResponse(
+    operatingMode: TradingOperatingMode,
+    sentinelStatus: SentinelStatusState | null,
+  ) {
+    const warningText =
+      operatingMode === 'live_trading' && !(sentinelStatus?.recommendedLiveEnable ?? false)
+        ? 'Sentinel has not reached readiness thresholds yet. Live trading remains user-controlled.'
+        : operatingMode === 'sentinel_simulation'
+          ? 'Sentinel simulation never places real orders.'
+          : null;
+
+    return {
+      operatingMode,
+      sentinelEnabled: operatingMode === 'sentinel_simulation',
+      eligibleForLiveTrading: sentinelStatus?.recommendedLiveEnable ?? false,
+      warningText,
+      sentinelStatus,
     };
   }
 

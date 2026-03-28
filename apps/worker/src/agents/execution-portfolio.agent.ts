@@ -1,4 +1,5 @@
 import { BotRuntimeState } from '@worker/runtime/bot-state';
+import type { TradingOperatingMode } from '@polymarket-btc-5m-agentic-bot/domain';
 import { ExecuteOrdersJob } from '@worker/jobs/executeOrders.job';
 import { ManageOpenOrdersJob } from '@worker/jobs/manageOpenOrders.job';
 import { ReconcileFillsJob } from '@worker/jobs/reconcileFills.job';
@@ -27,6 +28,7 @@ export class ExecutionPortfolioAgent {
   async runExecution(options?: {
     canSubmit?: () => boolean;
     runtimeState?: BotRuntimeState;
+    operatingMode?: TradingOperatingMode;
     authority?: ExecutionAuthorityInput;
   }): Promise<{
     submitted: number;
@@ -47,12 +49,14 @@ export class ExecutionPortfolioAgent {
     return this.executeOrdersJob.run({
       canSubmit: options?.canSubmit,
       runtimeState: options?.runtimeState,
+      operatingMode: options?.operatingMode,
     });
   }
 
   async runReconciliation(options?: {
     forceCancelAll?: boolean;
     runtimeState?: BotRuntimeState;
+    operatingMode?: TradingOperatingMode;
   }): Promise<{
     canceled: number;
     observed: number;
@@ -65,6 +69,7 @@ export class ExecutionPortfolioAgent {
     });
     const fillReconciliation = await this.reconcileFillsJob.run({
       runtimeState: options?.runtimeState,
+      operatingMode: options?.operatingMode,
     });
 
     return {
