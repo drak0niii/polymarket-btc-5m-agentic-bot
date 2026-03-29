@@ -42,9 +42,13 @@ export class SyncOrderbooksJob {
       };
     }
 
+    const now = new Date();
     const markets = await this.prisma.market.findMany({
       where: {
         status: 'active',
+        expiresAt: {
+          gt: now,
+        },
       },
       orderBy: {
         updatedAt: 'desc',

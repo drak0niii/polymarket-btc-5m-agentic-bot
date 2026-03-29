@@ -168,6 +168,33 @@ export class BotRuntime {
       persistedState.state,
       persistedState.reason ?? 'runtime state synced',
     );
+    const recoveredCommands =
+      await this.runtimeControl.recoverInterruptedProcessingCommands({
+        runtimeState: persistedState.state,
+        runtimeReason: persistedState.reason,
+      });
+
+    if (recoveredCommands.length > 0) {
+      this.logger.warn(
+        'Recovered interrupted runtime commands during worker startup.',
+        {
+          recoveredCount: recoveredCommands.length,
+          runtimeState: persistedState.state,
+        },
+      );
+      await this.prisma.auditEvent.create({
+        data: {
+          eventType: 'runtime.command.recovered_after_restart',
+          message:
+            'Worker startup reconciled interrupted processing commands to terminal truth.',
+          metadata: {
+            runtimeState: persistedState.state,
+            runtimeReason: persistedState.reason,
+            commands: recoveredCommands,
+          } as object,
+        },
+      });
+    }
 
     if (persistedState.state === 'running') {
       try {

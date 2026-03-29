@@ -34,6 +34,7 @@ export class DiscoverActiveBtcMarketsJob {
     const activeIds: string[] = [];
     const duplicateKeys = new Set<string>();
     let discovered = 0;
+    const now = new Date();
 
     for (const market of markets) {
       const mapped = this.admitDiscoveredMarket(market, duplicateKeys);
@@ -68,19 +69,36 @@ export class DiscoverActiveBtcMarketsJob {
       discovered += 1;
     }
 
-    if (activeIds.length > 0) {
-      await this.prisma.market.updateMany({
-        where: {
-          status: 'active',
-          id: {
-            notIn: activeIds,
-          },
-        },
-        data: {
-          status: 'inactive',
-        },
-      });
-    }
+    const staleActiveWhere =
+      activeIds.length > 0
+        ? {
+            status: 'active' as const,
+            OR: [
+              {
+                id: {
+                  notIn: activeIds,
+                },
+              },
+              {
+                expiresAt: {
+                  lte: now,
+                },
+              },
+            ],
+          }
+        : {
+            status: 'active' as const,
+            expiresAt: {
+              lte: now,
+            },
+          };
+
+    await this.prisma.market.updateMany({
+      where: staleActiveWhere,
+      data: {
+        status: 'inactive',
+      },
+    });
 
     this.logger.log('Discovered active BTC 5m markets.', {
       discovered,

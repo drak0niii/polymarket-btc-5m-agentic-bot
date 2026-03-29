@@ -16,6 +16,15 @@ export interface RuntimeCommand {
   createdAt: Date;
 }
 
+export interface RecoveredRuntimeCommand {
+  id: string;
+  command: RuntimeCommand['command'];
+  previousStatus: 'processing';
+  recoveredStatus: 'applied' | 'failed';
+  failureMessage: string | null;
+  createdAt: Date;
+}
+
 export interface RuntimeLiveConfig {
   maxOpenPositions: number;
   maxDailyLossPct: number;
@@ -237,6 +246,57 @@ export class RuntimeControlRepository {
         failureMessage: failureMessage ?? null,
         processedAt: new Date(),
       },
+    });
+  }
+
+  async recoverInterruptedProcessingCommands(input: {
+    runtimeState: BotRuntimeState;
+    runtimeReason: string | null;
+  }): Promise<RecoveredRuntimeCommand[]> {
+    const prismaAny = this.prisma as any;
+    return this.prisma.$transaction(async (tx: unknown) => {
+      const txAny = tx as any;
+      const processingCommands = await txAny.botRuntimeCommand.findMany({
+        where: { status: 'processing' },
+        orderBy: { createdAt: 'asc' },
+      });
+
+      if (!Array.isArray(processingCommands) || processingCommands.length === 0) {
+        return [];
+      }
+
+      const recoveredAt = new Date();
+      const recovered: RecoveredRuntimeCommand[] = [];
+
+      for (const command of processingCommands as RuntimeCommand[]) {
+        const resolution = this.resolveInterruptedCommand(command.command, input);
+        const updated = await txAny.botRuntimeCommand.updateMany({
+          where: {
+            id: command.id,
+            status: 'processing',
+          },
+          data: {
+            status: resolution.status,
+            failureMessage: resolution.failureMessage,
+            processedAt: recoveredAt,
+          },
+        });
+
+        if (updated.count === 0) {
+          continue;
+        }
+
+        recovered.push({
+          id: command.id,
+          command: command.command,
+          previousStatus: 'processing',
+          recoveredStatus: resolution.status,
+          failureMessage: resolution.failureMessage,
+          createdAt: command.createdAt,
+        });
+      }
+
+      return recovered;
     });
   }
 
@@ -606,5 +666,70 @@ export class RuntimeControlRepository {
 
   private readBoolean(value: unknown): boolean | null {
     return typeof value === 'boolean' ? value : null;
+  }
+
+  private resolveInterruptedCommand(
+    command: RuntimeCommand['command'],
+    input: {
+      runtimeState: BotRuntimeState;
+      runtimeReason: string | null;
+    },
+  ): {
+    status: 'applied' | 'failed';
+    failureMessage: string | null;
+  } {
+    const failureMessage = input.runtimeReason
+      ? `worker_restart_interrupted_before_terminal_acknowledgement:${input.runtimeState}:${input.runtimeReason}`
+      : `worker_restart_interrupted_before_terminal_acknowledgement:${input.runtimeState}`;
+
+    switch (command) {
+      case 'start': {
+        if (
+          input.runtimeState === 'running' ||
+          input.runtimeState === 'degraded' ||
+          input.runtimeState === 'reconciliation_only' ||
+          input.runtimeState === 'cancel_only'
+        ) {
+          return {
+            status: 'applied',
+            failureMessage: null,
+          };
+        }
+
+        return {
+          status: 'failed',
+          failureMessage,
+        };
+      }
+      case 'stop': {
+        if (
+          input.runtimeState === 'stopped' ||
+          input.runtimeState === 'halted_hard'
+        ) {
+          return {
+            status: 'applied',
+            failureMessage: null,
+          };
+        }
+
+        return {
+          status: 'failed',
+          failureMessage,
+        };
+      }
+      case 'halt': {
+        if (input.runtimeState === 'halted_hard') {
+          return {
+            status: 'applied',
+            failureMessage: null,
+          };
+        }
+
+        return {
+          status: 'failed',
+          failureMessage,
+        };
+      }
+    }
   }
 }
