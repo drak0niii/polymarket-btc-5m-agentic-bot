@@ -833,6 +833,14 @@ export class ExternalPortfolioService {
   }): ExternalPortfolioDivergenceState {
     const details: ExternalPortfolioDivergenceDetail[] = [];
     const classes = new Set<string>();
+    const liveOpenOrderTokenIds = new Set(
+      input.openOrders
+        .filter((order) => this.remainingQuantity(order) > 0)
+        .map((order) => order.tokenId),
+    );
+    const inventoryByToken = new Map(
+      input.inventories.map((inventory) => [inventory.tokenId, inventory]),
+    );
 
     const localPositionByToken = new Map<string, number>();
     for (const position of input.localOpenPositions) {
@@ -850,6 +858,18 @@ export class ExternalPortfolioService {
       );
     }
 
+    const harmlessZeroValueResidueTokens = new Set(
+      input.currentPositions
+        .filter((position) =>
+          this.isHarmlessZeroValueLoserResidue({
+            position,
+            inventory: inventoryByToken.get(position.tokenId) ?? null,
+            hasLiveOpenOrder: liveOpenOrderTokenIds.has(position.tokenId),
+          }),
+        )
+        .map((position) => position.tokenId),
+    );
+
     const comparedTokens = new Set<string>([
       ...localPositionByToken.keys(),
       ...externalPositionByToken.keys(),
@@ -858,6 +878,14 @@ export class ExternalPortfolioService {
       const localQuantity = localPositionByToken.get(tokenId) ?? 0;
       const externalQuantity = externalPositionByToken.get(tokenId) ?? 0;
       if (Math.abs(localQuantity - externalQuantity) <= 1e-6) {
+        continue;
+      }
+
+      if (
+        localQuantity === 0 &&
+        externalQuantity > 0 &&
+        harmlessZeroValueResidueTokens.has(tokenId)
+      ) {
         continue;
       }
 
@@ -935,6 +963,13 @@ export class ExternalPortfolioService {
     }
 
     for (const position of input.currentPositions) {
+      if (
+        harmlessZeroValueResidueTokens.has(position.tokenId) &&
+        (localPositionByToken.get(position.tokenId) ?? 0) === 0
+      ) {
+        continue;
+      }
+
       if (position.marketId) {
         continue;
       }
@@ -956,10 +991,16 @@ export class ExternalPortfolioService {
     const latestLocalFillMs = this.maxDateMs(
       input.localRecentFills.map((fill) => fill.filledAt),
     );
+    const hasBlockingInventoryMismatch = details.some(
+      (detail) =>
+        detail.code === 'inventory_mismatch_vs_current_positions' &&
+        typeof detail.tokenId === 'string' &&
+        !harmlessZeroValueResidueTokens.has(detail.tokenId),
+    );
     if (
       latestVenueTradeMs != null &&
       (latestLocalFillMs == null || latestVenueTradeMs - latestLocalFillMs > 30_000) &&
-      classes.has('inventory_mismatch_vs_current_positions')
+      hasBlockingInventoryMismatch
     ) {
       classes.add('venue_trade_unknown_to_local');
       details.push({
@@ -988,6 +1029,66 @@ export class ExternalPortfolioService {
       classes: [...classes],
       details,
     };
+  }
+
+  private isHarmlessZeroValueLoserResidue(input: {
+    position: ExternalPortfolioPositionSnapshot;
+    inventory: ExternalPortfolioInventorySnapshot | null;
+    hasLiveOpenOrder: boolean;
+  }): boolean {
+    const { position, inventory, hasLiveOpenOrder } = input;
+    if (hasLiveOpenOrder || position.size <= 0) {
+      return false;
+    }
+
+    if ((position.currentPrice ?? Number.NaN) !== 0 || (position.currentValue ?? Number.NaN) !== 0) {
+      return false;
+    }
+
+    if (!position.endDate || Number.isNaN(Date.parse(position.endDate))) {
+      return false;
+    }
+
+    if (Date.parse(position.endDate) > Date.now()) {
+      return false;
+    }
+
+    const raw =
+      position.raw && typeof position.raw === 'object'
+        ? (position.raw as Record<string, unknown>)
+        : null;
+    if (!raw || raw.redeemable !== true || raw.mergeable === true) {
+      return false;
+    }
+
+    const percentPnl =
+      typeof raw.percentPnl === 'number' && Number.isFinite(raw.percentPnl)
+        ? raw.percentPnl
+        : null;
+    const percentRealizedPnl =
+      typeof raw.percentRealizedPnl === 'number' && Number.isFinite(raw.percentRealizedPnl)
+        ? raw.percentRealizedPnl
+        : null;
+    const provenLoser =
+      (percentPnl != null && percentPnl <= -99.9) ||
+      (percentRealizedPnl != null && percentRealizedPnl <= -99.9);
+    if (!provenLoser) {
+      return false;
+    }
+
+    if (!inventory) {
+      return false;
+    }
+
+    if (
+      Math.abs(inventory.balance - position.size) > 1e-6 ||
+      inventory.markedValue !== 0 ||
+      inventory.positionQuantity !== position.size
+    ) {
+      return false;
+    }
+
+    return true;
   }
 
   private planRecovery(

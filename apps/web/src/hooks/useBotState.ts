@@ -101,6 +101,15 @@ function toCommandPresentation(
     };
   }
 
+  if (latestCommand?.status === 'blocked') {
+    return {
+      status: 'failed',
+      message:
+        latestCommand.failureMessage ?? 'The backend rejected this command before queueing it.',
+      commandId: latestCommand.id,
+    };
+  }
+
   if (latestCommand?.status === 'applied') {
     return {
       status: 'applied',

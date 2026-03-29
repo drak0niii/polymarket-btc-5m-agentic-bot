@@ -1,142 +1,135 @@
 # AGENTS.md
 
-## Repository mission for this final remediation pass
+## Repository mission for this pass
 
-This pass exists to close the last remaining runtime and control-plane issues so the dashboard becomes fully trustworthy and operationally dependable.
+This pass exists to answer one narrow question:
 
-The mission is not to add features.
-The mission is to remove the last runtime lies, races, and misleading operator experiences.
+**Why does the tracked-market runtime path fail in SyncOrderbooksJob with `Invalid prisma.orderbook.create() invocation` and `Unknown argument tickSize`, and can that exact blocker be corrected safely?**
+
+This pass is not for live trading.
+This pass is not for settlement.
+This pass is not for dashboard work.
+This pass is not for discovery/strategy activation beyond using their already-restored state.
+This pass is not for the previous Invalid URL bug, which is already fixed.
+This pass is not for the previous REST bootstrap 404 bug, which is already fixed.
 
 ---
 
 ## Prime directive
 
-**ALIGN START WITH REAL STARTUP TRUTH, ELIMINATE THE HALT RACE, HARDEN COMMAND LIFECYCLES, AND MAKE THE DASHBOARD A FULLY RELIABLE OPERATOR SURFACE**
+**FIX ONLY THE EXACT SYNCORDERBOOKSJOB PRISMA ORDERBOOK SCHEMA-MISMATCH BLOCKER WHILE PRESERVING REAL RUNTIME SAFETY**
 
 ---
 
 ## Non-negotiable operating rules
 
-1. **Fix the runtime, not just the UI.**
-   The remaining defects are no longer mainly presentation issues; underlying runtime/control-plane behavior must be corrected.
+1. **Use the real tracked-market path.**
+   This pass is only valid if real tracked markets are present and the worker is rerun.
 
-2. **No deceptive Start.**
-   If Start is predictably doomed by known prerequisites, it must be blocked or clearly precondition-failed before normal queueing.
+2. **Do not fake persistence success.**
+   Orderbook sync must succeed through the repository’s real write path.
 
-3. **No unreliable Halt.**
-   Emergency Halt must not lose a state race after being accepted.
+3. **Do not weaken failure handling.**
+   Real persistence faults must still degrade or halt correctly.
 
-4. **No divergence between UI, API, and worker truth.**
-   One authoritative command lifecycle must exist.
+4. **Do not broaden scope.**
+   Touch only the exact orderbook write/schema/mapping/client path needed.
 
-5. **No weakening of safety gates.**
-   Startup/authenticated venue checks must remain real and enforced.
+5. **Minimal changes only.**
+   Fix only the schema-mismatch blocker.
 
-6. **Fail closed.**
-   If the system cannot guarantee a safe control result, it must not imply success.
-
-7. **Retest required.**
-   A runtime/control-plane fix does not count without re-executing the affected operator flow.
+6. **Truth over convenience.**
+   If the next real blocker appears after fixing this one, report it honestly.
 
 ---
 
-## Required remediation order
+## Required order
 
-1. startup truth alignment
-2. halt race elimination
-3. command lifecycle hardening
-4. dashboard/runtime contract alignment
-5. full re-test and closure report
+1. confirm the current tracked-market orderbook-sync failure
+2. identify the exact failing Prisma payload
+3. trace the payload construction path
+4. inspect the exact Prisma schema/client truth
+5. identify the exact root cause
+6. apply only the minimum safe fix if justified
+7. rerun worker/runtime truth
+8. report strictly
 
-Do not skip this order.
-
----
-
-## Allowed changes
-
-You may change only what is needed for:
-- startup truth alignment
-- runtime transition correctness
-- halt reliability
-- authoritative command lifecycle propagation
-- dashboard/runtime contract completeness
-- focused re-test support
+Do not skip steps.
 
 ---
 
-## Forbidden changes
+## What must be proven
+
+### Path A — blocker fixed
+A successful pass proves:
+- the exact Prisma write/model mismatch was identified
+- the minimum safe fix was applied
+- the worker was rerun with real tracked markets
+- the specific `Unknown argument tickSize` failure no longer occurs
+- runtime truth after that is reported honestly
+
+### Path B — blocker still unresolved
+A successful pass also exists if it proves:
+- the exact mismatch cause remains blocked
+- no fake workaround was introduced
+- the tracked-market runtime path still cannot proceed honestly
+
+---
+
+## Allowed actions
+
+You may:
+- inspect worker logs and audit evidence
+- inspect SyncOrderbooksJob and related orderbook write code
+- inspect Prisma schema and generated client truth
+- inspect env/config only if it directly affects this exact path
+- make a minimal safe fix if justified
+- rerun the worker and capture fresh evidence
+
+---
+
+## Forbidden actions
 
 Do not:
-- weaken startup gates to make Start appear successful
-- hide runtime failures behind softer UI wording
-- treat queued commands as equivalent to applied commands
-- leave halt semantics ambiguous
-- broaden into unrelated product work
-- redesign the trading system beyond what is required for reliable control-plane behavior
+- suppress orderbook-sync failures just to keep runtime alive
+- hardcode fake DB writes as a deceptive success path
+- broaden into live trading, settlement, dashboard, or unrelated runtime refactors
+- claim success without rerunning the worker
+- claim runtime health from the no-market case
 
 ---
 
-## Canonical truth hierarchy for this pass
+## Truth hierarchy for this pass
 
-When deciding what the operator should be told, trust in this order:
+Trust in this order:
 
-1. actual worker/runtime transition truth
-2. authoritative backend/API command/result state
-3. persisted runtime artifacts where intended
-4. UI local state
-
-The dashboard must never outrank runtime truth.
-
----
-
-## Required issue targets
-
-This pass must fully close:
-
-### High/Critical runtime issues
-- Start accepted despite real startup prerequisites failing
-- Emergency Halt race causing post-acceptance illegal transition
-- any remaining misleading command lifecycle state in UI/API/worker
-
-### Contract/clarity issues
-- missing backend contract fields needed for truthful operation
-- refresh/reopen gaps that hide or distort command truth
+1. fresh worker/runtime evidence on the tracked-market path
+2. exact Prisma schema/client truth
+3. exact orderbook write payload evidence
+4. API bot-control state
+5. audit events
+6. assumptions
 
 ---
 
-## What counts as fully fixed
+## Required final report must answer
 
-An issue is fully fixed only if:
-1. root cause is identified
-2. minimal correct code fix is applied
-3. the exact operator flow is re-run
-4. expected behavior is now observed
-5. evidence is captured
-
-Anything less is partial.
-
----
-
-## Required final report
-
-The final result must explicitly answer:
-
-1. what caused the startup truth mismatch
-2. what caused the halt race
-3. what exact changes resolved them
-4. whether Start is now honestly blocked or successfully runnable as appropriate
-5. whether Halt is now operationally reliable
-6. whether UI/API/worker command lifecycles are fully aligned
-7. whether any High/Critical issues remain
-8. what still needs attention, if anything
+1. what exact Prisma write payload failed?
+2. where was that payload constructed?
+3. what does the current Prisma `orderbook` model actually accept?
+4. was the fault obsolete field usage, mapper drift, missing migration, stale client, schema mismatch, or mixed?
+5. what exact change was made, if any?
+6. does orderbook sync now succeed?
+7. does runtime now remain running?
+8. if not, what exact blocker surfaced next?
 
 ---
 
 ## Delivery stance
 
-Be strict.
-Be minimal.
-Be runtime-truth driven.
+Be narrow.
+Be evidence-based.
+Be runtime-safety-first.
 Do not over-claim.
 
-A successful pass is one where the dashboard no longer merely reports failures honestly, but the remaining core control flows themselves are reliable enough to justify a true top-tier operator trust rating.
+A successful pass is one where the system either truly clears the SyncOrderbooksJob schema blocker or isolates it honestly.

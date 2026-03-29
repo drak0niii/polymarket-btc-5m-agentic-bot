@@ -332,8 +332,14 @@ export class BotRuntime {
   }
 
   private async tickControlPlane(): Promise<void> {
-    await this.processNextCommand();
-    await this.refreshPreStartEligibility();
+    try {
+      await this.processNextCommand();
+      await this.refreshPreStartEligibility();
+    } catch (error) {
+      this.logger.error('Control-plane polling failed.', undefined, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private startLearningCyclePolling(): void {

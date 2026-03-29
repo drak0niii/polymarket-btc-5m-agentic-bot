@@ -19,6 +19,14 @@ export interface DiscoveredMarket {
 }
 
 export class MarketDiscovery {
+  private static readonly ACTIVE_MARKETS_PAGE_SIZE = 500;
+  private static readonly FIVE_MINUTE_PATTERNS = [
+    /\b5m\b/i,
+    /\b5-minute\b/i,
+    /\b5 min\b/i,
+    /\bfive minute\b/i,
+  ];
+
   constructor(private readonly gammaClient: GammaClient) {}
 
   async discoverActiveBtcMarkets(): Promise<DiscoveredMarket[]> {
@@ -30,7 +38,7 @@ export class MarketDiscovery {
     markets: DiscoveredMarket[];
     failures: VenueParserIssue[];
   }> {
-    const { markets, failures } = await this.gammaClient.listMarketsDetailed();
+    const { markets, failures } = await this.listActiveMarketsDetailed();
 
     return {
       markets: markets
@@ -38,6 +46,34 @@ export class MarketDiscovery {
         .map((market) => this.mapMarket(market)),
       failures,
     };
+  }
+
+  private async listActiveMarketsDetailed(): Promise<{
+    markets: GammaMarket[];
+    failures: VenueParserIssue[];
+  }> {
+    const markets: GammaMarket[] = [];
+    const failures: VenueParserIssue[] = [];
+    let offset = 0;
+
+    while (true) {
+      const result = await this.gammaClient.listMarketsDetailed({
+        active: true,
+        closed: false,
+        limit: MarketDiscovery.ACTIVE_MARKETS_PAGE_SIZE,
+        offset,
+      });
+      markets.push(...result.markets);
+      failures.push(...result.failures);
+
+      if (result.markets.length < MarketDiscovery.ACTIVE_MARKETS_PAGE_SIZE) {
+        break;
+      }
+
+      offset += MarketDiscovery.ACTIVE_MARKETS_PAGE_SIZE;
+    }
+
+    return { markets, failures };
   }
 
   private isRelevantBtcFiveMinuteMarket(market: GammaMarket): boolean {
@@ -52,11 +88,9 @@ export class MarketDiscovery {
 
     const text = `${slug} ${question}`;
     const isBtc = text.includes('btc') || text.includes('bitcoin');
-    const isFiveMinute =
-      text.includes('5m') ||
-      text.includes('5-minute') ||
-      text.includes('5 min') ||
-      text.includes('five minute');
+    const isFiveMinute = MarketDiscovery.FIVE_MINUTE_PATTERNS.some((pattern) =>
+      pattern.test(text),
+    );
 
     return isBtc && isFiveMinute;
   }

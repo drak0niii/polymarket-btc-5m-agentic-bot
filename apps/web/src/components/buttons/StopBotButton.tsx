@@ -1,11 +1,14 @@
 import { useBotState } from '../../hooks/useBotState';
 export function StopBotButton() {
   const { botState, canSubmitControls, commandStates, stopBot } = useBotState();
+  const startInFlight =
+    commandStates.start.status === 'queued' || commandStates.start.status === 'processing';
 
   const disabled =
     !canSubmitControls ||
     !botState ||
-    (botState.state !== 'running' &&
+    (!startInFlight &&
+      botState.state !== 'running' &&
       botState.state !== 'bootstrapping' &&
       botState.state !== 'degraded' &&
       botState.state !== 'reconciliation_only' &&

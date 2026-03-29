@@ -420,18 +420,25 @@ export class StartupRunbook {
         allowPositionManagement: false,
         reasonCodes: ['trading_permissions_missing'],
       };
-      const externalTruthHealthy =
-        externalSnapshot.freshness.overallVerdict !== 'stale' &&
-        tradingPermissions.allowPositionManagement;
+      const externalTruthReasonCode = this.resolveExternalTruthReasonCode({
+        freshnessVerdict: externalSnapshot.freshness.overallVerdict,
+        allowPositionManagement: tradingPermissions.allowPositionManagement,
+        reasonCodes: tradingPermissions.reasonCodes ?? [],
+      });
+      const externalTruthHealthy = externalTruthReasonCode === 'passed';
       steps.push({
         step: 'external_truth_fresh',
         ok: externalTruthHealthy,
         checkedAt: new Date().toISOString(),
-        reasonCode: externalTruthHealthy ? 'passed' : 'external_truth_not_fresh',
+        reasonCode: externalTruthReasonCode,
         evidence: {
           freshness: externalSnapshot.freshness.overallVerdict,
           allowNewEntries: tradingPermissions.allowNewEntries,
           allowPositionManagement: tradingPermissions.allowPositionManagement,
+          reasonCodes: tradingPermissions.reasonCodes ?? [],
+          recoveryMode: externalSnapshot.recovery.mode,
+          divergenceStatus: externalSnapshot.divergence.status,
+          divergenceClasses: externalSnapshot.divergence.classes,
           workingOpenOrders: externalSnapshot.workingOpenOrders,
         },
       });
@@ -753,5 +760,25 @@ export class StartupRunbook {
         hasProfileAddress: !!profileAddress,
       },
     };
+  }
+
+  private resolveExternalTruthReasonCode(input: {
+    freshnessVerdict: ExternalPortfolioSnapshot['freshness']['overallVerdict'];
+    allowPositionManagement: boolean;
+    reasonCodes: string[];
+  }): string {
+    if (input.freshnessVerdict === 'stale') {
+      return 'external_truth_stale';
+    }
+
+    if (input.allowPositionManagement) {
+      return 'passed';
+    }
+
+    if (input.reasonCodes.includes('trading_permissions_missing')) {
+      return 'external_truth_permissions_missing';
+    }
+
+    return 'external_truth_position_management_blocked';
   }
 }

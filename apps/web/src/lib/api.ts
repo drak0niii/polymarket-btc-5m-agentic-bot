@@ -1,8 +1,22 @@
-const API_BASE = 'http://127.0.0.1:3000/api/v1';
+function resolveApiBase(): string {
+  const configuredBase = import.meta.env.VITE_API_BASE_URL?.trim();
+  if (configuredBase) {
+    return configuredBase.replace(/\/+$/, '');
+  }
+
+  return '/api/v1';
+}
+
+const API_BASE = resolveApiBase();
 
 export type TradingOperatingMode = 'sentinel_simulation' | 'live_trading';
 export type RuntimeCommandType = 'start' | 'stop' | 'halt';
-export type RuntimeCommandStatus = 'pending' | 'processing' | 'applied' | 'failed';
+export type RuntimeCommandStatus =
+  | 'pending'
+  | 'processing'
+  | 'applied'
+  | 'failed'
+  | 'blocked';
 
 export interface SentinelStatusResponse {
   updatedAt: string;
@@ -65,13 +79,7 @@ export interface BotStateResponse {
   lastTransitionReason: string | null;
   readiness: {
     ready: boolean;
-    checks: {
-      env: boolean;
-      signing: boolean;
-      credentials: boolean;
-      liveMode: boolean;
-      riskConfig: boolean;
-    };
+    checks: Record<string, boolean>;
     blockingReasons: string[];
   };
   controlPlane: {

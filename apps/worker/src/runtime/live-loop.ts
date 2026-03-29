@@ -332,14 +332,12 @@ export class LiveLoop {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await this.prisma.auditEvent.create({
-        data: {
-          eventType: 'runtime.halt.evaluation_error',
-          message: 'Evaluation tick failed and runtime halted.',
-          metadata: {
-            error: message,
-          } as object,
-        },
+      await this.recordAuditEventSafely({
+        eventType: 'runtime.halt.evaluation_error',
+        message: 'Evaluation tick failed and runtime halted.',
+        metadata: {
+          error: message,
+        } as object,
       });
       this.stateStore.setState('halted_hard', `evaluation_tick_failed:${message}`);
       this.logger.error('Evaluation tick failed, runtime halted.', undefined, {
@@ -413,15 +411,13 @@ export class LiveLoop {
 
     this.venueHeartbeatProtectionActive = true;
     try {
-      await this.prisma.auditEvent.create({
-        data: {
-          eventType: 'venue.heartbeat.degraded',
-          message: 'Venue open-order heartbeat degraded; entries were blocked and reconciliation was forced.',
-          metadata: {
-            reasonCode,
-            botState: this.stateStore.getState(),
-          } as object,
-        },
+      await this.recordAuditEventSafely({
+        eventType: 'venue.heartbeat.degraded',
+        message: 'Venue open-order heartbeat degraded; entries were blocked and reconciliation was forced.',
+        metadata: {
+          reasonCode,
+          botState: this.stateStore.getState(),
+        } as object,
       });
 
       if (this.stateStore.getState() === 'running') {
@@ -465,9 +461,13 @@ export class LiveLoop {
       tokenIdNo: string | null;
     }>
   > {
+    const now = new Date();
     return this.prisma.market.findMany({
       where: {
         status: 'active',
+        expiresAt: {
+          gt: now,
+        },
       },
       select: {
         id: true,
@@ -641,12 +641,14 @@ export class LiveLoop {
   }
 
   private async enforceLiquidationPolicy(): Promise<void> {
-    const [nearExpiryMarkets, latestExternalCheckpoint] = await Promise.all([
+    const [nearExpiryMarkets, latestExternalCheckpoint, trackedMarkets] = await Promise.all([
       this.loadNearExpiryExposureMarkets(),
       this.runtimeControl.getLatestCheckpoint('external_portfolio_reconcile'),
+      this.loadTrackedMarkets(),
     ]);
     const btcSnapshot = this.syncBtcReferenceJob.getLastSnapshot();
     const userHealth = this.userStreamService.evaluateHealth();
+    const hasTrackedMarkets = trackedMarkets.length > 0;
     const checkpointDetails =
       latestExternalCheckpoint?.details &&
       typeof latestExternalCheckpoint.details === 'object'
@@ -675,10 +677,11 @@ export class LiveLoop {
       },
       {
         trigger: 'btc_reference_stale',
-        active: !btcSnapshot,
+        active: hasTrackedMarkets && !btcSnapshot,
         severity: 'medium',
         reasonCode: 'liquidation_btc_reference_stale',
         evidence: {
+          trackedMarkets: trackedMarkets.length,
           lastObservedAt: btcSnapshot?.observedAt ?? null,
         },
       },
@@ -768,5 +771,22 @@ export class LiveLoop {
         return secondsToExpiry <= 30;
       })
       .map((market) => market.id);
+  }
+
+  private async recordAuditEventSafely(data: {
+    eventType: string;
+    message: string;
+    metadata?: object;
+  }): Promise<void> {
+    try {
+      await this.prisma.auditEvent.create({
+        data,
+      });
+    } catch (error) {
+      this.logger.error('Failed to persist audit event.', undefined, {
+        eventType: data.eventType,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 }

@@ -297,6 +297,8 @@ export class MarketWebSocketStateService {
   }
 
   evaluateHealth(now = Date.now()): MarketWebSocketHealth {
+    const idleWithoutTrackedAssets =
+      this.connectionStatus === 'idle' && this.assets.size === 0;
     const staleAssets: string[] = [];
     const metadataInvalidations: string[] = [];
     const trafficStale =
@@ -318,14 +320,17 @@ export class MarketWebSocketStateService {
 
     return {
       healthy:
-        this.connectionStatus === 'connected' &&
-        this.trusted &&
-        !trafficStale &&
-        staleAssets.length === 0 &&
-        metadataInvalidations.length === 0 &&
-        this.bootstrapFailureReason === null,
+        idleWithoutTrackedAssets ||
+        (this.connectionStatus === 'connected' &&
+          this.trusted &&
+          !trafficStale &&
+          staleAssets.length === 0 &&
+          metadataInvalidations.length === 0 &&
+          this.bootstrapFailureReason === null),
       reasonCode:
-        this.connectionStatus !== 'connected'
+        idleWithoutTrackedAssets
+          ? null
+          : this.connectionStatus !== 'connected'
           ? 'market_stream_disconnected'
           : this.bootstrapFailureReason
             ? this.bootstrapFailureReason
@@ -345,7 +350,7 @@ export class MarketWebSocketStateService {
       lastEventAt: this.lastEventAt,
       lastTrafficAt: this.lastTrafficAt,
       bootstrapCompletedAt: this.bootstrapCompletedAt,
-      trusted: this.trusted,
+      trusted: idleWithoutTrackedAssets ? true : this.trusted,
       reconnectAttempt: this.connection?.getReconnectAttempt() ?? 0,
     };
   }
@@ -357,7 +362,11 @@ export class MarketWebSocketStateService {
       return;
     }
 
-    const url = (this.options.url ?? MarketWebSocketStateService.DEFAULT_URL).trim();
+    const configuredUrl = this.options.url?.trim() ?? '';
+    const url =
+      configuredUrl.length > 0
+        ? configuredUrl
+        : MarketWebSocketStateService.DEFAULT_URL;
     this.connection = new PolymarketWebSocketClient({
       name: 'market_stream',
       url,

@@ -99,6 +99,8 @@ export interface BalanceAllowanceSnapshot {
   raw: unknown;
 }
 
+const CONDITIONAL_TOKEN_UNIT_SCALE = 1_000_000;
+
 export interface VenueHeartbeatResult {
   success: boolean;
   heartbeatId: string | null;
@@ -473,8 +475,14 @@ export class OfficialPolymarketTradingClient {
       return {
         assetType: input.assetType,
         tokenId: input.tokenId?.trim() ?? null,
-        balance: parsed.balance,
-        allowance: parsed.allowance,
+        balance: this.normalizeBalanceAllowanceAmount(
+          parsed.balance,
+          input.assetType,
+        ),
+        allowance: this.normalizeBalanceAllowanceAmount(
+          parsed.allowance,
+          input.assetType,
+        ),
         checkedAt: new Date().toISOString(),
         raw: parsed.raw,
       };
@@ -902,6 +910,17 @@ export class OfficialPolymarketTradingClient {
 
     const trimmed = value.trim();
     return /^0x[a-fA-F0-9]{40}$/.test(trimmed) ? trimmed : null;
+  }
+
+  private normalizeBalanceAllowanceAmount(
+    value: number,
+    assetType: BalanceAllowanceAssetType,
+  ): number {
+    if (!Number.isFinite(value) || assetType !== 'CONDITIONAL') {
+      return value;
+    }
+
+    return value / CONDITIONAL_TOKEN_UNIT_SCALE;
   }
 
   private validateConfig(): void {

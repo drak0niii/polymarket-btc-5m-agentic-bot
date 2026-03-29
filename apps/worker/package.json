@@ -12,6 +12,7 @@
     "readiness:production": "ts-node -r tsconfig-paths/register --project tsconfig.json src/smoke/production-readiness.ts",
     "readiness:dashboard": "ts-node -r tsconfig-paths/register --project tsconfig.json src/runtime/readiness-dashboard.command.ts",
     "replay:signal": "ts-node -r tsconfig-paths/register --project tsconfig.json src/runtime/replay.command.ts",
+    "settlement:resolved-residues": "ts-node -r tsconfig-paths/register --project tsconfig.json src/commands/settlement-reconciliation.command.ts",
     "learning:print-state": "ts-node -r tsconfig-paths/register --project tsconfig.json src/commands/print-learning-state.command.ts",
     "learning:run-cycle": "DATABASE_URL=postgresql://test REDIS_URL=redis://test POLY_CLOB_HOST=http://localhost POLY_GAMMA_HOST=http://localhost POLY_PRIVATE_KEY=1111111111111111111111111111111111111111111111111111111111111111 POLY_API_KEY=test POLY_API_SECRET=test POLY_API_PASSPHRASE=test BOT_LIVE_EXECUTION_ENABLED=true ts-node -r tsconfig-paths/register --project tsconfig.json src/commands/run-learning-cycle.command.ts --force",
     "lineage:print": "ts-node -r tsconfig-paths/register --project tsconfig.json src/commands/print-strategy-lineage.command.ts",

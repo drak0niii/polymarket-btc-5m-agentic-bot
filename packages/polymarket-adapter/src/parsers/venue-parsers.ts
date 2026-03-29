@@ -166,6 +166,7 @@ const TRADE_STATUS_ALIASES: Record<string, string> = {
   matched: 'MATCHED',
   filled: 'FILLED',
   settled: 'SETTLED',
+  confirmed: 'CONFIRMED',
 };
 
 function issue(code: string, path: string, message: string): VenueParserIssue {
@@ -286,7 +287,14 @@ function readTimestamp(
     return new Date(millis).toISOString();
   }
   if (typeof value === 'string' && value.trim().length > 0) {
-    const parsed = new Date(value);
+    const normalized = value.trim();
+    const numeric = Number(normalized);
+    if (Number.isFinite(numeric) && /^-?\d+(\.\d+)?$/.test(normalized)) {
+      const millis = numeric >= 1_000_000_000_000 ? numeric : numeric * 1000;
+      return new Date(millis).toISOString();
+    }
+
+    const parsed = new Date(normalized);
     if (Number.isNaN(parsed.getTime())) {
       throw new VenueParseError(
         operation,
@@ -333,6 +341,91 @@ function readOptionalBoolean(record: Record<string, unknown>, keys: string[]): b
     }
   }
   return null;
+}
+
+function readOptionalFiniteNumber(
+  record: Record<string, unknown>,
+  keys: string[],
+  operation: string,
+  path: string,
+  options: { min?: number; max?: number } = {},
+): number | null {
+  for (const key of keys) {
+    if (!(key in record) || record[key] == null) {
+      continue;
+    }
+
+    try {
+      return readFiniteNumber(record[key], operation, `${path}.${key}`, {
+        ...options,
+        nullable: true,
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+function readAllowanceValue(
+  record: Record<string, unknown>,
+  operation: string,
+  path: string,
+): number {
+  const directAllowance = readOptionalFiniteNumber(
+    record,
+    ['allowance', 'approved', 'availableAllowance'],
+    operation,
+    path,
+    { min: 0 },
+  );
+  if (directAllowance != null) {
+    return directAllowance;
+  }
+
+  const allowanceRecord =
+    record.allowances && typeof record.allowances === 'object' && !Array.isArray(record.allowances)
+      ? (record.allowances as Record<string, unknown>)
+      : record.allowance && typeof record.allowance === 'object' && !Array.isArray(record.allowance)
+        ? (record.allowance as Record<string, unknown>)
+        : null;
+  if (!allowanceRecord) {
+    throw new VenueParseError(
+      operation,
+      [issue('number_expected', `${path}.allowance`, 'Expected balance allowance value.')],
+      record.allowance ?? record.allowances ?? null,
+    );
+  }
+
+  const values = Object.values(allowanceRecord)
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value >= 0);
+  if (values.length === 0) {
+    throw new VenueParseError(
+      operation,
+      [issue('number_expected', `${path}.allowance`, 'Expected balance allowance value.')],
+      allowanceRecord,
+    );
+  }
+
+  return Math.max(...values);
+}
+
+function buildSyntheticTradeId(
+  record: Record<string, unknown>,
+  tokenId: string,
+  timestamp: string | null,
+  index: number,
+): string {
+  const transactionHash = readOptionalString(record, ['transactionHash', 'transaction_hash']);
+  const timestampToken = timestamp ?? readOptionalString(record, ['timestamp']);
+  const side = readOptionalString(record, ['side']) ?? 'unknown';
+
+  return (
+    transactionHash ??
+    [tokenId, timestampToken ?? 'unknown_time', side, String(index)].join(':')
+  );
 }
 
 function normalizeSide(value: unknown, operation: string, path: string): 'BUY' | 'SELL' {
@@ -396,8 +489,19 @@ function collectGammaTokenIds(record: Record<string, unknown>, operation: string
   }
 
   const clobTokenIdsRaw = record.clobTokenIds ?? record.clob_token_ids;
-  const clobTokenIds = Array.isArray(clobTokenIdsRaw)
-    ? clobTokenIdsRaw.map((value, index) =>
+  const clobTokenIdsRecord =
+    typeof clobTokenIdsRaw === 'string'
+      ? (() => {
+          try {
+            const parsed = JSON.parse(clobTokenIdsRaw);
+            return Array.isArray(parsed) ? parsed : [];
+          } catch {
+            return [];
+          }
+        })()
+      : clobTokenIdsRaw;
+  const clobTokenIds = Array.isArray(clobTokenIdsRecord)
+    ? clobTokenIdsRecord.map((value, index) =>
         readString(value, operation, `${path}.clobTokenIds[${index}]`)!,
       )
     : [];
@@ -686,7 +790,7 @@ export function parseBalanceAllowancePayload(
   const record = readRecord(payload, operation, '$');
   return {
     balance: readFiniteNumber(record.balance, operation, '$.balance', { min: 0 })!,
-    allowance: readFiniteNumber(record.allowance, operation, '$.allowance', { min: 0 })!,
+    allowance: readAllowanceValue(record, operation, '$'),
     raw: record,
   };
 }
@@ -748,19 +852,29 @@ export function parseDataApiTradesPayload(
   const items = extractArrayPayload(payload, operation);
   return items.map((entry, index) => {
     const record = readRecord(entry, operation, `$[${index}]`);
+    const tokenId = readString(record.asset ?? record.tokenId, operation, `$[${index}].tokenId`)!;
+    const timestamp = readTimestamp(record.timestamp ?? null, operation, `$[${index}].timestamp`, {
+      nullable: true,
+    });
+
     return {
-      id: readString(record.tradeID ?? record.id, operation, `$[${index}].id`)!,
-      tokenId: readString(record.asset ?? record.tokenId, operation, `$[${index}].tokenId`)!,
+      id:
+        readOptionalString(record, [
+          'tradeID',
+          'tradeId',
+          'id',
+          'transactionHash',
+          'transaction_hash',
+        ]) ?? buildSyntheticTradeId(record, tokenId, timestamp, index),
+      tokenId,
       marketId: readOptionalString(record, ['marketId', 'market_id']),
-      conditionId: readOptionalString(record, ['conditionId']),
+      conditionId: readOptionalString(record, ['conditionId', 'condition_id']),
       side: normalizeSide(record.side, operation, `$[${index}].side`),
       price: readFiniteNumber(record.price, operation, `$[${index}].price`, { min: 0, max: 1 })!,
       size: readFiniteNumber(record.size, operation, `$[${index}].size`, { min: 0 })!,
       outcome: readOptionalString(record, ['outcome']),
-      timestamp: readTimestamp(record.timestamp ?? null, operation, `$[${index}].timestamp`, {
-        nullable: true,
-      }),
-      transactionHash: readOptionalString(record, ['transactionHash']),
+      timestamp,
+      transactionHash: readOptionalString(record, ['transactionHash', 'transaction_hash']),
       raw: record,
     };
   });
@@ -773,11 +887,27 @@ export function parseDataApiPositionsPayload(
   const items = extractArrayPayload(payload, operation);
   return items.map((entry, index) => {
     const record = readRecord(entry, operation, `$[${index}]`);
+    const size =
+      readOptionalFiniteNumber(
+        record,
+        ['size', 'totalBought', 'quantity', 'balance'],
+        operation,
+        `$[${index}]`,
+        { min: 0 },
+      ) ??
+      (() => {
+        throw new VenueParseError(
+          operation,
+          [issue('number_expected', `$[${index}].size`, 'Expected finite position size.')],
+          record,
+        );
+      })();
+
     return {
       tokenId: readString(record.asset ?? record.tokenId, operation, `$[${index}].tokenId`)!,
       marketId: readOptionalString(record, ['marketId', 'market_id']),
-      conditionId: readOptionalString(record, ['conditionId']),
-      size: readFiniteNumber(record.size, operation, `$[${index}].size`, { min: 0 })!,
+      conditionId: readOptionalString(record, ['conditionId', 'condition_id']),
+      size,
       avgPrice: readFiniteNumber(record.avgPrice ?? null, operation, `$[${index}].avgPrice`, {
         min: 0,
         max: 1,

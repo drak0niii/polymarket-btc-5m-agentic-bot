@@ -5,6 +5,7 @@ export function StartBotButton() {
   const disabled =
     !canSubmitControls ||
     !botState ||
+    !botState.readiness.ready ||
     botState.state !== 'stopped' ||
     commandStates.start.status === 'submitting' ||
     commandStates.start.status === 'queued' ||

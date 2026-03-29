@@ -2,6 +2,7 @@ import { Inject, Injectable, Optional } from '@nestjs/common';
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import path from 'path';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '@api/modules/prisma/prisma.service';
 
 export interface LiveConfigState {
@@ -53,6 +54,12 @@ export interface ReconciliationCheckpointState {
   status: string;
   processedAt: Date;
   details: Record<string, unknown> | null;
+}
+
+export interface EnqueueCommandResult {
+  admitted: boolean;
+  command: RuntimeCommandState;
+  conflictingCommand: RuntimeCommandState | null;
 }
 
 @Injectable()
@@ -164,12 +171,91 @@ export class BotControlRepository {
     });
   }
 
+  async enqueueCommand(input: {
+    command: 'start' | 'stop' | 'halt';
+    reason: string;
+    requestedBy?: string | null;
+    cancelOpenOrders?: boolean;
+    blockedReason: string;
+  }): Promise<EnqueueCommandResult> {
+    return this.runSerializedCommandTransaction(async (tx) => {
+      await tx.botRuntimeStatus.upsert({
+        where: { id: 'live' },
+        update: {},
+        create: {
+          id: 'live',
+          state: 'stopped',
+          reason: 'initialized',
+        },
+      });
+      await tx.$queryRaw`SELECT 1 FROM "bot_runtime_status" WHERE id = 'live' FOR UPDATE`;
+
+      const conflictingCommand = (await tx.botRuntimeCommand.findFirst({
+        where: {
+          command: input.command,
+          status: {
+            in: ['pending', 'processing'],
+          },
+        },
+        orderBy: { createdAt: 'asc' },
+      })) as RuntimeCommandState | null;
+
+      if (conflictingCommand) {
+        const command = (await tx.botRuntimeCommand.create({
+          data: {
+            command: input.command,
+            reason: input.reason,
+            requestedBy: input.requestedBy ?? null,
+            cancelOpenOrders: input.cancelOpenOrders ?? false,
+            status: 'blocked',
+            failureMessage: input.blockedReason,
+            processedAt: new Date(),
+          },
+        })) as RuntimeCommandState;
+
+        return {
+          admitted: false,
+          command,
+          conflictingCommand,
+        };
+      }
+
+      const command = (await tx.botRuntimeCommand.create({
+        data: {
+          command: input.command,
+          reason: input.reason,
+          requestedBy: input.requestedBy ?? null,
+          cancelOpenOrders: input.cancelOpenOrders ?? false,
+          status: 'pending',
+        },
+      })) as RuntimeCommandState;
+
+      return {
+        admitted: true,
+        command,
+        conflictingCommand: null,
+      };
+    });
+  }
+
   async findPendingCommands(limit = 5) {
     return this.prisma.botRuntimeCommand.findMany({
       where: { status: 'pending' },
       orderBy: { createdAt: 'asc' },
       take: limit,
     });
+  }
+
+  async findActiveCommands(limit = 20): Promise<RuntimeCommandState[]> {
+    return this.prisma.botRuntimeCommand.findMany({
+      where: {
+        status: {
+          in: ['pending', 'processing'],
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+      take: limit,
+    }) as Promise<RuntimeCommandState[]>;
   }
 
   async findActiveCommand(command: 'start' | 'stop' | 'halt') {
@@ -182,11 +268,20 @@ export class BotControlRepository {
     });
   }
 
-  async findRecentCommands(limit = 12): Promise<RuntimeCommandState[]> {
+  async findRecentCommands(limit = 50): Promise<RuntimeCommandState[]> {
     return this.prisma.botRuntimeCommand.findMany({
       orderBy: { createdAt: 'desc' },
       take: limit,
     }) as Promise<RuntimeCommandState[]>;
+  }
+
+  async findLatestCommand(
+    command: 'start' | 'stop' | 'halt',
+  ): Promise<RuntimeCommandState | null> {
+    return this.prisma.botRuntimeCommand.findFirst({
+      where: { command },
+      orderBy: { createdAt: 'desc' },
+    }) as Promise<RuntimeCommandState | null>;
   }
 
   async findLatestCheckpoint(source: string): Promise<ReconciliationCheckpointState | null> {
@@ -238,6 +333,25 @@ export class BotControlRepository {
 
       return null;
     }
+  }
+
+  private async runSerializedCommandTransaction<T>(
+    run: (tx: Prisma.TransactionClient) => Promise<T>,
+    retries = 3,
+  ): Promise<T> {
+    for (let attempt = 1; attempt <= retries; attempt += 1) {
+      try {
+        return await this.prisma.$transaction(run, {
+          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        });
+      } catch (error) {
+        if (attempt === retries || !isSerializationFailure(error)) {
+          throw error;
+        }
+      }
+    }
+
+    throw new Error('Failed to serialize command transaction.');
   }
 
   private async readRuntimeArtifact(): Promise<{
@@ -320,5 +434,14 @@ function isMissingFile(error: unknown): boolean {
     error !== null &&
     'code' in error &&
     (error as { code?: string }).code === 'ENOENT'
+  );
+}
+
+function isSerializationFailure(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: string }).code === 'P2034'
   );
 }

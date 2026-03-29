@@ -317,6 +317,13 @@ export class UserWebSocketStateService {
   }
 
   evaluateHealth(now = Date.now()): UserWebSocketHealth {
+    const idleWithoutTrackedMarkets =
+      this.connectionStatus === 'idle' && this.desiredMarkets.size === 0;
+    const noTrackedMarketRisk =
+      idleWithoutTrackedMarkets &&
+      this.openOrders.size === 0 &&
+      !this.divergenceDetected &&
+      this.bootstrapFailureReason === null;
     const trafficStale =
       !this.lastTrafficAt ||
       now - new Date(this.lastTrafficAt).getTime() > this.staleAfterMs;
@@ -330,13 +337,16 @@ export class UserWebSocketStateService {
 
     return {
       healthy:
-        this.connectionStatus === 'connected' &&
-        this.trusted &&
-        !trafficStale &&
-        !this.divergenceDetected &&
-        this.bootstrapFailureReason === null,
+        noTrackedMarketRisk ||
+        (this.connectionStatus === 'connected' &&
+          this.trusted &&
+          !trafficStale &&
+          !this.divergenceDetected &&
+          this.bootstrapFailureReason === null),
       reasonCode:
-        this.connectionStatus !== 'connected'
+        noTrackedMarketRisk
+          ? null
+          : this.connectionStatus !== 'connected'
           ? 'user_stream_disconnected'
           : this.bootstrapFailureReason
             ? this.bootstrapFailureReason
@@ -359,7 +369,7 @@ export class UserWebSocketStateService {
       recentTrades: this.recentTrades.size,
       divergenceDetected: this.divergenceDetected,
       lastReconciliationAt: this.lastReconciliationAt,
-      trusted: this.trusted,
+      trusted: noTrackedMarketRisk ? true : this.trusted,
       subscribedMarkets: this.desiredMarkets.size,
       reconnectAttempt: this.connection?.getReconnectAttempt() ?? 0,
     };

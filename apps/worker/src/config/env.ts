@@ -39,6 +39,12 @@ const envSchema = z.object({
   POLY_USE_SERVER_TIME: z.coerce.boolean().default(true),
   POLY_MAX_CLOCK_SKEW_MS: z.coerce.number().int().nonnegative().default(5000),
   POLY_STARTUP_TOKEN_ID: z.string().optional(),
+  POLY_RELAYER_URL: z.string().optional(),
+  POLY_BUILDER_API_KEY: z.string().optional(),
+  POLY_BUILDER_SECRET: z.string().optional(),
+  POLY_BUILDER_PASSPHRASE: z.string().optional(),
+  POLY_BUILDER_REMOTE_URL: z.string().optional(),
+  POLY_BUILDER_REMOTE_TOKEN: z.string().optional(),
 
   BTC_REFERENCE_SYMBOL: z.string().min(1).default('BTCUSD'),
   BOT_DEFAULT_STATUS: z

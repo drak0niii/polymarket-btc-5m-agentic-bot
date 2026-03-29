@@ -12,6 +12,7 @@ import { AuditService } from '@api/modules/audit/audit.service';
 import {
   BotControlRepository,
   LiveConfigState,
+  ReconciliationCheckpointState,
   RuntimeCommandState,
   SentinelStatusState,
   TradingOperatingMode,
@@ -31,6 +32,19 @@ type BotRuntimeState =
   | 'stopped';
 
 type CommandType = 'start' | 'stop' | 'halt';
+
+const WORKER_HEARTBEAT_STALE_AFTER_MS = Math.max(
+  appEnv.BOT_PORTFOLIO_REFRESH_INTERVAL_MS * 2,
+  15_000,
+);
+const STARTUP_GATE_STALE_AFTER_MS = 45_000;
+
+interface StartupGateSnapshot {
+  status: 'passed' | 'failed' | 'missing' | 'stale';
+  mode: 'live' | 'test' | 'sentinel' | null;
+  blockingReasons: string[];
+  processedAt: string | null;
+}
 
 @Injectable()
 export class BotControlService {
@@ -53,21 +67,43 @@ export class BotControlService {
   ) {}
 
   async getState() {
-    const [runtimeStatus, liveConfig, pendingCommands, recentCommands, operatingMode, sentinelStatus] =
+    const [
+      runtimeStatus,
+      liveConfig,
+      pendingCommands,
+      activeCommands,
+      recentCommands,
+      latestStartCommand,
+      latestStopCommand,
+      latestHaltCommand,
+      operatingMode,
+      sentinelStatus,
+      startupGateCheckpoint,
+    ] =
       await Promise.all([
         this.repository.getOrCreateRuntimeStatus(appEnv.BOT_DEFAULT_STATUS),
         this.repository.getOrCreateLiveConfig(this.defaultLiveConfig),
         this.repository.findPendingCommands(),
+        this.repository.findActiveCommands(),
         this.repository.findRecentCommands(),
+        this.repository.findLatestCommand('start'),
+        this.repository.findLatestCommand('stop'),
+        this.repository.findLatestCommand('halt'),
         this.repository.getOperatingMode(),
         this.repository.readSentinelStatus(),
+        this.repository.findLatestCheckpoint('startup_gate_verdict'),
       ]);
-    const readiness = this.buildReadiness(liveConfig, operatingMode);
+    const startupGate = this.readStartupGate(startupGateCheckpoint);
+    const readiness = this.buildReadiness(
+      runtimeStatus,
+      liveConfig,
+      operatingMode,
+      startupGate,
+    );
     const operatingModeState = this.buildOperatingModeResponse(
       operatingMode,
       sentinelStatus,
     );
-    const latestCommands = this.buildLatestCommands(recentCommands);
 
     return {
       state: runtimeStatus.state as BotRuntimeState,
@@ -93,20 +129,20 @@ export class BotControlService {
       lastTransitionReason: runtimeStatus.reason,
       readiness,
       controlPlane: {
-        source: 'worker_runtime',
-        activeCommands: recentCommands
-          .filter((command) => command.status === 'pending' || command.status === 'processing')
-          .map((command) => this.serializeCommand(command)),
+        source: this.isWorkerAvailable(runtimeStatus)
+          ? 'worker_runtime'
+          : 'worker_runtime_stale',
+        activeCommands: activeCommands.map((command) => this.serializeCommand(command)),
         latestCommandByType: {
-          start: latestCommands.start,
-          stop: latestCommands.stop,
-          halt: latestCommands.halt,
+          start: this.serializeCommand(latestStartCommand),
+          stop: this.serializeCommand(latestStopCommand),
+          halt: this.serializeCommand(latestHaltCommand),
         },
         pendingCommands: pendingCommands.map((command) => ({
           id: command.id,
           command: command.command,
           cancelOpenOrders: command.cancelOpenOrders,
-          createdAt: command.createdAt,
+          createdAt: command.createdAt.toISOString(),
         })),
         recentCommands: recentCommands.map((command) => this.serializeCommand(command)),
       },
@@ -122,10 +158,11 @@ export class BotControlService {
       );
     }
 
-    const [runtimeStatus, liveConfig, operatingMode] = await Promise.all([
+    const [runtimeStatus, liveConfig, operatingMode, startupGateCheckpoint] = await Promise.all([
       this.repository.getOrCreateRuntimeStatus(appEnv.BOT_DEFAULT_STATUS),
       this.repository.getOrCreateLiveConfig(this.defaultLiveConfig),
       this.repository.getOperatingMode(),
+      this.repository.findLatestCheckpoint('startup_gate_verdict'),
     ]);
 
     if (
@@ -137,20 +174,43 @@ export class BotControlService {
       );
     }
 
-    const readiness = this.buildReadiness(liveConfig, operatingMode);
+    const startupGate = this.readStartupGate(startupGateCheckpoint);
+    const readiness = this.buildReadiness(
+      runtimeStatus,
+      liveConfig,
+      operatingMode,
+      startupGate,
+    );
     if (!readiness.ready) {
+      await this.recordBlockedCommand({
+        command: 'start',
+        reason: dto.reason ?? 'manual start requested',
+        requestedBy: dto.requestedBy,
+        failureMessage: `Start rejected before queueing. ${readiness.blockingReasons.join(', ')}`,
+        cancelOpenOrders: false,
+      });
       throw new ReadinessError(
         `Bot readiness checks failed. Cannot queue start. Blocking checks: ${readiness.blockingReasons.join(', ')}`,
       );
     }
 
-    await this.assertNoActiveCommand('start');
-
-    const command = await this.repository.createCommand({
+    const queued = await this.repository.enqueueCommand({
       command: 'start',
       reason: dto.reason ?? 'manual start requested',
       requestedBy: dto.requestedBy,
+      blockedReason: 'Another start command is already pending or processing.',
     });
+    if (!queued.admitted) {
+      await this.auditCommandBlocked(
+        queued.command,
+        queued.command.failureMessage ?? 'Another start command is already pending or processing.',
+      );
+      throw new ConflictError(
+        queued.command.failureMessage ??
+          `start command ${queued.conflictingCommand?.id ?? 'unknown'} is already active.`,
+      );
+    }
+    const command = queued.command;
 
     await this.auditService.record({
       eventType: 'bot.start.command_queued',
@@ -170,31 +230,42 @@ export class BotControlService {
   }
 
   async stop(dto: StopBotDto) {
-    const runtimeStatus = await this.repository.getOrCreateRuntimeStatus(
-      appEnv.BOT_DEFAULT_STATUS,
-    );
+    const [runtimeStatus, activeStart] = await Promise.all([
+      this.repository.getOrCreateRuntimeStatus(appEnv.BOT_DEFAULT_STATUS),
+      this.repository.findActiveCommand('start'),
+    ]);
 
-    if (runtimeStatus.state === 'stopped') {
-      await this.auditService.record({
-        eventType: 'bot.stop.noop',
-        message: 'Stop requested while runtime is already stopped.',
-        metadata: {
-          reason: dto.reason ?? null,
-          requestedBy: dto.requestedBy ?? null,
-        },
+    if (runtimeStatus.state === 'stopped' && !activeStart) {
+      await this.recordBlockedCommand({
+        command: 'stop',
+        reason: dto.reason ?? 'manual stop requested',
+        requestedBy: dto.requestedBy,
+        cancelOpenOrders: dto.cancelOpenOrders ?? false,
+        failureMessage:
+          'Stop rejected before queueing. Runtime is already stopped and no start command is active.',
       });
 
       return this.getState();
     }
 
-    await this.assertNoActiveCommand('stop');
-
-    const command = await this.repository.createCommand({
+    const queued = await this.repository.enqueueCommand({
       command: 'stop',
       reason: dto.reason ?? 'manual stop requested',
       requestedBy: dto.requestedBy,
       cancelOpenOrders: dto.cancelOpenOrders ?? false,
+      blockedReason: 'Another stop command is already pending or processing.',
     });
+    if (!queued.admitted) {
+      await this.auditCommandBlocked(
+        queued.command,
+        queued.command.failureMessage ?? 'Another stop command is already pending or processing.',
+      );
+      throw new ConflictError(
+        queued.command.failureMessage ??
+          `stop command ${queued.conflictingCommand?.id ?? 'unknown'} is already active.`,
+      );
+    }
+    const command = queued.command;
 
     await this.auditService.record({
       eventType: 'bot.stop.command_queued',
@@ -215,24 +286,46 @@ export class BotControlService {
   }
 
   async halt(dto: HaltBotDto) {
-    const runtimeStatus = await this.repository.getOrCreateRuntimeStatus(
-      appEnv.BOT_DEFAULT_STATUS,
-    );
+    const [runtimeStatus, activeStart] = await Promise.all([
+      this.repository.getOrCreateRuntimeStatus(appEnv.BOT_DEFAULT_STATUS),
+      this.repository.findActiveCommand('start'),
+    ]);
 
-    if (runtimeStatus.state === 'stopped' || runtimeStatus.state === 'halted_hard') {
+    if (
+      (runtimeStatus.state === 'stopped' || runtimeStatus.state === 'halted_hard') &&
+      !activeStart
+    ) {
+      const failureMessage = `Emergency halt is not available from "${runtimeStatus.state}".`;
+      await this.recordBlockedCommand({
+        command: 'halt',
+        reason: dto.reason ?? 'manual emergency halt requested',
+        requestedBy: dto.requestedBy,
+        cancelOpenOrders: dto.cancelOpenOrders ?? true,
+        failureMessage,
+      });
       throw new InvalidStateTransitionError(
-        `Emergency halt is not available from "${runtimeStatus.state}".`,
+        failureMessage,
       );
     }
 
-    await this.assertNoActiveCommand('halt');
-
-    const command = await this.repository.createCommand({
+    const queued = await this.repository.enqueueCommand({
       command: 'halt',
       reason: dto.reason ?? 'manual emergency halt requested',
       requestedBy: dto.requestedBy,
       cancelOpenOrders: dto.cancelOpenOrders ?? true,
+      blockedReason: 'Another halt command is already pending or processing.',
     });
+    if (!queued.admitted) {
+      await this.auditCommandBlocked(
+        queued.command,
+        queued.command.failureMessage ?? 'Another halt command is already pending or processing.',
+      );
+      throw new ConflictError(
+        queued.command.failureMessage ??
+          `halt command ${queued.conflictingCommand?.id ?? 'unknown'} is already active.`,
+      );
+    }
+    const command = queued.command;
 
     await this.auditService.record({
       eventType: 'bot.halt.command_queued',
@@ -339,13 +432,32 @@ export class BotControlService {
     return this.buildOperatingModeResponse(input.operatingMode, sentinelStatus);
   }
 
-  private buildReadiness(liveConfig: {
-    maxOpenPositions: number;
-    maxDailyLossPct: number;
-    maxPerTradeRiskPct: number;
-    maxKellyFraction: number;
-  }, operatingMode: TradingOperatingMode) {
-    const checks = {
+  private buildReadiness(
+    runtimeStatus: {
+      state: string;
+      reason: string | null;
+      lastHeartbeatAt: Date | null;
+      updatedAt: Date;
+    },
+    liveConfig: {
+      maxOpenPositions: number;
+      maxDailyLossPct: number;
+      maxPerTradeRiskPct: number;
+      maxKellyFraction: number;
+    },
+    operatingMode: TradingOperatingMode,
+    startupGate: StartupGateSnapshot,
+  ) {
+    const workerHeartbeat = this.isWorkerAvailable(runtimeStatus);
+    const expectedStartupGateMode =
+      operatingMode === 'sentinel_simulation'
+        ? 'sentinel'
+        : appEnv.IS_TEST
+          ? 'test'
+          : 'live';
+    const startupGatePassed =
+      startupGate.status === 'passed' && startupGate.mode === expectedStartupGateMode;
+    const checks: Record<string, boolean> = {
       env: Boolean(appEnv.DATABASE_URL && appEnv.REDIS_URL),
       signing:
         operatingMode === 'sentinel_simulation' ? true : Boolean(appEnv.POLY_PRIVATE_KEY),
@@ -363,14 +475,35 @@ export class BotControlService {
         liveConfig.maxDailyLossPct > 0 &&
         liveConfig.maxPerTradeRiskPct > 0 &&
         liveConfig.maxKellyFraction > 0,
+      workerHeartbeat,
+      startupGate: startupGatePassed,
     };
+    const blockingReasons: string[] = Object.entries(checks)
+      .filter(([, passed]) => !passed)
+      .map(([name]) => name);
+
+    if (!workerHeartbeat) {
+      blockingReasons.push(this.buildWorkerAvailabilityReason(runtimeStatus));
+    }
+
+    if (startupGate.status === 'missing') {
+      blockingReasons.push('startup_gate_missing');
+    } else if (startupGate.status === 'stale') {
+      blockingReasons.push('startup_gate_stale');
+    } else if (startupGate.mode !== expectedStartupGateMode) {
+      blockingReasons.push(
+        `startup_gate_mode_mismatch:expected_${expectedStartupGateMode}_got_${startupGate.mode ?? 'unknown'}`,
+      );
+    } else if (startupGate.status === 'failed') {
+      blockingReasons.push(
+        `startup_gate_failed:${startupGate.blockingReasons.join('|') || 'unknown'}`,
+      );
+    }
 
     return {
       ready: Object.values(checks).every(Boolean),
       checks,
-      blockingReasons: Object.entries(checks)
-        .filter(([, passed]) => !passed)
-        .map(([name]) => name),
+      blockingReasons,
     };
   }
 
@@ -391,20 +524,6 @@ export class BotControlService {
       eligibleForLiveTrading: sentinelStatus?.recommendedLiveEnable ?? false,
       warningText,
       sentinelStatus,
-    };
-  }
-
-  private buildLatestCommands(recentCommands: RuntimeCommandState[]) {
-    return {
-      start: this.serializeCommand(
-        recentCommands.find((command) => command.command === 'start') ?? null,
-      ),
-      stop: this.serializeCommand(
-        recentCommands.find((command) => command.command === 'stop') ?? null,
-      ),
-      halt: this.serializeCommand(
-        recentCommands.find((command) => command.command === 'halt') ?? null,
-      ),
     };
   }
 
@@ -444,16 +563,110 @@ export class BotControlService {
     }
   }
 
-  private async assertNoActiveCommand(command: CommandType): Promise<void> {
-    const activeCommand = await this.repository.findActiveCommand(command);
+  private async recordBlockedCommand(input: {
+    command: CommandType;
+    reason: string;
+    requestedBy?: string | null;
+    failureMessage: string;
+    cancelOpenOrders?: boolean;
+  }): Promise<void> {
+    const command = (await this.repository.createCommand({
+      command: input.command,
+      reason: input.reason,
+      requestedBy: input.requestedBy,
+      cancelOpenOrders: input.cancelOpenOrders,
+      status: 'blocked',
+      failureMessage: input.failureMessage,
+    })) as RuntimeCommandState;
+    await this.auditCommandBlocked(command, input.failureMessage);
+  }
 
-    if (!activeCommand) {
-      return;
+  private async auditCommandBlocked(
+    command: RuntimeCommandState,
+    failureMessage: string,
+  ): Promise<void> {
+    await this.auditService.record({
+      eventType: `bot.${command.command}.command_blocked`,
+      message: `${command.command} command rejected before queueing.`,
+      metadata: {
+        commandId: command.id,
+        reason: command.reason,
+        requestedBy: command.requestedBy,
+        cancelOpenOrders: command.cancelOpenOrders,
+        failureMessage,
+      },
+    });
+  }
+
+  private readStartupGate(
+    checkpoint: ReconciliationCheckpointState | null,
+  ): StartupGateSnapshot {
+    if (!checkpoint?.processedAt) {
+      return {
+        status: 'missing',
+        mode: null,
+        blockingReasons: [],
+        processedAt: null,
+      };
     }
 
-    throw new ConflictError(
-      `${command} command ${activeCommand.id} is already ${activeCommand.status}.`,
-    );
+    if (Date.now() - checkpoint.processedAt.getTime() > STARTUP_GATE_STALE_AFTER_MS) {
+      return {
+        status: 'stale',
+        mode: this.readStartupGateMode(checkpoint.details),
+        blockingReasons: this.readStartupGateBlockingReasons(checkpoint.details),
+        processedAt: checkpoint.processedAt.toISOString(),
+      };
+    }
+
+    return {
+      status: checkpoint.status === 'completed' ? 'passed' : 'failed',
+      mode: this.readStartupGateMode(checkpoint.details),
+      blockingReasons: this.readStartupGateBlockingReasons(checkpoint.details),
+      processedAt: checkpoint.processedAt.toISOString(),
+    };
+  }
+
+  private readStartupGateMode(
+    details: Record<string, unknown> | null,
+  ): StartupGateSnapshot['mode'] {
+    const mode = details?.mode;
+    if (mode === 'live' || mode === 'test' || mode === 'sentinel') {
+      return mode;
+    }
+
+    return null;
+  }
+
+  private readStartupGateBlockingReasons(
+    details: Record<string, unknown> | null,
+  ): string[] {
+    const reasons = details?.blockingReasons;
+    if (!Array.isArray(reasons)) {
+      return [];
+    }
+
+    return reasons.filter((reason): reason is string => typeof reason === 'string');
+  }
+
+  private isWorkerAvailable(runtimeStatus: {
+    lastHeartbeatAt: Date | null;
+  }): boolean {
+    if (!runtimeStatus.lastHeartbeatAt) {
+      return false;
+    }
+
+    return Date.now() - runtimeStatus.lastHeartbeatAt.getTime() <= WORKER_HEARTBEAT_STALE_AFTER_MS;
+  }
+
+  private buildWorkerAvailabilityReason(runtimeStatus: {
+    lastHeartbeatAt: Date | null;
+  }): string {
+    if (!runtimeStatus.lastHeartbeatAt) {
+      return 'worker_heartbeat_missing';
+    }
+
+    return 'worker_heartbeat_stale';
   }
 
   private validateLiveConfig(dto: SetLiveConfigDto): void {
